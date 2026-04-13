@@ -84,7 +84,7 @@ def train_nll(
             val_nll = _eval_nll(model, val_loader, device)
             select_metric = val_nll
         else:
-            val_nll, val_mse = float("nan"), float("nan")
+            val_nll = float("nan")
             select_metric = avg_train_nll
 
         improved = (select_metric < best_metric) if not (torch.isnan(torch.tensor(select_metric))) else False

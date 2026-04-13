@@ -1,257 +1,139 @@
-# Standard library imports
-from typing import List, Tuple, Union, Callable
+from __future__ import annotations
+
+from typing import List, Tuple, Optional, Union
 from collections import Counter
 
-# Third-party imports
 import torch
 from tqdm import tqdm
-
-# Project-specific imports
 from transformer_lens import HookedTransformer, utils
+
 from data_utils.concept_dataset import ConceptDataset, SupervisedConceptDataset
 
 
+# Maps mode names to hook-string factories (layer -> cache key).
+_HOOK_FN = {
+    "mlp":          lambda L: f"blocks.{L}.mlp.hook_post",
+    "mlp_out":      lambda L: f"blocks.{L}.hook_mlp_out",
+    "residual":     lambda L: utils.get_act_name("resid_post", L),
+    "residual_pre": lambda L: utils.get_act_name("resid_pre", L),
+    "attn_out":     lambda L: f"blocks.{L}.hook_attn_out",
+}
+
+
 class ActivationGenerator:
+    """Extracts token-level activations from a HookedTransformer model."""
+
     def __init__(
         self,
         model_name: str,
         model_device: str = "cpu",
         data_device: str = "cpu",
-        mode: str = "residual"
+        mode: str = "residual",
     ):
         """
-        Initialize the generator with a pretrained model.
-        
         Args:
-            model_name (str): Name of the pretrained model.
-            model_device (str): Device to load the model onto.
-            data_device (str): Device to load the data onto.
-            mode (str): Which activation to use ("mlp" or "residual").
+            model_name: TransformerLens model name (e.g. "gpt2-small").
+            model_device: Device for the language model forward passes.
+            data_device: Device for the output activation tensors.
+            mode: Which activation stream to extract. Supported values:
+                  "mlp", "mlp_out", "residual", "residual_pre", "attn_out".
         """
+        if mode not in _HOOK_FN:
+            raise ValueError(f"Unknown mode '{mode}'. Choose from {sorted(_HOOK_FN)}")
         self.model = HookedTransformer.from_pretrained(model_name, device=model_device)
-        self.model_name = model_name  # store for later use in helper functions
         self.data_device = data_device
-        self._mode = mode
+        self.mode = mode
 
-    def _get_data_as_tensors(self, dataset: ConceptDataset, batch_size: int):
-        """
-        Converts data from the ConceptDataset into model-ready tensors.
-        Assumes that the dataset yields (prompts, labels) and uses left padding.
-        """
-        data = []
-        for batch in dataset.get_batches(batch_size=batch_size):
-            prompts = batch['prompt']
-            tokens = self.model.to_tokens(prompts)
-            data.append(tokens)
-        return data
+    def _hook_str(self, layer: int) -> str:
+        """Return the TransformerLens cache key for the chosen stream at a given layer."""
+        return _HOOK_FN[self.mode](layer)
 
-    def _get_mlp_hook_string(self, layer_number: int) -> str:
-        """
-        Helper to get the hook string for a given layer based on the mode.
-        """
-        if self._mode == 'mlp':
-            act_str = f"blocks.{layer_number}.mlp.hook_post"
-        if self._mode == "mlp_out":
-            return f"blocks.{layer_number}.hook_mlp_out"
-        elif self._mode == 'residual':
-            act_str = utils.get_act_name("resid_post", layer_number)
-        elif self._mode == 'residual_pre':
-            act_str = utils.get_act_name("resid_pre", layer_number)
-        elif self._mode == 'attn_out':
-            act_str = f"blocks.{layer_number}.hook_attn_out"
-        return act_str
+    def _tokenize_dataset(self, dataset, batch_size: int) -> List[torch.Tensor]:
+        """Tokenize every batch in the dataset; returns a list of (B, T) token tensors."""
+        return [
+            self.model.to_tokens(batch["prompt"])
+            for batch in dataset.get_batches(batch_size=batch_size)
+        ]
 
-    def change_mode(self, new_mode):
-        self._mode = new_mode
+    def build_vocab_frequency(self, dataset, batch_size: int = 5) -> Counter:
+        """
+        Count how often each token appears across the dataset (padding excluded).
 
-    def _get_period_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Given a tensor of input IDs, returns a boolean mask where True corresponds
-        to positions that match the period token (".").
-        """
-        # Assume that encoding "." returns a list with the period token id as its first element.
-        period_id = self.model.tokenizer.encode(".")[0]
-        return input_ids == period_id
-
-    def build_vocab_frequency(self, dataset: ConceptDataset, batch_size: int = 5) -> Counter:
-        """
-        Builds a vocabulary frequency Counter over the entire dataset.
-        Padding tokens are ignored.
-        
         Args:
-            dataset (ConceptDataset): The dataset yielding samples.
-            batch_size (int): Batch size for processing.
-            
-        Returns:
-            A Counter mapping token id to frequency count.
-        """
-        token_counter = Counter()
-        data = self._get_data_as_tensors(dataset, batch_size)
-        pad_token_id = self.model.tokenizer.pad_token_id
-        for batch in tqdm(data, desc="Building vocab frequency"):
-            # Supports either dict or tensor
-            if isinstance(batch, dict):
-                input_ids = batch["input_ids"]
-            else:
-                input_ids = batch
-            tokens = input_ids.flatten().tolist()
-            tokens = [t for t in tokens if t != pad_token_id]
-            token_counter.update(tokens)
-        return token_counter
+            dataset: Dataset with a get_batches method.
+            batch_size: Number of prompts per tokenization call.
 
-    def generate_multiple_layer_activations_and_freq(
+        Returns:
+            Counter mapping token_id -> total occurrences across the dataset.
+        """
+        pad_id = self.model.tokenizer.pad_token_id
+        counter: Counter = Counter()
+        for input_ids in tqdm(self._tokenize_dataset(dataset, batch_size), desc="Building vocab frequency"):
+            for tok in input_ids.flatten().tolist():
+                if tok != pad_id:
+                    counter[tok] += 1
+        return counter
+
+    @torch.no_grad()
+    def generate_activations(
         self,
         dataset: Union[ConceptDataset, SupervisedConceptDataset],
         layers: List[int],
         batch_size: int = 5,
-    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        stack: bool = False,
+    ) -> Tuple[Union[List[torch.Tensor], torch.Tensor], torch.Tensor]:
         """
-        For each sample in the dataset, returns the activations from multiple layers
-        and a frequency vector corresponding to each non-padding token.
-        
-        The output for each layer is a tensor of shape:
-            (num_tokens, d_model)
-        where num_tokens is the total number of non-padding tokens across the dataset.
-        The frequency vector (of shape (num_tokens,)) is built from a vocabulary frequency
-        computed over the dataset.
-        
-        Args:
-            dataset (ConceptDataset): Dataset yielding samples.
-            layers (List[int]): List of layer numbers to extract activations from.
-            batch_size (int): Batch size for processing the dataset.
-        
-        Returns:
-            A tuple (final_activations, freq) where:
-              - final_activations: List of tensors, one per layer, each of shape (num_tokens, d_model).
-              - freq: Tensor of shape (num_tokens,), where each entry is the frequency of that token.
-        """
-        # Build the global vocabulary frequency dictionary.
-        vocab_freq = self.build_vocab_frequency(dataset, batch_size=batch_size)
-        
-        data = self._get_data_as_tensors(dataset, batch_size)
-        all_layer_activations = [[] for _ in layers]
-        all_token_ids = []
-
-        with torch.no_grad():
-            for batch in tqdm(data, desc="Generating multi-layer activations with freq"):
-                if isinstance(batch, dict):
-                    inputs = {k: v.to(self.data_device) for k, v in batch.items()}
-                    input_ids = inputs["input_ids"]
-                else:
-                    input_ids = batch.to(self.data_device)
-                    inputs = None
-
-                # Run the model and obtain cache.
-                _, cache = self.model.run_with_cache(input_ids)
-                
-                # Create mask for non-padding tokens.
-                pad_token_id = self.model.tokenizer.pad_token_id
-                bos_token_id = self.model.tokenizer.bos_token_id
-                mask = (input_ids != pad_token_id) & (input_ids != bos_token_id)
-
-                # Extract non-padding token IDs.
-                nonpad_ids = input_ids[mask.bool()].view(-1)
-                all_token_ids.append(nonpad_ids.cpu())
-                
-                for idx, layer in enumerate(layers):
-                    hook_str = self._get_mlp_hook_string(layer)
-                    # Get activations: shape (batch_size, seq_len, d_model)
-                    acts = cache[hook_str].detach().to(self.data_device)
-                    # Extract only non-padding activations.
-                    nonpad_acts = acts[mask.bool()].view(-1, acts.size(-1))
-                    # Immediately move activations to CPU.
-                    all_layer_activations[idx].append(nonpad_acts.cpu())
-                
-                del cache
-                torch.cuda.empty_cache()
-        
-        # Concatenate activations for each layer and token IDs.
-        final_activations = [torch.cat(layer_acts, dim=0) for layer_acts in all_layer_activations]
-        token_ids_all = torch.cat(all_token_ids, dim=0)
-        # Build the frequency vector: for each token in token_ids_all, look up its global frequency.
-        freq = torch.tensor([vocab_freq[token.item()] for token in token_ids_all])
-        self.model.reset_hooks()
-        return final_activations, freq
-
-    def generate_stacked_layer_activations_and_freq(
-        self,
-        dataset: Union[ConceptDataset, SupervisedConceptDataset],
-        layers: List[int],
-        batch_size: int = 5,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        For each sample in the dataset, returns the stacked activations from multiple layers
-        concatenated along the feature dimension, along with a frequency vector corresponding
-        to each non-padding token.
-
-        The output activations tensor will have shape:
-            (num_tokens, num_layers * d_model)
-        where num_tokens is the total number of non-padding tokens across the dataset.
-        The frequency vector (of shape (num_tokens,)) is built from a vocabulary frequency
-        computed over the dataset.
+        Extract activations for every non-padding, non-BOS token in the dataset.
 
         Args:
-            dataset (ConceptDataset): Dataset yielding samples.
-            layers (List[int]): List of layer numbers to extract activations from.
-            batch_size (int): Batch size for processing the dataset.
+            dataset: Dataset yielding batches with at least a "prompt" key.
+            layers: Layer indices from which to extract activations.
+            batch_size: Number of prompts per forward pass.
+            stack: If False (default), return a list with one tensor per layer,
+                   each of shape (num_tokens, d_model). If True, concatenate all
+                   layers along the feature dimension and return a single tensor
+                   of shape (num_tokens, len(layers) * d_model).
 
         Returns:
-            A tuple (stacked_activations, freq) where:
-            - stacked_activations: Tensor of shape (num_tokens, num_layers * d_model)
-                containing activations from all layers concatenated along the feature dimension.
-            - freq: Tensor of shape (num_tokens,), where each entry is the frequency of that token.
+            A tuple (activations, freq) where:
+              - activations: list of (num_tokens, d_model) tensors (one per layer),
+                             or a single (num_tokens, len(layers)*d_model) tensor
+                             when stack=True.
+              - freq: (num_tokens,) int tensor; each entry is the global frequency
+                      of that token in the dataset (useful for inverse-frequency
+                      weighted sampling during initialization).
         """
-        # Build the global vocabulary frequency dictionary.
         vocab_freq = self.build_vocab_frequency(dataset, batch_size=batch_size)
-        
-        data = self._get_data_as_tensors(dataset, batch_size)
-        # Initialize lists to collect activations for each layer.
-        all_layer_activations = [[] for _ in layers]
-        all_token_ids = []
+        pad_id = self.model.tokenizer.pad_token_id
+        bos_id = self.model.tokenizer.bos_token_id
 
-        with torch.no_grad():
-            for batch in tqdm(data, desc="Generating stacked activations with freq"):
-                if isinstance(batch, dict):
-                    inputs = {k: v.to(self.data_device) for k, v in batch.items()}
-                    input_ids = inputs["input_ids"]
-                else:
-                    input_ids = batch.to(self.data_device)
-                    inputs = None
+        per_layer: List[List[torch.Tensor]] = [[] for _ in layers]
+        all_token_ids: List[torch.Tensor] = []
 
-                # Run the model and obtain cache.
-                _, cache = self.model.run_with_cache(input_ids)
-                
-                # Create a mask to identify non-padding tokens.
-                pad_token_id = self.model.tokenizer.pad_token_id
-                bos_token_id = self.model.tokenizer.bos_token_id
-                mask = (input_ids != pad_token_id) & (input_ids != bos_token_id)
+        for input_ids in tqdm(self._tokenize_dataset(dataset, batch_size), desc="Generating activations"):
+            input_ids = input_ids.to(self.data_device)
+            _, cache = self.model.run_with_cache(input_ids)
 
-                # Extract non-padding token IDs.
-                nonpad_ids = input_ids[mask.bool()].view(-1)
-                all_token_ids.append(nonpad_ids.cpu())
-                
-                for idx, layer in enumerate(layers):
-                    hook_str = self._get_mlp_hook_string(layer)
-                    # Get the activations (batch_size, seq_len, d_model)
-                    acts = cache[hook_str].detach().to(self.data_device)
-                    # Extract only non-padding activations.
-                    nonpad_acts = acts[mask.bool()].view(-1, acts.size(-1))
-                    all_layer_activations[idx].append(nonpad_acts.cpu())
-                
-                del cache
-                torch.cuda.empty_cache()
-        
-        # Concatenate activations for each layer.
-        final_activations = [torch.cat(layer_acts, dim=0) for layer_acts in all_layer_activations]
-        # Stack activations from all layers along the feature dimension.
-        stacked_activations = torch.cat(final_activations, dim=1)
-        token_ids_all = torch.cat(all_token_ids, dim=0)
-        # Build the frequency vector: for each token in token_ids_all, look up its global frequency.
-        freq = torch.tensor([vocab_freq[token.item()] for token in token_ids_all])
+            mask = (input_ids != pad_id) & (input_ids != bos_id)
+            all_token_ids.append(input_ids[mask].cpu())
+
+            for idx, layer in enumerate(layers):
+                acts = cache[self._hook_str(layer)].detach().to(self.data_device)
+                per_layer[idx].append(acts[mask].cpu())
+
+            del cache
+            torch.cuda.empty_cache()
+
         self.model.reset_hooks()
-        return stacked_activations, freq
+        layer_tensors = [torch.cat(parts, dim=0) for parts in per_layer]
+        token_ids_all = torch.cat(all_token_ids, dim=0)
+        freq = torch.tensor([vocab_freq[t.item()] for t in token_ids_all])
 
+        if stack:
+            return torch.cat(layer_tensors, dim=1), freq
+        return layer_tensors, freq
 
+    @torch.no_grad()
     def generate_period_activations(
         self,
         dataset: Union[ConceptDataset, SupervisedConceptDataset],
@@ -259,148 +141,87 @@ class ActivationGenerator:
         batch_size: int = 5,
     ) -> List[torch.Tensor]:
         """
-        For each sample in the dataset, returns the activations corresponding to period tokens (".")
-        from multiple layers.
-        
-        The output for each layer is a tensor of shape:
-            (num_period_tokens, d_model)
-        where num_period_tokens is the total number of period tokens across the dataset.
-        
+        Extract activations at sentence-ending period tokens (".").
+
         Args:
-            dataset (ConceptDataset): Dataset yielding samples.
-            layers (List[int]): List of layer numbers to extract activations from.
-            batch_size (int): Batch size for processing the dataset.
-        
+            dataset: Dataset yielding batches with at least a "prompt" key.
+            layers: Layer indices from which to extract activations.
+            batch_size: Number of prompts per forward pass.
+
         Returns:
-            A list of tensors, one per layer, each of shape (num_period_tokens, d_model),
-            corresponding to activations for period tokens.
+            List of tensors (one per layer), each of shape (num_period_tokens, d_model).
         """
-        data = self._get_data_as_tensors(dataset, batch_size)
-        period_layer_activations = [[] for _ in layers]
-        
-        with torch.no_grad():
-            for batch in tqdm(data, desc="Generating period activations"):
-                if isinstance(batch, dict):
-                    inputs = {k: v.to(self.data_device) for k, v in batch.items()}
-                    input_ids = inputs["input_ids"]
-                else:
-                    input_ids = batch.to(self.data_device)
-                    inputs = None
+        period_id = self.model.tokenizer.encode(".")[0]
+        per_layer: List[List[torch.Tensor]] = [[] for _ in layers]
 
-                # Run the model and obtain cache.
-                _, cache = self.model.run_with_cache(input_ids)
-                
-                # Create a mask for period tokens.
-                period_mask = self._get_period_mask(input_ids)
-                
-                for idx, layer in enumerate(layers):
-                    hook_str = self._get_mlp_hook_string(layer)
-                    # Get activations: shape (batch_size, seq_len, d_model)
-                    acts = cache[hook_str].detach().to(self.data_device)
-                    # Extract activations corresponding to period tokens.
-                    period_acts = acts[period_mask.bool()].view(-1, acts.size(-1))
-                    period_layer_activations[idx].append(period_acts.cpu())
-                
-                del cache
-                torch.cuda.empty_cache()
-        
-        final_period_activations = [torch.cat(layer_acts, dim=0) for layer_acts in period_layer_activations]
-        return final_period_activations
+        for input_ids in tqdm(self._tokenize_dataset(dataset, batch_size), desc="Generating period activations"):
+            input_ids = input_ids.to(self.data_device)
+            _, cache = self.model.run_with_cache(input_ids)
+            mask = input_ids == period_id
+
+            for idx, layer in enumerate(layers):
+                acts = cache[self._hook_str(layer)].detach().to(self.data_device)
+                per_layer[idx].append(acts[mask].cpu())
+
+            del cache
+            torch.cuda.empty_cache()
+
+        return [torch.cat(parts, dim=0) for parts in per_layer]
 
 
-
-def extract_token_ids_sample_ids_and_labels(dataset: ConceptDataset, act_generator: ActivationGenerator, batch_size: int = 5):
+def extract_token_ids(
+    dataset,
+    act_generator: ActivationGenerator,
+    batch_size: int = 5,
+) -> Tuple[torch.Tensor, List[int], Optional[List]]:
     """
-    Efficiently extract non-padding token IDs and corresponding labels from a dataset using the provided
-    act_generator's tokenizer (without running the model or extracting activations).
+    Tokenize the dataset and return token IDs, sample IDs, and per-token labels —
+    without running the language model forward pass.
+
+    Each token at position j in sample i receives sample index i (0-based). Padding
+    and BOS tokens are excluded.
 
     Args:
-        dataset (ConceptDataset): A dataset instance that yields batches with at least a "prompt" key.
-        act_generator (ActivationGenerator): Instance with a model containing a tokenizer and data_device.
-        batch_size (int): Batch size for processing the dataset.
+        dataset: Dataset with a get_batches method returning dicts with at least
+                 "prompt". If batches also contain a "label" key (e.g.
+                 SupervisedConceptDataset), per-token labels are returned.
+        act_generator: Provides the tokenizer and data_device.
+        batch_size: Number of prompts per tokenization call.
 
     Returns:
-        token_ids (torch.Tensor): Tensor of shape (num_tokens,) containing the token IDs
-                                  for all non-padding tokens in the dataset.
-        labels (List): List of labels corresponding to each non-padding token.
+        token_ids:  (num_tokens,) LongTensor of token IDs for every non-pad/BOS position.
+        sample_ids: List[int] of length num_tokens; the 0-based dataset index per token.
+        labels:     Per-token label list (each sample's label repeated for all its tokens)
+                    if the dataset provides "label" batches; otherwise None.
     """
-    all_token_ids = []
-    all_labels = []
-    sample_ids = []
-    pad_token_id = act_generator.model.tokenizer.pad_token_id
-    idx = 0
+    model = act_generator.model
+    pad_id = model.tokenizer.pad_token_id
+    bos_id = model.tokenizer.bos_token_id
+
+    all_token_ids: List[torch.Tensor] = []
+    sample_ids: List[int] = []
+    labels: Optional[List] = None
+    sample_idx = 0
 
     for batch in tqdm(dataset.get_batches(batch_size=batch_size), desc="Extracting token IDs"):
-        prompts = batch['prompt']
-        labels = batch['label']
-        
-        # Tokenize the prompts (using left padding to be consistent)
-        tokens = act_generator.model.to_tokens(prompts, padding_side="left")
-        
+        input_ids = model.to_tokens(batch["prompt"], padding_side="left").to(act_generator.data_device)
+        mask = (input_ids != pad_id) & (input_ids != bos_id)
+        counts = mask.sum(dim=1).tolist()
 
-        input_ids = tokens.to(act_generator.data_device)
-        pad_token_id = act_generator.model.tokenizer.pad_token_id
-        bos_token_id = act_generator.model.tokenizer.bos_token_id
-        attention_mask = (input_ids != pad_token_id) & (input_ids != bos_token_id)
-        
-        # Count non-padding tokens per sample and repeat labels accordingly
-        num_non_padding = attention_mask.sum(dim=1).squeeze()
-        for n, label in zip(num_non_padding, labels):
-            all_labels += [label] * n
-            sample_ids += [idx] * n
-            idx += 1
-        
-        # Filter out pad tokens and collect token IDs
-        nonpad_ids = input_ids[attention_mask].view(-1)
-        all_token_ids.append(nonpad_ids.cpu())
+        batch_labels = batch.get("label")
+        if batch_labels is not None:
+            if labels is None:
+                labels = []
+            for n, lab in zip(counts, batch_labels):
+                n = int(n)
+                labels.extend([lab] * n)
+                sample_ids.extend([sample_idx] * n)
+                sample_idx += 1
+        else:
+            for n in counts:
+                sample_ids.extend([sample_idx] * int(n))
+                sample_idx += 1
 
-    token_ids = torch.cat(all_token_ids, dim=0)
-    return token_ids, sample_ids, all_labels
+        all_token_ids.append(input_ids[mask].cpu())
 
-
-import torch
-from tqdm import tqdm
-
-def extract_token_ids_and_sample_ids(dataset: ConceptDataset, act_generator: ActivationGenerator, batch_size: int = 5):
-    """
-    Efficiently extract non-padding token IDs and sample IDs from a dataset using the provided
-    act_generator's tokenizer (without running the model or extracting activations).
-
-    Args:
-        dataset (ConceptDataset): A dataset instance that yields batches with at least a "prompt" key.
-        act_generator (ActivationGenerator): Instance with a model containing a tokenizer and data_device.
-        batch_size (int): Batch size for processing the dataset.
-
-    Returns:
-        token_ids (torch.Tensor): Tensor of shape (num_tokens,) containing the token IDs
-                                  for all non-padding tokens in the dataset.
-        sample_ids (List[int]): List of sample IDs corresponding to each non-padding token.
-    """
-    all_token_ids = []
-    sample_ids = []
-    pad_token_id = act_generator.model.tokenizer.pad_token_id
-    bos_token_id = act_generator.model.tokenizer.bos_token_id
-    idx = 0
-
-    for batch in tqdm(dataset.get_batches(batch_size=batch_size), desc="Extracting token IDs"):
-        prompts = batch['prompt']
-
-        # Tokenize the prompts (using left padding to be consistent)
-        tokens = act_generator.model.to_tokens(prompts, padding_side="left")
-        input_ids = tokens.to(act_generator.data_device)
-
-        # Create attention mask ignoring PAD and BOS
-        attention_mask = (input_ids != pad_token_id) & (input_ids != bos_token_id)
-
-        # Count non-padding tokens per sample and repeat sample IDs accordingly
-        num_non_padding = attention_mask.sum(dim=1).squeeze()
-        for n in num_non_padding:
-            sample_ids += [idx] * n
-            idx += 1
-
-        # Filter out pad tokens and collect token IDs
-        nonpad_ids = input_ids[attention_mask].view(-1)
-        all_token_ids.append(nonpad_ids.cpu())
-
-    token_ids = torch.cat(all_token_ids, dim=0)
-    return token_ids, sample_ids
+    return torch.cat(all_token_ids, dim=0), sample_ids, labels

@@ -6,10 +6,25 @@ from transformer_lens import HookedTransformer, utils
 
 
 class MFASteerer:
+    """
+    Steers LLM residual-stream (or MLP) activations using an MFA model.
+
+    Two intervention strategies are supported:
+
+    1. **Mean steering** (`intervene` / `generate`):
+       x' = (1 - alpha) * x + alpha * mu_k
+       Interpolates the activation towards the centroid of component k.
+
+    2. **Latent two-stage steering** (`intervene_latent` / `generate_latent`):
+       Step 1: x1 = x + alpha_centroid * (mu_k - x)   (centroid pull)
+       Step 2: x' = x1 + W_k @ z                       (within-subspace move)
+       Combines centroid pull with an explicit displacement in the local subspace.
+    """
+
     _SITES = {
-        "resid_post":  lambda L: f"blocks.{L}.hook_resid_post",
-        "mlp_act":     lambda L: f"blocks.{L}.mlp.hook_post",
-        "mlp_out":     lambda L: f"blocks.{L}.hook_mlp_out",
+        "resid_post": lambda L: f"blocks.{L}.hook_resid_post",
+        "mlp_act":    lambda L: f"blocks.{L}.mlp.hook_post",
+        "mlp_out":    lambda L: f"blocks.{L}.hook_mlp_out",
     }
 
     def __init__(self, model: HookedTransformer, mfa, intervention_type: str = "resid_post"):
@@ -19,142 +34,123 @@ class MFASteerer:
         self.mfa = mfa
         self.intervention_type = intervention_type
 
+    # ---- internals ----
+
     def _site(self, layer: int) -> str:
         return self._SITES[self.intervention_type](layer)
 
-    def _flatten(self, value: torch.Tensor):
-        orig_shape = value.shape
+    def _to_tokens(self, prompt_or_tokens: Union[str, torch.Tensor]) -> torch.Tensor:
+        if isinstance(prompt_or_tokens, str):
+            return self.model.to_tokens(prompt_or_tokens)
+        return prompt_or_tokens
+
+    def _make_hooks(self, hook_fn, layers: List[int]):
+        return [(self._site(L), hook_fn) for L in layers]
+
+    @staticmethod
+    def _flatten(value: torch.Tensor):
+        """Flatten (B, T, D) -> (B*T, D) for hook functions; no-op for (N, D)."""
         if value.ndim == 3:
-            B, P, D = value.shape
-            flat = value.reshape(B * P, D)
-            return flat, orig_shape
-        elif value.ndim == 2:
-            return value, orig_shape
-        else:
-            return None, orig_shape
+            B, T, D = value.shape
+            return value.reshape(B * T, D), value.shape
+        return value, value.shape
 
     def _get_W(self) -> torch.Tensor:
-        if hasattr(self.mfa, "W"):
-            return self.mfa.W
-        if hasattr(self.mfa, "Lambda"):
-            return self.mfa.Lambda
-        if hasattr(self.mfa, "loadings"):
-            return self.mfa.loadings
+        for attr in ("W", "Lambda", "loadings"):
+            if hasattr(self.mfa, attr):
+                return getattr(self.mfa, attr)
         raise AttributeError("MFA loadings not found: expected .W, .Lambda, or .loadings")
-
-    def _normalize_z(self, z: Union[torch.Tensor, list], device, dtype) -> torch.Tensor:
-        if not isinstance(z, torch.Tensor):
-            z = torch.tensor(z)
-        return z.to(device=device, dtype=dtype)
 
     def _responsibilities(self, flat: torch.Tensor) -> torch.Tensor:
         r = self.mfa.responsibilities(flat)  # (N, K)
-        if r.device != flat.device:
-            r = r.to(flat.device)
-        if r.dtype != torch.float32:
-            r = r.float()
-        return r
+        return r.to(device=flat.device, dtype=torch.float32)
+
+    # ---- hook constructors ----
 
     def _hook_mean(self, alpha: float, k: Optional[int]):
-        mfa = self.mfa
-        mu = mfa.mu  # (K, D)
+        """Hook that pulls activations towards centroid mu_k (or mixture centroid if k=None)."""
+        mu = self.mfa.mu  # (K, D)
 
         @torch.inference_mode()
         def hook_fn(value: torch.Tensor, hook) -> torch.Tensor:
             flat, orig_shape = self._flatten(value)
-            if flat is None:
-                return value
-
             device, dtype = flat.device, flat.dtype
             mu_local = mu.to(device=device, dtype=dtype)
 
             if k is None:
-                r = self._responsibilities(flat)                    # fp32
-                target = (r @ mu_local.float()).to(dtype=dtype)     # (N, D)
+                r = self._responsibilities(flat)
+                target = (r @ mu_local.float()).to(dtype=dtype)
             else:
-                if not (0 <= k < mu_local.shape[0]):
-                    raise ValueError(f"k must be in [0,{mu_local.shape[0]-1}] or None")
                 target = mu_local[k].expand_as(flat)
 
-            out = (1.0 - alpha) * flat + alpha * target
-            return out.reshape(orig_shape)
+            return ((1.0 - alpha) * flat + alpha * target).reshape(orig_shape)
 
         return hook_fn
-    
-    def _hook_latent_two_stage(
-        self,
-        alpha_centroid: float,
-        z: Union[torch.Tensor, list],
-        k: Optional[int],
-    ):
-        mfa = self.mfa
-        mu = mfa.mu
+
+    def _hook_latent_two_stage(self, alpha_centroid: float, z: Union[torch.Tensor, list], k: Optional[int]):
+        """
+        Hook that first pulls towards the centroid, then moves along the local subspace.
+
+        Step 1:  x1 = x + alpha_centroid * (mu_k - x)
+        Step 2:  x' = x1 + W_k @ z
+        """
+        mu = self.mfa.mu
         W = self._get_W()
 
         @torch.inference_mode()
         def hook_fn(value: torch.Tensor, hook) -> torch.Tensor:
             flat, orig_shape = self._flatten(value)
-            if flat is None:
-                return value
-
             device, dtype = flat.device, flat.dtype
             mu_local = mu.to(device=device, dtype=dtype)
             W_local  = W.to(device=device, dtype=dtype)
-            z_local  = self._normalize_z(z, device, dtype)
 
-            K, Dm = mu_local.shape
-            Kw, Dw, q = W_local.shape
-            if Kw != K or Dw != Dm:
-                raise ValueError(f"Expected W shape (K,D,q) matching mu (K,D); got W={W_local.shape}, mu={mu_local.shape}")
+            z_local = z if isinstance(z, torch.Tensor) else torch.tensor(z)
+            z_local = z_local.to(device=device, dtype=dtype)
 
+            K, D = mu_local.shape
+            _, _, q = W_local.shape
             N = flat.shape[0]
 
             if k is not None:
-                if not (0 <= k < K):
-                    raise ValueError(f"k must be in [0,{K-1}] or None")
-
-                # Step 1: centroid pull
-                centroid = mu_local[k].unsqueeze(0).expand(N, Dm)
+                centroid = mu_local[k].unsqueeze(0).expand(N, D)
                 x1 = flat + alpha_centroid * (centroid - flat)
 
-                # Step 2: within move (NOT scaled by alpha_centroid)
                 if z_local.ndim == 1:
-                    delta = (W_local[k] @ z_local).view(1, Dm).expand(N, Dm)
+                    delta = (W_local[k] @ z_local).view(1, D).expand(N, D)
                 elif z_local.ndim == 2 and z_local.shape == (N, q):
                     delta = z_local @ W_local[k].T
                 else:
-                    raise ValueError(f"When k is specified, z must be (q,) or (N,q) with (N,q)=({N},{q}). Got {tuple(z_local.shape)}")
+                    raise ValueError(
+                        f"When k is specified, z must be (q,) or (N,q)=({N},{q}). Got {tuple(z_local.shape)}"
+                    )
+                return (x1 + delta).reshape(orig_shape)
 
-                out = x1 + delta
-                return out.reshape(orig_shape)
+            # k is None: use responsibility-weighted centroid and loadings
+            r = self._responsibilities(flat)  # (N, K) fp32
 
-            r = self._responsibilities(flat)  # (N, K) in fp32
-
-            centroid = (r @ mu_local.float()).to(dtype=dtype)   # (N,D)
+            centroid = (r @ mu_local.float()).to(dtype=dtype)
             x1 = flat + alpha_centroid * (centroid - flat)
 
             if z_local.ndim == 1:
-                # delta_n = (sum_k r_nk W_k) z
-                W_eff = torch.einsum("nk,kdq->ndq", r, W_local.float())      # (N,D,q) fp32
-                delta = torch.einsum("ndq,q->nd", W_eff, z_local.float())    # (N,D) fp32
-                delta = delta.to(dtype=dtype)
+                W_eff = torch.einsum("nk,kdq->ndq", r, W_local.float())
+                delta = torch.einsum("ndq,q->nd", W_eff, z_local.float()).to(dtype=dtype)
             elif z_local.ndim == 2 and z_local.shape == (N, q):
-                W_eff = torch.einsum("nk,kdq->ndq", r, W_local.float())      # (N,D,q)
-                delta = torch.einsum("ndq,nq->nd", W_eff, z_local.float())   # (N,D)
-                delta = delta.to(dtype=dtype)
+                W_eff = torch.einsum("nk,kdq->ndq", r, W_local.float())
+                delta = torch.einsum("ndq,nq->nd", W_eff, z_local.float()).to(dtype=dtype)
             elif z_local.ndim == 2 and z_local.shape == (K, q):
-                # per-component z_k: delta_n = sum_k r_nk (W_k z_k)
-                Wz_k = torch.einsum("kdq,kq->kd", W_local.float(), z_local.float())  # (K,D)
-                delta = (r @ Wz_k).to(dtype=dtype)                                   # (N,D)
+                Wz_k = torch.einsum("kdq,kq->kd", W_local.float(), z_local.float())
+                delta = (r @ Wz_k).to(dtype=dtype)
             else:
                 raise ValueError(
-                    f"When k=None, z must be (q,), (N,q)=({N},{q}), or (K,q)=({K},{q}). Got {tuple(z_local.shape)}"
+                    f"When k=None, z must be (q,), (N,q)=({N},{q}), or (K,q)=({K},{q}). "
+                    f"Got {tuple(z_local.shape)}"
                 )
 
-            out = x1 + delta
-            return out.reshape(orig_shape)
+            return (x1 + delta).reshape(orig_shape)
 
         return hook_fn
+
+    # ---- public API ----
 
     @torch.inference_mode()
     def intervene(
@@ -164,9 +160,9 @@ class MFASteerer:
         alpha: float,
         k: Optional[int] = None,
     ) -> torch.Tensor:
-        tokens = self.model.to_tokens(prompt_or_tokens) if isinstance(prompt_or_tokens, str) else prompt_or_tokens
-        hook = self._hook_mean(alpha=alpha, k=k)
-        hooks = [(self._site(L), hook) for L in layers]
+        """Run a single forward pass with mean steering; returns logits."""
+        tokens = self._to_tokens(prompt_or_tokens)
+        hooks = self._make_hooks(self._hook_mean(alpha, k), layers)
         return self.model.run_with_hooks(tokens, fwd_hooks=hooks)
 
     @torch.inference_mode()
@@ -182,10 +178,10 @@ class MFASteerer:
         top_p: Optional[float] = None,
         do_sample: bool = True,
     ) -> str:
-        tokens = self.model.to_tokens(prompt_or_tokens) if isinstance(prompt_or_tokens, str) else prompt_or_tokens
-        hook = self._hook_mean(alpha=alpha, k=k)
-        hooks = [(self._site(L), hook) for L in layers]
-        out_tokens = self.model.generate(
+        """Generate text with mean steering applied at every forward pass."""
+        tokens = self._to_tokens(prompt_or_tokens)
+        hooks = self._make_hooks(self._hook_mean(alpha, k), layers)
+        out = self.model.generate(
             tokens,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
@@ -194,10 +190,10 @@ class MFASteerer:
             do_sample=do_sample,
             fwd_hooks=hooks,
         )
-        return self.model.to_string(out_tokens[0])
+        return self.model.to_string(out[0])
 
     @torch.inference_mode()
-    def intervene_to_latent_two_stage(
+    def intervene_latent(
         self,
         prompt_or_tokens: Union[str, torch.Tensor],
         layers: List[int],
@@ -205,13 +201,13 @@ class MFASteerer:
         z: Union[torch.Tensor, list],
         k: Optional[int] = None,
     ) -> torch.Tensor:
-        tokens = self.model.to_tokens(prompt_or_tokens) if isinstance(prompt_or_tokens, str) else prompt_or_tokens
-        hook = self._hook_latent_two_stage(alpha_centroid=alpha_centroid, z=z, k=k)
-        hooks = [(self._site(L), hook) for L in layers]
+        """Run a single forward pass with latent two-stage steering; returns logits."""
+        tokens = self._to_tokens(prompt_or_tokens)
+        hooks = self._make_hooks(self._hook_latent_two_stage(alpha_centroid, z, k), layers)
         return self.model.run_with_hooks(tokens, fwd_hooks=hooks)
 
     @torch.inference_mode()
-    def generate_to_latent_two_stage(
+    def generate_latent(
         self,
         prompt_or_tokens: Union[str, torch.Tensor],
         layers: List[int],
@@ -224,10 +220,10 @@ class MFASteerer:
         top_p: Optional[float] = None,
         do_sample: bool = True,
     ) -> str:
-        tokens = self.model.to_tokens(prompt_or_tokens) if isinstance(prompt_or_tokens, str) else prompt_or_tokens
-        hook = self._hook_latent_two_stage(alpha_centroid=alpha_centroid, z=z, k=k)
-        hooks = [(self._site(L), hook) for L in layers]
-        out_tokens = self.model.generate(
+        """Generate text with latent two-stage steering applied at every forward pass."""
+        tokens = self._to_tokens(prompt_or_tokens)
+        hooks = self._make_hooks(self._hook_latent_two_stage(alpha_centroid, z, k), layers)
+        out = self.model.generate(
             tokens,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
@@ -236,10 +232,10 @@ class MFASteerer:
             do_sample=do_sample,
             fwd_hooks=hooks,
         )
-        return self.model.to_string(out_tokens[0])
+        return self.model.to_string(out[0])
 
     @torch.inference_mode()
-    def generate_to_latent_two_stage_sampling(
+    def generate_latent_sampling(
         self,
         prompt: str,
         layers: List[int],
@@ -255,36 +251,45 @@ class MFASteerer:
         m: int = 1,
         use_past_kv_cache: bool = True,
     ) -> List[str]:
+        """
+        Generate m independent samples with latent two-stage steering.
+
+        Args:
+            prompt: Input text.
+            layers: Layers at which to apply the hook.
+            alpha_centroid: Centroid pull strength.
+            z: Latent displacement vector(s).
+            k: Component index (None uses responsibility-weighted mixture).
+            max_new_tokens: Maximum tokens to generate per sample.
+            m: Number of independent samples to generate in parallel.
+            use_past_kv_cache: Use KV cache for efficient autoregressive generation.
+
+        Returns:
+            List of m generated strings (each includes the prompt).
+        """
         device = self.model.cfg.device
-        tokens = self.model.to_tokens(prompt).to(device) # [1, T]
-        tokens = tokens.repeat(m, 1) # [m, T]
+        tokens = self.model.to_tokens(prompt).to(device).repeat(m, 1)
 
         past_kv_cache = None
         if use_past_kv_cache:
             from transformer_lens import HookedTransformerKeyValueCache
             past_kv_cache = HookedTransformerKeyValueCache.init_cache(self.model.cfg, device, m)
 
-        hook = self._hook_latent_two_stage(alpha_centroid=alpha_centroid, z=z, k=k)
-        fwd_hooks = [(self._site(L), hook) for L in layers]
+        hook_fn = self._hook_latent_two_stage(alpha_centroid, z, k)
+        fwd_hooks = self._make_hooks(hook_fn, layers)
 
         for i in range(max_new_tokens):
-            if use_past_kv_cache:
-                if i == 0:
-                    logits = self.model.run_with_hooks(tokens, fwd_hooks=fwd_hooks, past_kv_cache=past_kv_cache)
-                else:
-                    logits = self.model.run_with_hooks(tokens[:, -1:], fwd_hooks=fwd_hooks, past_kv_cache=past_kv_cache)
-            else:
-                logits = self.model.run_with_hooks(tokens, fwd_hooks=fwd_hooks)
+            inp = tokens if (i == 0 or not use_past_kv_cache) else tokens[:, -1:]
+            logits = self.model.run_with_hooks(inp, fwd_hooks=fwd_hooks, past_kv_cache=past_kv_cache)
 
-            last_logits = logits[:, -1, :] # [m, d_vocab]
             next_tok = utils.sample_logits(
-                last_logits,
+                logits[:, -1, :],
                 top_k=top_k,
                 top_p=top_p,
                 temperature=temperature,
                 freq_penalty=freq_penalty,
                 tokens=tokens,
-            ).unsqueeze(1)  # [m, 1]
+            ).unsqueeze(1)
             tokens = torch.cat([tokens, next_tok], dim=1)
 
         return [self.model.to_string(tokens[i]) for i in range(m)]

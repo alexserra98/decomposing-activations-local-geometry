@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 import heapq
 from typing import Callable, Dict, List, Tuple, Any, Optional, Union, Literal
 from collections import defaultdict
@@ -18,17 +17,26 @@ def get_top_strings_per_concept(
     aggregate: Literal["occurrence", "max", "sum"] = "occurrence",
 ) -> Dict[int, List[Union[str, Tuple[str, float]]]]:
     """
-    Works with the provided MFA class.
+    For each MFA component k, collect the top-scoring token strings from a loader.
 
-    score:
-      - "posterior": α_k(h) = p(k | h)  (via MFA.responsibilities)
-      - "likelihood": ll_k(h) = log p(h | k)  (via MFA.log_prob_components)
+    Args:
+        model: Trained MFA model with responsibilities() and log_prob_components() methods.
+        loader: DataLoader yielding (activations, token_ids) batches.
+        tok2str: Callable that converts a token ID to a human-readable string.
+        topk: Number of top tokens to return per component.
+        device: Device to run the model on (defaults to the model's device).
+        return_scores: If True, return (string, score) tuples instead of strings.
+        score: Scoring function.
+            "posterior"  — alpha_k(h) = p(k | h),  via model.responsibilities().
+            "likelihood" — ll_k(h) = log p(h | k),  via model.log_prob_components().
+        aggregate: How to aggregate across occurrences of the same token.
+            "occurrence" — keep top individual token occurrences (can repeat).
+            "max"        — de-duplicate by string; keep max score per token.
+            "sum"        — de-duplicate by string; sum scores across occurrences.
 
-    aggregate:
-      - "occurrence": keep top individual (token occurrence, can repeat)
-      - "max":        de-dup by token string; keep max score per token
-      - "sum":        de-dup by token string; sum scores across occurrences
-                      (for posterior, sums α; for likelihood, sums ll)
+    Returns:
+        Dict mapping component index k -> list of top token strings (or (string, score)
+        tuples if return_scores=True), sorted by descending score, length <= topk.
     """
     was_training = model.training
     model.eval()
@@ -36,114 +44,73 @@ def get_top_strings_per_concept(
     if device is None:
         device = next(model.parameters()).device
 
-    # Per-concept heaps for "occurrence"
     heaps: Dict[int, List[Tuple[float, int, str]]] = {}
-    # Per-concept maps for aggregation ("max"/"sum")
-    if aggregate == "sum":
-        agg_maps: Dict[int, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    else:
-        agg_maps = defaultdict(dict)  # type: ignore[assignment]
+    agg_maps: Dict[int, Dict[str, float]] = defaultdict(
+        lambda: defaultdict(float) if aggregate == "sum" else dict
+    )
 
     counter = 0
     K_seen: Optional[int] = None
 
     for batch in loader:
-        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-            h, toks = batch[0], batch[1]
-        else:
+        if not (isinstance(batch, (list, tuple)) and len(batch) >= 2):
             raise ValueError("Loader must yield (activations, tokens).")
-        h = h.to(device, non_blocking=True)
+        h, toks = batch[0].to(device, non_blocking=True), batch[1]
 
-        # --- Compute per-(B,K) score matrices for ranking and values ---
         if score == "posterior":
-            # α = p(k|h) in (0,1); use α for both ranking and aggregation
-            alpha = model.responsibilities(h)  # (B, K)
-            scores_rank = alpha
-            scores_value = alpha
+            scores_mat = model.responsibilities(h)     # (B, K)
         else:
-            # ll_k(h) = log p(h | k)
-            ll = model.log_prob_components(h)  # (B, K)
-            scores_rank = ll
-            scores_value = ll
+            scores_mat = model.log_prob_components(h)  # (B, K)
 
-        B, K = scores_rank.shape
+        B, K = scores_mat.shape
         if K_seen is None:
             K_seen = K
             if aggregate == "occurrence":
-                for k in range(K):
-                    heaps[k] = []
+                heaps = {k: [] for k in range(K)}
 
-        # convenience accessor for tokens
-        def get_tok_i(toks, i):
-            if isinstance(toks, torch.Tensor):
-                return toks[i]
-            elif isinstance(toks, (list, tuple)):
-                return toks[i]
-            else:
-                return (toks, i)
-
-        # Work on CPU for Python data structures
-        rank_cpu = scores_rank.detach().cpu()
-        value_cpu = scores_value.detach().cpu()
+        scores_cpu = scores_mat.detach().cpu()
 
         for i in range(B):
-            s = tok2str(get_tok_i(toks, i))
-            row_r = rank_cpu[i]   # (K,)
-            row_v = value_cpu[i]  # (K,)
-
-            # Skip if NaNs/Infs in ranking row
-            if not torch.isfinite(row_r).all():
+            row = scores_cpu[i]  # (K,)
+            if not torch.isfinite(row).all():
                 continue
+            s = tok2str(toks[i])
 
-            # Iterate over concepts
-            # (convert to python float once per (i,k))
             for k in range(K):
-                key = float(row_r[k])   # ranking key
-                val = float(row_v[k])   # value used for aggregation/return
+                val = float(row[k])
 
                 if aggregate == "occurrence":
                     hp = heaps[k]
                     if len(hp) < topk:
-                        heapq.heappush(hp, (key, counter, s))
-                    else:
-                        if key > hp[0][0]:
-                            heapq.heapreplace(hp, (key, counter, s))
+                        heapq.heappush(hp, (val, counter, s))
+                    elif val > hp[0][0]:
+                        heapq.heapreplace(hp, (val, counter, s))
                     counter += 1
-                else:
-                    # aggregate by token string
-                    if aggregate == "max":
-                        prev = agg_maps[k].get(s, float("-inf"))
-                        if val > prev:
-                            agg_maps[k][s] = val
-                    else:  # "sum"
-                        agg_maps[k][s] += val
+                elif aggregate == "max":
+                    if val > agg_maps[k].get(s, float("-inf")):
+                        agg_maps[k][s] = val
+                else:  # "sum"
+                    agg_maps[k][s] += val
 
     result: Dict[int, List[Union[str, Tuple[str, float]]]] = {}
 
     if aggregate == "occurrence":
         for k, hp in heaps.items():
-            # sort by ranking key descending
             items = sorted(hp, key=lambda t: t[0], reverse=True)
             if return_scores:
-                if score == "posterior":
-                    # return α for readability
-                    out = [(s, float(scores)) for (scores, _, s) in items]
-                else:
-                    out = [(s, float(scores)) for (scores, _, s) in items]
-                result[k] = out
+                result[k] = [(s, sc) for (sc, _, s) in items]
             else:
-                result[k] = [s for (_sc, _c, s) in items]
+                result[k] = [s for (_, _, s) in items]
     else:
         for k, d in agg_maps.items():
-            items = list(d.items())  # [(str, agg_score)]
-            items.sort(key=lambda kv: kv[1], reverse=True)
-            items = items[:topk]
+            items = sorted(d.items(), key=lambda kv: kv[1], reverse=True)[:topk]
             result[k] = items if return_scores else [s for s, _ in items]
 
     if was_training:
         model.train()
 
     return result
+
 
 @torch.no_grad()
 def get_top_indices_per_concept(
@@ -156,12 +123,22 @@ def get_top_indices_per_concept(
     score: Literal["posterior", "likelihood"] = "posterior",
 ) -> Dict[int, List[Union[int, Tuple[int, float]]]]:
     """
-    Like get_top_strings_per_concept, but returns global sample indices
-    (the index of the example in the loader's iteration order).
+    For each MFA component k, collect the top-scoring global sample indices from a loader.
+
+    Same scoring logic as get_top_strings_per_concept, but returns the 0-based
+    iteration index of each sample rather than a token string.
+
+    Args:
+        model: Trained MFA model.
+        loader: DataLoader yielding (activations, ...) batches.
+        topk: Number of top samples to return per component.
+        device: Device to run the model on.
+        return_scores: If True, return (index, score) tuples.
+        score: "posterior" or "likelihood" (see get_top_strings_per_concept).
 
     Returns:
-      Dict[k] -> list of indices (or (index, score) if return_scores=True),
-                 sorted by descending score, length <= topk
+        Dict mapping k -> list of sample indices (or (index, score) if return_scores=True),
+        sorted by descending score, length <= topk.
     """
     was_training = model.training
     model.eval()
@@ -169,38 +146,30 @@ def get_top_indices_per_concept(
     if device is None:
         device = next(model.parameters()).device
 
-    # Per-concept min-heaps of (score_key, tie_breaker, global_idx)
     heaps: Dict[int, List[Tuple[float, int, int]]] = {}
-
     global_idx = 0
     K_seen: Optional[int] = None
-    tie_breaker = 0  # strictly increases to stabilize heap ordering
+    tie_breaker = 0
 
     for batch in loader:
-        # Expect (activations, tokens) or (activations, ...)
-        if isinstance(batch, (list, tuple)) and len(batch) >= 1:
-            h = batch[0]
-        else:
+        if not (isinstance(batch, (list, tuple)) and len(batch) >= 1):
             raise ValueError("Loader must yield (activations, ...).")
+        h = batch[0].to(device, non_blocking=True)
 
-        h = h.to(device, non_blocking=True)
-
-        # --- Scores per (B, K) ---
         if score == "posterior":
-            S = model.responsibilities(h)         # (B, K), α in (0,1)
+            S = model.responsibilities(h)
         else:
-            S = model.log_prob_components(h)      # (B, K), log p(h|k)
+            S = model.log_prob_components(h)
 
         B, K = S.shape
         if K_seen is None:
             K_seen = K
-            for k in range(K):
-                heaps[k] = []
+            heaps = {k: [] for k in range(K)}
 
         S_cpu = S.detach().cpu()
 
         for i in range(B):
-            row = S_cpu[i]  # (K,)
+            row = S_cpu[i]
             if not torch.isfinite(row).all():
                 global_idx += 1
                 continue
@@ -210,19 +179,16 @@ def get_top_indices_per_concept(
                 hp = heaps[k]
                 if len(hp) < topk:
                     heapq.heappush(hp, (key, tie_breaker, global_idx))
-                else:
-                    if key > hp[0][0]:
-                        heapq.heapreplace(hp, (key, tie_breaker, global_idx))
+                elif key > hp[0][0]:
+                    heapq.heapreplace(hp, (key, tie_breaker, global_idx))
                 tie_breaker += 1
             global_idx += 1
 
-    # Build result dict
     result: Dict[int, List[Union[int, Tuple[int, float]]]] = {}
     for k, hp in heaps.items():
-        # sort by score descending
         items = sorted(hp, key=lambda t: t[0], reverse=True)
         if return_scores:
-            result[k] = [(idx, float(sc)) for (sc, _tb, idx) in items]
+            result[k] = [(idx, sc) for (sc, _tb, idx) in items]
         else:
             result[k] = [idx for (sc, _tb, idx) in items]
 

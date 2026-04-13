@@ -99,50 +99,104 @@ class MFA(nn.Module):
 
     def _core(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
+        Core E-step shared by all public methods. Computes log-likelihoods and
+        posterior latents for every (sample, component) pair in one batched pass.
+
+        The covariance of component k is  C_k = W_k W_k^T + Psi  (factor analyser).
+        Instead of inverting the D×D matrix C_k, we work with the q×q inner matrix
+
+            M_k = I_q + W_k^T Psi^{-1} W_k
+
+        which is cheap to factor (q << D). All inverses of C_k are expressed via the
+        Woodbury identity using the Cholesky L_k of M_k.
+
         Args:
-            x: (B, D)
+            x: (B, D) batch of activation vectors.
+
         Returns:
-            ll, Ez, Sz, L, v, psi
+            ll:   (B, K)    log p(x | k)  — per-sample, per-component log-likelihood.
+            Ez:   (B, K, q) E[z | x, k]  — posterior mean of the latent z.
+            Sz:   (K, q, q) Cov[z | x, k] = M_k^{-1}  — posterior covariance (batch-independent).
+            L:    (K, q, q) Cholesky factor of M_k (lower-triangular).
+            v:    (B, K, q) W_k^T Psi^{-1} (x - mu_k)  — RHS before the Cholesky solve.
+            psi:  (K, D)    diagonal noise variances.
         """
         B, D = x.shape
         if D != self.D:
             raise ValueError(f"expected input dim {self.D}, got {D}")
 
-        psi     = self._psi() # (K, D)
-        psi_inv = 1.0 / psi # (K, D)
-        W       = self._W() # (K, D, q)  (unrotated)
+        psi     = self._psi()       # (K, D)  diagonal noise Psi_k
+        psi_inv = 1.0 / psi         # (K, D)
+        W       = self._W()         # (K, D, q)  factor loadings W_k  (unrotated)
 
-        A = W * psi_inv[:, :, None].sqrt() # (K, D, q)
-        M = torch.einsum("kdi,kdj->kij", A, A) # (K, q, q)
+        # ------------------------------------------------------------------
+        # Step 1 — Cholesky of M_k = I_q + W_k^T Psi_k^{-1} W_k
+        #
+        # We write  M = A^T A + I  where  A = Psi^{-1/2} W  so that
+        # A^T A = W^T Psi^{-1} W.  L_k = cholesky(M_k) is reused in all
+        # subsequent solves, keeping everything O(q^3) per component.
+        # ------------------------------------------------------------------
+        A  = W * psi_inv[:, :, None].sqrt()         # (K, D, q)  scaled loadings
+        M  = torch.einsum("kdi,kdj->kij", A, A)     # (K, q, q)  W^T Psi^{-1} W
         Iq = torch.eye(self.q, dtype=W.dtype, device=W.device)
-        M = M + Iq[None, :, :]
-        L = torch.linalg.cholesky(M) # (K, q, q)
+        M  = M + Iq[None]                           # (K, q, q)  I + W^T Psi^{-1} W
+        L  = torch.linalg.cholesky(M)               # (K, q, q)  lower-triangular
 
-        xT_Pinv_x   = torch.einsum("bd,kd->bk", x * x, psi_inv) # (B, K)
-        xT_Pinv_mu  = torch.einsum("bd,kd->bk", x,        psi_inv * self.mu) # (B, K)
-        muT_Pinv_mu = (self.mu * self.mu * psi_inv).sum(dim=-1) # (K,)
-        xPsiInvx    = xT_Pinv_x - 2.0 * xT_Pinv_mu + muT_Pinv_mu[None, :] # (B, K)
+        # ------------------------------------------------------------------
+        # Step 2 — Mahalanobis distance under the diagonal Psi^{-1}
+        #
+        # ||x - mu_k||^2_{Psi^{-1}} expanded as:
+        #   x^T Psi^{-1} x  -  2 x^T Psi^{-1} mu_k  +  mu_k^T Psi^{-1} mu_k
+        # ------------------------------------------------------------------
+        xT_Pinv_x   = torch.einsum("bd,kd->bk", x ** 2,      psi_inv)          # (B, K)
+        xT_Pinv_mu  = torch.einsum("bd,kd->bk", x,   psi_inv * self.mu)        # (B, K)
+        muT_Pinv_mu = (self.mu ** 2 * psi_inv).sum(dim=-1)                      # (K,)
+        quad_Psi    = xT_Pinv_x - 2.0 * xT_Pinv_mu + muT_Pinv_mu[None, :]     # (B, K)
 
-        PinvW      = psi_inv[:, :, None] * W # (K, D, q)
-        WT_Pinv_x  = torch.einsum("bd,kdq->bkq", x, PinvW) # (B, K, q)
-        WT_Pinv_mu = torch.einsum("kd,kdq->kq", self.mu, PinvW) # (K, q)
-        v          = WT_Pinv_x - WT_Pinv_mu[None, :, :] # (B, K, q)
+        # ------------------------------------------------------------------
+        # Step 3 — Posterior latent and Woodbury correction
+        #
+        # v_k = W_k^T Psi^{-1} (x - mu_k)   is the natural sufficient stat for z.
+        #
+        # Posterior mean:  Ez = M_k^{-1} v_k  via Cholesky solve.
+        #   (cholesky_solve expects the RHS as (K, q, B), so we permute v.)
+        #
+        # Posterior cov:   Sz = M_k^{-1}  (same for every x in the batch).
+        #
+        # Woodbury identity rewrites the full quadratic:
+        #   (x-mu)^T C^{-1} (x-mu) = ||x-mu||^2_{Psi^{-1}}  -  v^T M^{-1} v
+        #                           = quad_Psi                -  v · Ez
+        # ------------------------------------------------------------------
+        PinvW      = psi_inv[:, :, None] * W                                    # (K, D, q)
+        WT_Pinv_x  = torch.einsum("bd,kdq->bkq", x,        PinvW)              # (B, K, q)
+        WT_Pinv_mu = torch.einsum("kd,kdq->kq",  self.mu,  PinvW)              # (K, q)
+        v          = WT_Pinv_x - WT_Pinv_mu[None, :, :]                        # (B, K, q)
 
-        v_perm = v.permute(1, 2, 0) # (K, q, B)
-        Ez_perm = torch.cholesky_solve(v_perm, L, upper=False)# (K, q, B)
-        Ez = Ez_perm.permute(2, 0, 1) # (B, K, q)
+        Ez = torch.cholesky_solve(v.permute(1, 2, 0), L, upper=False)          # (K, q, B)
+        Ez = Ez.permute(2, 0, 1)                                                # (B, K, q)
 
-        Iq_expand = Iq.expand(self.K, self.q, self.q).clone()
-        Sz = torch.cholesky_solve(Iq_expand, L, upper=False)  # (K, q, q)
+        Sz = torch.cholesky_solve(Iq.expand(self.K, self.q, self.q).clone(),
+                                  L, upper=False)                               # (K, q, q)
 
-        logdet_Psi = torch.log(psi).sum(dim=-1) # (K,)
-        logdet_M = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)  # (K,)
-        logdet_C = logdet_Psi + logdet_M # (K,)
+        quad = quad_Psi - (v * Ez).sum(dim=-1)                                  # (B, K)
 
-        vMinvv = (v * Ez).sum(dim=-1) # (B, K)
-        quad = xPsiInvx - vMinvv # (B, K)
+        # ------------------------------------------------------------------
+        # Step 4 — Log-determinant via the matrix determinant lemma
+        #
+        # log|C_k| = log|Psi_k| + log|M_k|
+        # log|M_k| = 2 * sum(log diag(L_k))   from the Cholesky factor.
+        # ------------------------------------------------------------------
+        logdet_Psi = torch.log(psi).sum(dim=-1)                                 # (K,)
+        logdet_M   = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)  # (K,)
+        logdet_C   = logdet_Psi + logdet_M                                      # (K,)
 
-        ll = -0.5 * (self.D * math.log(2.0 * math.pi) + logdet_C[None, :] + quad) # (B, K)
+        # ------------------------------------------------------------------
+        # Step 5 — Log-likelihood
+        #
+        # log p(x | k) = -1/2 [ D log(2π) + log|C_k| + (x-mu_k)^T C_k^{-1} (x-mu_k) ]
+        # ------------------------------------------------------------------
+        ll = -0.5 * (self.D * math.log(2.0 * math.pi) + logdet_C[None, :] + quad)  # (B, K)
+
         return ll, Ez, Sz, L, v, psi
 
     def responsibilities(self, x: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
@@ -163,11 +217,33 @@ class MFA(nn.Module):
         return (-self.log_prob(x)).mean()
 
     def component_posterior(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Posterior mean and covariance of the latent z for each component.
+
+        Returns:
+            Ez: (B, K, q) E[z | x, k] — coordinates in the local subspace of component k.
+            Sz: (K, q, q) Cov[z | x, k] — shared across the batch.
+        """
         _ll, Ez, Sz, *_ = self._core(x)
         Ez, Sz = self._maybe_rotate_scores(Ez, Sz)
-        return Ez, Sz 
+        return Ez, Sz
 
     def reconstruct(self, x: torch.Tensor, *, use_mixture_mean: bool = True) -> torch.Tensor:
+        """
+        Reconstruct activations from their posterior latent codes.
+
+        Each component predicts x_hat_k = mu_k + W_k E[z|x,k]. If use_mixture_mean
+        is True (default), these are averaged using the posterior mixture weights
+        (responsibilities), giving a single (B, D) reconstruction. If False,
+        returns all per-component reconstructions as (B, K, D).
+
+        Args:
+            x: (B, D) input activations.
+            use_mixture_mean: Whether to collapse components with responsibility weights.
+
+        Returns:
+            (B, D) mixture-weighted reconstruction, or (B, K, D) per-component.
+        """
         ll, Ez, _Sz, _L, _v, _psi = self._core(x)
         # Use rotated view if enabled
         W_eff = self.W
@@ -281,8 +357,12 @@ class EncodedBatch:
 
 class MFAEncoderDecoder:
     """
-    Encoder/decoder for MFA 
+    Dictionary-based encoder/decoder for an MFA model.
 
+    Builds a shared dictionary D whose columns are [mu_k | W_k[:,0] | ... | W_k[:,q-1]]
+    stacked over all K components. Encoding a batch x returns sparse-style coefficients
+    c such that c @ D.T ≈ x, where c_k = [alpha_k, alpha_k * z_k] and alpha_k is the
+    responsibility of component k.
     """
     def __init__(self, model):
         self.model = model

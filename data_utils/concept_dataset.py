@@ -15,13 +15,13 @@ class ConceptDataset:
         dedup: bool = False,
     ):
         """
-        Initialize the dataset by loading data from CSV / JSON / JSONL.
+        Load a list of prompt strings from a CSV, JSON, or JSONL file.
 
         Args:
             path: Path to a .csv, .json, or .jsonl file.
             prompt_field: Column/key name that holds the prompt string (default: 'prompt').
-            json_key: If the top-level JSON is a dict and you only want a specific key's list,
-                      provide its name. If None, all list-like values are concatenated.
+            json_key: If the top-level JSON is a dict and you only want a specific key's
+                      list, provide its name. If None, all list-like values are used.
             dedup: If True, remove duplicate prompts while preserving order.
         """
         self.path = Path(path)
@@ -45,16 +45,13 @@ class ConceptDataset:
     def _extract_prompt_from_dict(self, d: dict) -> Optional[str]:
         if not isinstance(d, dict):
             return None
-
         val = d.get(self.prompt_field)
         if isinstance(val, str) and val.strip():
             return val.strip()
-
         for k in ("sentence", "prompt", "text"):
             val = d.get(k)
             if isinstance(val, str) and val.strip():
                 return val.strip()
-
         return None
 
     def _load_csv(self):
@@ -69,15 +66,11 @@ class ConceptDataset:
     def _load_json(self):
         with self.path.open("r", encoding="utf-8") as f:
             obj = json.load(f)
-
         if isinstance(obj, list):
             self._extend_from_sequence(obj)
-
         elif isinstance(obj, dict):
-            # If user specified a particular key, read only that
             if self.json_key is not None:
-                seq = obj.get(self.json_key, [])
-                self._extend_from_sequence(seq)
+                self._extend_from_sequence(obj.get(self.json_key, []))
             else:
                 for seq in obj.values():
                     self._extend_from_sequence(seq)
@@ -95,7 +88,6 @@ class ConceptDataset:
                         obj = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-
                     if isinstance(obj, dict):
                         p = self._extract_prompt_from_dict(obj)
                         if p:
@@ -103,7 +95,6 @@ class ConceptDataset:
                     elif isinstance(obj, list):
                         self._extend_from_sequence(obj)
                 else:
-                    # Treat as raw string line
                     self.data.append(line)
 
     def _extend_from_sequence(self, seq):
@@ -127,7 +118,7 @@ class ConceptDataset:
                 seen.add(p)
                 deduped.append(p)
         self.data = deduped
-        
+
     def __len__(self):
         return len(self.data)
 
@@ -136,108 +127,98 @@ class ConceptDataset:
 
     def get_batches(self, batch_size: int) -> List[dict]:
         """
-        Group the data into batches of prompts.
+        Yield batches of prompts.
 
         Args:
             batch_size: Number of samples per batch.
 
         Returns:
-            List[dict]: A list of batches where each batch is {'prompt': List[str]}.
+            List of dicts, each with key "prompt" mapping to a list of strings.
         """
         batches = []
         for i in range(0, len(self.data), batch_size):
-            batch_data = self.data[i:i + batch_size]
-            batches.append({'prompt': list(batch_data)})
+            batches.append({"prompt": list(self.data[i:i + batch_size])})
         return batches
 
 
 class SupervisedConceptDataset:
     def __init__(self, path: str):
         """
-        Initialize the dataset by loading the data from a CSV or JSON file.
+        Load (prompt, label) pairs from a CSV or JSON file.
 
-        Supported formats (in addition to the original ones):
-          - List[dict] JSON with fields like:
-              {'parent': ..., 'level': ..., 'concept': <LABEL>, 'sentence': <PROMPT>}
-            -> label := concept, prompt := sentence
+        Supported CSV columns (tried in order):
+          "prompt"/"text"/"sentence"  x  "label"/"concept"
+
+        Supported JSON structures:
+          - List[dict]: each dict should contain a prompt field
+            ("prompt", "text", or "sentence") and a label field ("label" or "concept").
+          - dict: keys are label strings, values are lists of prompt strings.
+
+        Args:
+            path: Path to a .csv or .json file.
         """
         self.path = path
         self.data: List[Tuple[str, str]] = []
 
-        def _add_pairs_from_df(df: pd.DataFrame, prompt_col: str, label_col: str):
-            sub = df[[prompt_col, label_col]].dropna(subset=[prompt_col, label_col])
-            for p, y in zip(sub[prompt_col], sub[label_col]):
-                if isinstance(p, str) and isinstance(y, str):
-                    p2, y2 = p.strip(), y.strip()
-                    if p2 and y2:
-                        self.data.append((p2, y2))
-                else:
-                    p2 = "" if p is None else str(p).strip()
-                    y2 = "" if y is None else str(y).strip()
-                    if p2 and y2:
-                        self.data.append((p2, y2))
-
         if path.endswith(".csv"):
-            df = pd.read_csv(self.path, encoding="utf-8")
-
-            if {"prompt", "label"}.issubset(df.columns):
-                _add_pairs_from_df(df, "prompt", "label")
-            elif {"text", "label"}.issubset(df.columns):
-                _add_pairs_from_df(df, "text", "label")
-            elif {"sentence", "concept"}.issubset(df.columns):
-                _add_pairs_from_df(df, "sentence", "concept")
-            elif {"sentence", "label"}.issubset(df.columns):
-                _add_pairs_from_df(df, "sentence", "label")
-
+            self._load_csv()
         elif path.endswith(".json"):
-            df = None
-            try:
-                df = pd.read_json(self.path, encoding="utf-8")
-            except ValueError:
-                try:
-                    df = pd.read_json(self.path, orient="index", encoding="utf-8")
-                except ValueError:
-                    df = None
+            self._load_json()
+        else:
+            raise ValueError(f"Unsupported file type: {path} (use .csv or .json)")
 
-            if df is not None and isinstance(df, pd.DataFrame):
-                if {"prompt", "label"}.issubset(df.columns):
-                    _add_pairs_from_df(df, "prompt", "label")
-                elif {"text", "label"}.issubset(df.columns):
-                    _add_pairs_from_df(df, "text", "label")
-                # New format: sentence + concept (label := concept)
-                elif {"sentence", "concept"}.issubset(df.columns):
-                    _add_pairs_from_df(df, "sentence", "concept")
-                elif {"sentence", "label"}.issubset(df.columns):
-                    _add_pairs_from_df(df, "sentence", "label")
-                else:
-                    df = None
+    # ---- helpers ----
 
-            if df is None:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    loaded_data = json.load(f)
+    @staticmethod
+    def _find_columns(columns) -> Tuple[Optional[str], Optional[str]]:
+        """Return (prompt_col, label_col) for the first recognised column pair."""
+        for pc, lc in [("prompt", "label"), ("text", "label"),
+                       ("sentence", "concept"), ("sentence", "label")]:
+            if pc in columns and lc in columns:
+                return pc, lc
+        return None, None
 
-                if isinstance(loaded_data, list):
-                    for item in loaded_data:
-                        if not isinstance(item, dict):
-                            continue
-                        prompt = item.get("prompt") or item.get("text") or item.get("sentence")
-                        label = item.get("label") or item.get("concept")
-                        if prompt is None or label is None:
-                            continue
-                        p2, y2 = str(prompt).strip(), str(label).strip()
-                        if p2 and y2:
-                            self.data.append((p2, y2))
+    def _add_pair(self, prompt, label):
+        p, y = str(prompt).strip(), str(label).strip()
+        if p and y:
+            self.data.append((p, y))
 
-                elif isinstance(loaded_data, dict):
-                    for label, prompts in loaded_data.items():
-                        if label is None or prompts is None:
-                            continue
-                        for prompt in (prompts if isinstance(prompts, list) else []):
-                            if prompt is None:
-                                continue
-                            p2, y2 = str(prompt).strip(), str(label).strip()
-                            if p2 and y2:
-                                self.data.append((p2, y2))
+    # ---- loaders ----
+
+    def _load_csv(self):
+        df = pd.read_csv(self.path, encoding="utf-8")
+        pc, lc = self._find_columns(df.columns)
+        if pc is None:
+            raise ValueError(
+                f"No recognised prompt/label columns in {self.path}. "
+                f"Found: {list(df.columns)}"
+            )
+        for p, y in zip(df[pc].dropna(), df[lc].dropna()):
+            self._add_pair(p, y)
+
+    def _load_json(self):
+        with open(self.path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+
+        if isinstance(obj, list):
+            for item in obj:
+                if not isinstance(item, dict):
+                    continue
+                prompt = item.get("prompt") or item.get("text") or item.get("sentence")
+                label = item.get("label") or item.get("concept")
+                if prompt is not None and label is not None:
+                    self._add_pair(prompt, label)
+        elif isinstance(obj, dict):
+            for label, prompts in obj.items():
+                for prompt in (prompts if isinstance(prompts, list) else []):
+                    if prompt is not None:
+                        self._add_pair(prompt, label)
+        else:
+            raise ValueError(
+                f"Unsupported JSON structure in {self.path}: expected list or dict."
+            )
+
+    # ---- public interface ----
 
     def __len__(self):
         return len(self.data)
@@ -245,7 +226,34 @@ class SupervisedConceptDataset:
     def __getitem__(self, idx) -> Tuple[str, str]:
         return self.data[idx]
 
+    def select(self, s: Union[slice, range, List[int]]) -> "SupervisedConceptDataset":
+        """
+        Return a new SupervisedConceptDataset containing only the entries at self.data[s].
+
+        Args:
+            s: A slice, range, or list of integer indices selecting the desired subset.
+
+        Returns:
+            A new SupervisedConceptDataset with the selected (prompt, label) pairs.
+        """
+        subset = SupervisedConceptDataset.__new__(SupervisedConceptDataset)
+        subset.path = self.path
+        if isinstance(s, slice):
+            subset.data = self.data[s]
+        else:
+            subset.data = [self.data[i] for i in s]
+        return subset
+
     def get_batches(self, batch_size: int) -> List[dict]:
+        """
+        Yield batches of (prompt, label) pairs.
+
+        Args:
+            batch_size: Number of samples per batch.
+
+        Returns:
+            List of dicts with keys "prompt" and "label", each mapping to a list of strings.
+        """
         batches = []
         for i in range(0, len(self.data), batch_size):
             batch = self.data[i:i + batch_size]
