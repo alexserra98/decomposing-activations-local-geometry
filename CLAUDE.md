@@ -92,3 +92,8 @@ Serialization: `save_mfa(model, path)` / `load_mfa(path)` preserve all parameter
 - MFA positive parameters (`psi`, `scale`) are stored as raw values and passed through `F.softplus` — never modify them directly.
 - `model_device` is for forward passes; `data_device` is where output tensors land (useful when offloading activations to CPU while keeping the LLM on GPU/MPS).
 - The tutorial caps at 250k tokens (`MAX_TOKENS`) for speed; remove this cap for full experiments.
+
+## General Instructions
+- I don’t need to a production grade code because I am running experiments for machine learning research and I want to iterate quickly. So I care more about readability and ease of modification than about efficiency or edge cases.
+- Keep the code simple and straightforward, and avoid over-engineering. I will handle any necessary optimizations or refactoring later on.
+- Focus on the core logic and functionality, and avoid adding unnecessary features or abstractions. I want to be able to understand and modify the code easily, so please prioritize clarity and simplicity over completeness

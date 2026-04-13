@@ -13,93 +13,16 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
+import argparse
 import torch
-import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 from modeling.mfa import load_mfa
 
-# %%
-# --- Config ---
-DATA_PATH =  "/Users/alessandroserra/Desktop/phd/decomposing-activations-local-geometry/experiments/data"
-DEVICE = "mps"          # change to "cuda" or "cpu" as needed
-MODEL_PATH = f"{DATA_PATH}/mfa_model.pt"
-RESULTS_PATH = f"{DATA_PATH}/cluster_intrinsic_dims.pt"
-VARIANCE_THRESHOLD = 0.90
-MAX_SAMPLES_PER_CLUSTER = 10_000   # cap to keep SVD tractable
-BATCH_SIZE = 512
-MIN_POPULATION = 100               # threshold for flagging low-population clusters
 
-# %%
-# --- Load data ---
-X = torch.load(f"{DATA_PATH}/activations.pt")    # (N, D)
-tok = torch.load(f"{DATA_PATH}/tokens.pt")        # (N,)
+# ── Core computation ────────────────────────────────────────────────────
 
-print(f"Activations : {X.shape}  dtype={X.dtype}")
-print(f"Tokens      : {tok.shape}")
-
-# %%
-# --- Load model ---
-model = load_mfa(MODEL_PATH, map_location="cpu").to(DEVICE)
-model.eval()
-K, D, q = model.K, model.D, model.q
-print(f"MFA: K={K} components  rank={q}  D={D}")
-
-# %%
-# --- Assign each activation to its most likely cluster ---
-loader = DataLoader(TensorDataset(X, tok), batch_size=BATCH_SIZE, shuffle=False)
-
-all_assignments = []
-with torch.no_grad():
-    for x_batch, _ in tqdm(loader, desc="Computing responsibilities"):
-        r = model.responsibilities(x_batch.to(DEVICE))  # (B, K)
-        all_assignments.append(r.argmax(dim=1).cpu())   # hard assignment
-
-assignments = torch.cat(all_assignments)   # (N,)
-sizes = torch.bincount(assignments, minlength=K)
-
-print(f"\nCluster sizes — min={sizes.min().item()}  "
-      f"max={sizes.max().item()}  "
-      f"mean={sizes.float().mean():.1f}  "
-      f"median={sizes.float().median():.1f}")
-print(f"Empty clusters: {(sizes == 0).sum().item()}")
-
-# %%
-# --- Plot 1: cluster population distribution ---
-import numpy as np
-
-sizes_np   = sizes.numpy()
-sort_idx   = np.argsort(sizes_np)[::-1]
-sizes_sorted = sizes_np[sort_idx]
-colors     = [ "#1f77b4" for k in sort_idx]
-
-vmin = sizes_np.min()
-vmax = sizes_np.max()
-bin_edges = vmin + (vmax - vmin) * np.arange(0.0, 1.1, 0.1)
-counts, edges = np.histogram(sizes_np, bins=bin_edges)
-
-fig, ax = plt.subplots(figsize=(8, 4))
-ax.bar(
-    edges[:-1],
-    counts,
-    width=np.diff(edges),
-    align="edge",
-    color="#1f77b4",
-    edgecolor="black"
-)
-
-ax.set_xticks(edges)
-ax.legend()
-ax.set_title(
-    f"Cluster population distribution  (K={K})\n"
-)
-ax.set_xlabel("Cluster population")
-ax.set_ylabel("Number of clusters")
-plt.tight_layout()
-plt.show()
-# %%
-# --- PCA intrinsic dimension per cluster ---
 
 def intrinsic_dim_pca(X_cluster: torch.Tensor, threshold: float = 0.90) -> int:
     """
@@ -116,77 +39,126 @@ def intrinsic_dim_pca(X_cluster: torch.Tensor, threshold: float = 0.90) -> int:
     return int(above[0].item()) + 1 if len(above) > 0 else len(S)
 
 
-dims = torch.zeros(K, dtype=torch.long)
+def compute_intrinsic_dims(
+    model_path,
+    act_path,
+    tok_path,
+    *,
+    device="cpu",
+    batch_size=512,
+    variance_threshold=0.90,
+    min_population=100,
+    max_samples=10_000,
+):
+    """
+    Compute intrinsic dimensionality per MFA cluster.
 
-num_skipped_clusters = 0
-for k in tqdm(range(K), desc="PCA per cluster"):
-    idx = (assignments == k).nonzero(as_tuple=True)[0]
-    n = idx.numel()
-    if n < MIN_POPULATION:
-        dims[k] = 0
-        num_skipped_clusters += 1
-        continue
-    #if n > MAX_SAMPLES_PER_CLUSTER:
-    idx = idx[torch.randperm(n)]
-    dims[k] = intrinsic_dim_pca(X[idx], threshold=VARIANCE_THRESHOLD)
+    Args:
+        model_path: Path to saved MFA model.
+        act_path: Path to activations.pt (N, D).
+        tok_path: Path to tokens.pt (N,).
+        device: Device for responsibility computation.
+        batch_size: Batch size for responsibility computation.
+        variance_threshold: Fraction of variance to explain.
+        min_population: Skip clusters smaller than this.
+        max_samples: Cap samples per cluster for SVD.
 
-valid = dims > 0
-print(f"\nIntrinsic dims at {VARIANCE_THRESHOLD*100:.0f}% variance threshold:")
-print(f"  mean   = {dims[valid].float().mean():.2f}")
-print(f"  median = {dims[valid].float().median():.2f}")
-print(f"  min    = {dims[valid].min().item()}")
-print(f"  max    = {dims[valid].max().item()}")
-print(f"  MFA rank (q) = {q}  (reference)")
-print(f"Skipped {num_skipped_clusters} clusters with population < {MIN_POPULATION}")
+    Returns:
+        dict with keys: intrinsic_dims, cluster_sizes, assignments,
+                        variance_threshold, K, rank, D.
+    """
+    X = torch.load(act_path, weights_only=True)
+    tok = torch.load(tok_path, weights_only=True)
+    print(f"Activations: {X.shape}  dtype={X.dtype}")
 
-# %%
-# --- Save results ---
-results = {
-    "intrinsic_dims": dims,                 # (K,) int — 0 for empty clusters
-    "cluster_sizes": sizes,                 # (K,) int
-    "assignments": assignments,             # (N,) int
-    "variance_threshold": VARIANCE_THRESHOLD,
-    "K": K,
-    "rank": q,
-    "D": D,
-}
-torch.save(results, RESULTS_PATH)
-print(f"\nResults saved to {RESULTS_PATH}")
+    model = load_mfa(model_path, map_location="cpu").to(device)
+    model.eval()
+    K, D, q = model.K, model.D, model.q
+    print(f"MFA: K={K} components  rank={q}  D={D}")
 
-# %%
-# --- Plot ---
-fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    # Hard assignments via responsibilities
+    loader = DataLoader(TensorDataset(X, tok), batch_size=batch_size, shuffle=False)
+    all_assignments = []
+    with torch.no_grad():
+        for x_batch, _ in tqdm(loader, desc="Computing responsibilities"):
+            r = model.responsibilities(x_batch.to(device))
+            all_assignments.append(r.argmax(dim=1).cpu())
 
-d_valid = dims[valid].numpy()
-s_valid = sizes[valid].numpy()
+    assignments = torch.cat(all_assignments)
+    sizes = torch.bincount(assignments, minlength=K)
 
-# Left: histogram of intrinsic dims
-ax = axes[0]
-bins = range(1, int(d_valid.max()) + 2)
-ax.hist(d_valid, bins=bins, edgecolor="white", linewidth=0.4, color="steelblue")
-ax.axvline(d_valid.mean(), color="crimson", linestyle="--", linewidth=1.5,
-           label=f"mean = {d_valid.mean():.1f}")
-ax.axvline(q, color="darkorange", linestyle="--", linewidth=1.5,
-           label=f"MFA rank = {q}")
-ax.set_xlabel("Intrinsic dimension")
-ax.set_ylabel("# clusters")
-ax.set_title(f"Intrinsic dim distribution ({VARIANCE_THRESHOLD*100:.0f}% variance)")
-ax.legend(framealpha=0.7)
+    print(f"\nCluster sizes — min={sizes.min().item()}  "
+          f"max={sizes.max().item()}  "
+          f"mean={sizes.float().mean():.1f}  "
+          f"median={sizes.float().median():.1f}")
+    print(f"Empty clusters: {(sizes == 0).sum().item()}")
 
-# Right: intrinsic dim vs cluster size (log-scale x)
-ax = axes[1]
-ax.scatter(s_valid, d_valid, alpha=0.45, s=14, color="steelblue")
-ax.set_xscale("log")
-ax.set_xlabel("Cluster size (log scale)")
-ax.set_ylabel("Intrinsic dimension")
-ax.set_title("Intrinsic dim vs cluster size")
-ax.axhline(d_valid.mean(), color="crimson", linestyle="--", linewidth=1,
-           label=f"mean = {d_valid.mean():.1f}")
-ax.legend(framealpha=0.7)
+    # PCA intrinsic dimension per cluster
+    dims = torch.zeros(K, dtype=torch.long)
+    num_skipped = 0
 
-plt.suptitle(f"MFA cluster intrinsic dimensionality  (K={K}, rank={q}, D={D})",
-             fontsize=12)
-plt.tight_layout()
-plt.show()
+    for k in tqdm(range(K), desc="PCA per cluster"):
+        idx = (assignments == k).nonzero(as_tuple=True)[0]
+        n = idx.numel()
+        if n < min_population:
+            dims[k] = 0
+            num_skipped += 1
+            continue
+        if n > max_samples:
+            idx = idx[torch.randperm(n)[:max_samples]]
+        dims[k] = intrinsic_dim_pca(X[idx], threshold=variance_threshold)
+
+    valid = dims > 0
+    print(f"\nIntrinsic dims at {variance_threshold*100:.0f}% variance threshold:")
+    print(f"  mean   = {dims[valid].float().mean():.2f}")
+    print(f"  median = {dims[valid].float().median():.2f}")
+    print(f"  min    = {dims[valid].min().item()}")
+    print(f"  max    = {dims[valid].max().item()}")
+    print(f"  MFA rank (q) = {q}  (reference)")
+    print(f"Skipped {num_skipped} clusters with population < {min_population}")
+
+    return {
+        "intrinsic_dims": dims,
+        "cluster_sizes": sizes,
+        "assignments": assignments,
+        "variance_threshold": variance_threshold,
+        "K": K,
+        "rank": q,
+        "D": D,
+    }
 
 
+# ── CLI entry point ─────────────────────────────────────────────────────
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Intrinsic dimensionality per MFA cluster")
+    parser.add_argument("--model-path", required=True, help="Path to mfa_model.pt")
+    parser.add_argument("--act-path", required=True, help="Path to activations.pt")
+    parser.add_argument("--tok-path", required=True, help="Path to tokens.pt")
+    parser.add_argument("--save-path", default=None, help="Where to save results")
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--variance-threshold", type=float, default=0.90)
+    parser.add_argument("--min-population", type=int, default=100)
+    parser.add_argument("--max-samples", type=int, default=10_000)
+    args = parser.parse_args()
+
+    results = compute_intrinsic_dims(
+        args.model_path, args.act_path, args.tok_path,
+        device=args.device,
+        batch_size=args.batch_size,
+        variance_threshold=args.variance_threshold,
+        min_population=args.min_population,
+        max_samples=args.max_samples,
+    )
+
+    save_path = args.save_path or os.path.join(
+        os.path.dirname(args.model_path), "intrinsic_dims.pt"
+    )
+    torch.save(results, save_path)
+    print(f"Results saved to {save_path}")
+
+
+if __name__ == "__main__":
+    main()

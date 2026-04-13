@@ -17,6 +17,7 @@ class MFA(nn.Module):
         psi_per_component: bool = False, # True => Psi_k per component; False => shared Psi
         scale_init: float = 1.0, # initial loading scales s_{k,j}
         eps_floor: float = 1e-5, # numerical floor for positivity / norms
+        use_amp: bool = False, # enable mixed precision for heavy einsum ops
     ):
         super().__init__()
         if centroids.ndim != 2:
@@ -28,6 +29,7 @@ class MFA(nn.Module):
         self.K, self.D, self.q = K, D, int(rank)
         self._two_pi_logD = self.D * math.log(2.0 * math.pi)
         self._eps = float(eps_floor)
+        self.use_amp = use_amp
 
         # Means  (K, D)
         self.mu = nn.Parameter(centroids.clone())
@@ -125,16 +127,16 @@ class MFA(nn.Module):
         if D != self.D:
             raise ValueError(f"expected input dim {self.D}, got {D}")
 
+        # Detect device type for autocast (cuda or cpu; mps not supported)
+        _dev = x.device.type
+        _amp_enabled = self.use_amp and _dev in ("cuda",)
+
         psi     = self._psi()       # (K, D)  diagonal noise Psi_k
         psi_inv = 1.0 / psi         # (K, D)
         W       = self._W()         # (K, D, q)  factor loadings W_k  (unrotated)
 
         # ------------------------------------------------------------------
-        # Step 1 — Cholesky of M_k = I_q + W_k^T Psi_k^{-1} W_k
-        #
-        # We write  M = A^T A + I  where  A = Psi^{-1/2} W  so that
-        # A^T A = W^T Psi^{-1} W.  L_k = cholesky(M_k) is reused in all
-        # subsequent solves, keeping everything O(q^3) per component.
+        # Step 1 — Cholesky of M_k  (always float32 for numerical stability)
         # ------------------------------------------------------------------
         A  = W * psi_inv[:, :, None].sqrt()         # (K, D, q)  scaled loadings
         M  = torch.einsum("kdi,kdj->kij", A, A)     # (K, q, q)  W^T Psi^{-1} W
@@ -143,34 +145,22 @@ class MFA(nn.Module):
         L  = torch.linalg.cholesky(M)               # (K, q, q)  lower-triangular
 
         # ------------------------------------------------------------------
-        # Step 2 — Mahalanobis distance under the diagonal Psi^{-1}
-        #
-        # ||x - mu_k||^2_{Psi^{-1}} expanded as:
-        #   x^T Psi^{-1} x  -  2 x^T Psi^{-1} mu_k  +  mu_k^T Psi^{-1} mu_k
+        # Steps 2–3 — Mahalanobis + posterior (can use mixed precision)
         # ------------------------------------------------------------------
-        xT_Pinv_x   = torch.einsum("bd,kd->bk", x ** 2,      psi_inv)          # (B, K)
-        xT_Pinv_mu  = torch.einsum("bd,kd->bk", x,   psi_inv * self.mu)        # (B, K)
-        muT_Pinv_mu = (self.mu ** 2 * psi_inv).sum(dim=-1)                      # (K,)
-        quad_Psi    = xT_Pinv_x - 2.0 * xT_Pinv_mu + muT_Pinv_mu[None, :]     # (B, K)
+        with torch.autocast(device_type=_dev, dtype=torch.bfloat16, enabled=_amp_enabled):
+            xT_Pinv_x   = torch.einsum("bd,kd->bk", x ** 2,      psi_inv)          # (B, K)
+            xT_Pinv_mu  = torch.einsum("bd,kd->bk", x,   psi_inv * self.mu)        # (B, K)
+            muT_Pinv_mu = (self.mu ** 2 * psi_inv).sum(dim=-1)                      # (K,)
+            quad_Psi    = xT_Pinv_x - 2.0 * xT_Pinv_mu + muT_Pinv_mu[None, :]     # (B, K)
 
-        # ------------------------------------------------------------------
-        # Step 3 — Posterior latent and Woodbury correction
-        #
-        # v_k = W_k^T Psi^{-1} (x - mu_k)   is the natural sufficient stat for z.
-        #
-        # Posterior mean:  Ez = M_k^{-1} v_k  via Cholesky solve.
-        #   (cholesky_solve expects the RHS as (K, q, B), so we permute v.)
-        #
-        # Posterior cov:   Sz = M_k^{-1}  (same for every x in the batch).
-        #
-        # Woodbury identity rewrites the full quadratic:
-        #   (x-mu)^T C^{-1} (x-mu) = ||x-mu||^2_{Psi^{-1}}  -  v^T M^{-1} v
-        #                           = quad_Psi                -  v · Ez
-        # ------------------------------------------------------------------
-        PinvW      = psi_inv[:, :, None] * W                                    # (K, D, q)
-        WT_Pinv_x  = torch.einsum("bd,kdq->bkq", x,        PinvW)              # (B, K, q)
-        WT_Pinv_mu = torch.einsum("kd,kdq->kq",  self.mu,  PinvW)              # (K, q)
-        v          = WT_Pinv_x - WT_Pinv_mu[None, :, :]                        # (B, K, q)
+            PinvW      = psi_inv[:, :, None] * W                                    # (K, D, q)
+            WT_Pinv_x  = torch.einsum("bd,kdq->bkq", x,        PinvW)              # (B, K, q)
+            WT_Pinv_mu = torch.einsum("kd,kdq->kq",  self.mu,  PinvW)              # (K, q)
+            v          = WT_Pinv_x - WT_Pinv_mu[None, :, :]                        # (B, K, q)
+
+        # Cholesky solve stays in float32
+        v = v.float()
+        quad_Psi = quad_Psi.float()
 
         Ez = torch.cholesky_solve(v.permute(1, 2, 0), L, upper=False)          # (K, q, B)
         Ez = Ez.permute(2, 0, 1)                                                # (B, K, q)
