@@ -97,3 +97,7 @@ Serialization: `save_mfa(model, path)` / `load_mfa(path)` preserve all parameter
 - I don’t need to a production grade code because I am running experiments for machine learning research and I want to iterate quickly. So I care more about readability and ease of modification than about efficiency or edge cases.
 - Keep the code simple and straightforward, and avoid over-engineering. I will handle any necessary optimizations or refactoring later on.
 - Focus on the core logic and functionality, and avoid adding unnecessary features or abstractions. I want to be able to understand and modify the code easily, so please prioritize clarity and simplicity over completeness
+
+## Environment
+- You are in a slurm cluster, usually you will be in a working node with GPU, where I am accessing through tunneling with VScode.
+- In my personal folder /u/dssc/zenocosini I can do whatever I want but I have storaged capped to 200GB. Outside I can read or write so command like ´sudo apt install´ won't work. I usually keep big stuff in /orfeo/scratch/dssc/zenocosini where you should never delete anything but you can write.

@@ -49,6 +49,7 @@ def train_nll(
         iterable = enumerate(loader, 1)
         pbar = tqdm(iterable, total=steps_per_epoch)
 
+
         for batch_idx, batch in pbar:
             x = batch[0] if isinstance(batch, (tuple, list)) else batch
             x = x.view(x.size(0), -1).to(device)
@@ -94,7 +95,6 @@ def train_nll(
             best_epoch  = ep
             if save_path and save_func:
                 save_func(model, save_path)
-
         print(
             f"[epoch {ep:02d}] "
             f"train NLL={avg_train_nll:.6f}  "

@@ -1,0 +1,10 @@
+[project]
+name = "decomposing-activations-local-geometry"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=4.8.4",
+    "huggingface-hub>=0.34.0,<1.0",
+]

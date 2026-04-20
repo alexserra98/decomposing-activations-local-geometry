@@ -34,6 +34,7 @@ data/
 experiments/data/
 experiments/*.png
 experiments/*.pdf
+output_job/
 
 # Logs
 *.log
