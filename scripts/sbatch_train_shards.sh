@@ -1,12 +1,18 @@
 #!/bin/bash
-#SBATCH --partition=H100
+# ── Single knob: edit the --gres line to change #GPUs / GPU type ─────────
+# Examples:
+#     #SBATCH --gres=gpu:H100:2      (2× H100)
+#     #SBATCH --gres=gpu:A100:4      (4× A100)
+# NPROC is auto-derived from SLURM_GPUS_ON_NODE below — no other edits needed.
+# Rule of thumb: keep --cpus-per-task ≈ 8×GPUs and --mem ≈ 80G×GPUs.
+#SBATCH --partition=DGX
 #SBATCH --account=LADE
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --gres=gpu:H100:2
+#SBATCH --gres=gpu:A100:2
 #SBATCH --mem=160G
-#SBATCH --time=23:00:00
+#SBATCH --time=15:00:00
 #SBATCH --job-name=mfa_train_ddp
 #SBATCH --array=5,17
 #SBATCH --output=output_job/mfa_train_ddp_%A_%a.out
@@ -38,7 +44,8 @@ fi
 mkdir -p output_job
 cd "$SLURM_SUBMIT_DIR" || exit 1
 
-NPROC=${NPROC:-2}   # GPUs per node = processes per node for torchrun
+# Auto-derive from the --gres allocation; env override still wins.
+NPROC=${NPROC:-${SLURM_GPUS_ON_NODE:-2}}
 
 echo "=== $(date) === job $SLURM_JOB_ID.$SLURM_ARRAY_TASK_ID on $(hostname) ==="
 echo "shard_dir: $SHARD_DIR   layer: $LAYER   out_dir: $OUT_DIR"
