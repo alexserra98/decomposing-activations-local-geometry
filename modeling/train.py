@@ -39,7 +39,7 @@ def _eval_nll_tensor(model, X, device, chunk=8192):
     N = X.shape[0]
     tot = 0.0
     for i in range(0, N, chunk):
-        xb = X[i:i + chunk].view(X[i:i + chunk].size(0), -1)
+        xb = X[i:i + chunk].view(X[i:i + chunk].size(0), -1).float()
         tot += float(model.nll(xb).item()) * xb.size(0)
     return tot / max(N, 1)
 
