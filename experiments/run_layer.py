@@ -383,6 +383,7 @@ def cmd_train(args):
 def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
     """Shard-aware training path (branch B of cmd_train). DDP-aware via torchrun."""
     from pathlib import Path
+    from datetime import timedelta
     import time as _time
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel as DDP
@@ -402,7 +403,9 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         if args.device != "cuda":
             raise SystemExit("DDP requires --device cuda")
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
+        # Val streaming on rank 0 can take ~10 min while rank 1 waits at a
+        # barrier; default NCCL timeout (10 min) isn't enough.
+        dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
         device = f"cuda:{local_rank}"
         if is_main:
             print(f"[ddp] world_size={world_size} backend=nccl")
