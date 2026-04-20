@@ -437,7 +437,10 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         meta_index, val_frac=args.val_frac, seed=args.split_seed,
     )
     # Partition train positions across ranks (val stays full on rank 0 only).
-    train_pos = train_pos_full[rank::world_size]
+    # Round-robin then trim to floor(N/world) so every rank has the same
+    # number of batches — otherwise DDP hangs when one rank finishes first.
+    n_per_rank = len(train_pos_full) // world_size
+    train_pos = train_pos_full[rank::world_size][:n_per_rank]
 
     train_counts = per_subset_counts(meta_index, train_pos_full)
     val_counts = per_subset_counts(meta_index, val_pos)
