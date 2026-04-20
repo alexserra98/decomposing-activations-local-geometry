@@ -381,12 +381,37 @@ def cmd_train(args):
 
 
 def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
-    """Shard-aware training path (branch B of cmd_train)."""
+    """Shard-aware training path (branch B of cmd_train). DDP-aware via torchrun."""
     from pathlib import Path
+    import time as _time
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
     from data_utils.shard_activations import (
         ShardActivationDataset, load_meta_index,
         stratified_split, per_subset_counts,
     )
+
+    # ── DDP env ─────────────────────────────────────────────────────────
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank       = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    use_ddp    = world_size > 1
+    is_main    = (rank == 0)
+
+    if use_ddp:
+        if args.device != "cuda":
+            raise SystemExit("DDP requires --device cuda")
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+        device = f"cuda:{local_rank}"
+        if is_main:
+            print(f"[ddp] world_size={world_size} backend=nccl")
+    else:
+        device = args.device
+
+    def log(msg):
+        if is_main:
+            print(msg)
 
     shard_dir = Path(args.shard_dir)
     extract_cfg = json.loads((shard_dir / "config.json").read_text())
@@ -396,67 +421,77 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
     per_row_tokens = window - drop_prefix
 
     out_dir = Path(args.out_dir or (shard_dir / f"layer{args.layer:02d}_mfa"))
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    if use_ddp:
+        dist.barrier()
 
-    print(f"shard_dir={shard_dir}  layer={args.layer}  out_dir={out_dir}")
-    print(f"window={window}  d_model={d_model}  drop_prefix={drop_prefix}")
+    log(f"shard_dir={shard_dir}  layer={args.layer}  out_dir={out_dir}")
+    log(f"window={window}  d_model={d_model}  drop_prefix={drop_prefix}")
 
     meta_index = load_meta_index(shard_dir)
-    train_pos, val_pos = stratified_split(
+    train_pos_full, val_pos = stratified_split(
         meta_index, val_frac=args.val_frac, seed=args.split_seed,
     )
-    train_counts = per_subset_counts(meta_index, train_pos)
-    val_counts = per_subset_counts(meta_index, val_pos)
-    n_train_tok = len(train_pos) * per_row_tokens
-    n_val_tok = len(val_pos) * per_row_tokens
-    print(f"split: train rows={len(train_pos):,}  val rows={len(val_pos):,}")
-    print(f"       train tokens≈{n_train_tok:,}  val tokens≈{n_val_tok:,}")
+    # Partition train positions across ranks (val stays full on rank 0 only).
+    train_pos = train_pos_full[rank::world_size]
 
-    split_info = {
-        "seed": args.split_seed, "val_frac": args.val_frac,
-        "per_row_tokens": per_row_tokens,
-        "train_rows": len(train_pos), "val_rows": len(val_pos),
-        "train_per_subset": train_counts, "val_per_subset": val_counts,
-        "val_global_rows": [meta_index[p]["global_row"] for p in val_pos],
-    }
-    (out_dir / "val_indices.json").write_text(json.dumps(split_info, indent=2))
+    train_counts = per_subset_counts(meta_index, train_pos_full)
+    val_counts = per_subset_counts(meta_index, val_pos)
+    n_train_tok = len(train_pos_full) * per_row_tokens
+    n_val_tok = len(val_pos) * per_row_tokens
+    log(f"split: train rows={len(train_pos_full):,}  val rows={len(val_pos):,}")
+    log(f"       train tokens≈{n_train_tok:,}  val tokens≈{n_val_tok:,}")
+    if use_ddp:
+        log(f"       rank {rank}/{world_size} sees {len(train_pos):,} train rows")
+
+    if is_main:
+        split_info = {
+            "seed": args.split_seed, "val_frac": args.val_frac,
+            "per_row_tokens": per_row_tokens,
+            "train_rows": len(train_pos_full), "val_rows": len(val_pos),
+            "train_per_subset": train_counts, "val_per_subset": val_counts,
+            "val_global_rows": [meta_index[p]["global_row"] for p in val_pos],
+            "world_size": world_size,
+        }
+        (out_dir / "val_indices.json").write_text(json.dumps(split_info, indent=2))
 
     train_ds = ShardActivationDataset(
         shard_dir, layer=args.layer, row_subset=train_pos,
         drop_prefix=drop_prefix, shuffle_shards=True,
-        shuffle_within_shard=True, seed=(args.seed or 0),
+        shuffle_within_shard=True, seed=(args.seed or 0) + rank,
     )
 
     nw = args.num_workers
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, num_workers=nw,
-        pin_memory=(args.device == "cuda"),
+        pin_memory=(device != "cpu"),
         persistent_workers=(nw > 0),
     )
 
-    # Materialize val set once into a single device-resident tensor (fp16).
-    # ~3.7M tokens * 2048 * 2B ≈ 15 GB, fits alongside MFA on an H100.
-    import time as _time
-    print(f"[val] streaming {len(val_pos):,} rows into {args.device} memory...")
-    _t0 = _time.time()
-    val_ds = ShardActivationDataset(
-        shard_dir, layer=args.layer, row_subset=val_pos,
-        drop_prefix=drop_prefix, shuffle_shards=False,
-        shuffle_within_shard=False, seed=(args.seed or 0),
-        dtype=torch.float16,
-    )
-    val_prefetch = DataLoader(
-        val_ds, batch_size=args.batch_size,
-        num_workers=max(1, nw // 2),
-        pin_memory=(args.device == "cuda"),
-    )
-    val_chunks = []
-    for xb, _ in val_prefetch:
-        val_chunks.append(xb.to(args.device, non_blocking=True))
-    val_tensor = torch.cat(val_chunks, dim=0)
-    del val_chunks
-    print(f"[val] done: shape={tuple(val_tensor.shape)} dtype={val_tensor.dtype} "
-          f"in {_time.time() - _t0:.1f}s")
+    # Val set: materialize once on rank 0 only (saves 15GB on rank >0).
+    val_tensor = None
+    if is_main:
+        log(f"[val] streaming {len(val_pos):,} rows into {device} memory...")
+        _t0 = _time.time()
+        val_ds = ShardActivationDataset(
+            shard_dir, layer=args.layer, row_subset=val_pos,
+            drop_prefix=drop_prefix, shuffle_shards=False,
+            shuffle_within_shard=False, seed=(args.seed or 0),
+            dtype=torch.float16,
+        )
+        val_prefetch = DataLoader(
+            val_ds, batch_size=args.batch_size,
+            num_workers=max(1, nw // 2),
+            pin_memory=(device != "cpu"),
+        )
+        val_chunks = []
+        for xb, _ in val_prefetch:
+            val_chunks.append(xb.to(device, non_blocking=True))
+        val_tensor = torch.cat(val_chunks, dim=0)
+        del val_chunks
+        log(f"[val] done: shape={tuple(val_tensor.shape)} dtype={val_tensor.dtype} "
+            f"in {_time.time() - _t0:.1f}s")
 
     max_pool = args.max_pool_size or 2_000_000
     if args.pool_size is not None and args.pool_size > 0:
@@ -464,61 +499,83 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
     else:
         pool_size = min(max(args.K * 2, n_train_tok // 5), max_pool)
     pool_size = min(pool_size, n_train_tok)
-    print(f"Reservoir pool_size: {pool_size:,} (n_train_tokens={n_train_tok:,})")
+    log(f"Reservoir pool_size: {pool_size:,} (n_train_tokens={n_train_tok:,})")
 
     if args.seed is not None:
-        torch.manual_seed(args.seed)
+        torch.manual_seed(args.seed + rank)
 
+    # Centroids: rank 0 fits (using full train stream) if missing, then all ranks load.
     centroids_path = out_dir / "centroids.pt"
-    if centroids_path.exists():
-        centroids = torch.load(centroids_path, map_location=args.device, weights_only=True)
-        print(f"Loaded cached centroids from {centroids_path}: {tuple(centroids.shape)}")
-        if centroids.shape[0] != args.K:
-            raise SystemExit(
-                f"Cached centroids K={centroids.shape[0]} != --K {args.K}; "
-                f"delete {centroids_path} to recompute."
-            )
-    else:
+    if is_main and not centroids_path.exists():
+        full_train_ds = ShardActivationDataset(
+            shard_dir, layer=args.layer, row_subset=train_pos_full,
+            drop_prefix=drop_prefix, shuffle_shards=True,
+            shuffle_within_shard=True, seed=(args.seed or 0),
+        )
+        full_train_loader = DataLoader(
+            full_train_ds, batch_size=args.batch_size, num_workers=nw,
+            pin_memory=(device != "cpu"),
+        )
         knn = ReservoirKMeans(
             n_clusters=args.K, pool_size=pool_size,
-            vocab_size=args.vocab_size, device=args.device,
+            vocab_size=args.vocab_size, device=device,
             proj_dim=args.proj_dim, seed=args.seed,
         )
         centroids = knn.fit(
-            train_loader, token_loader=None, refine_epochs=args.refine_epochs,
+            full_train_loader, token_loader=None, refine_epochs=args.refine_epochs,
         )
         torch.save(centroids.cpu(), centroids_path)
-        print(f"Centroids: {tuple(centroids.shape)} saved to {centroids_path}")
+        log(f"Centroids: {tuple(centroids.shape)} saved to {centroids_path}")
+    if use_ddp:
+        dist.barrier()  # non-main ranks wait for centroids.pt
 
-    model = MFA(centroids=centroids, rank=args.rank).to(args.device)
+    centroids = torch.load(centroids_path, map_location=device, weights_only=True)
+    log(f"Loaded centroids from {centroids_path}: {tuple(centroids.shape)}")
+    if centroids.shape[0] != args.K:
+        raise SystemExit(
+            f"Cached centroids K={centroids.shape[0]} != --K {args.K}; "
+            f"delete {centroids_path} to recompute."
+        )
+
+    model = MFA(centroids=centroids, rank=args.rank).to(device)
     if args.compile:
-        print("Compiling model with torch.compile...")
+        log("Compiling model with torch.compile...")
         model = torch.compile(model)
+    if use_ddp:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     train_nll(
         model, train_loader,
         val_tensor=val_tensor,
         epochs=args.epochs, lr=args.lr,
         grad_clip=args.grad_clip,
-        save_path=str(out_dir / "mfa_model.pt"),
-        save_func=save_mfa,
+        save_path=str(out_dir / "mfa_model.pt") if is_main else None,
+        save_func=save_mfa if is_main else None,
         ckpt_path=str(out_dir / "checkpoint.pt"),
     )
 
-    raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-    save_mfa(raw_model, str(out_dir / "mfa_model.pt"))
+    raw_model = model.module if hasattr(model, "module") else model
+    raw_model = raw_model._orig_mod if hasattr(raw_model, "_orig_mod") else raw_model
+    if is_main:
+        save_mfa(raw_model, str(out_dir / "mfa_model.pt"))
 
-    cfg = {
-        "shard_dir": str(shard_dir), "layer": args.layer,
-        "window": window, "d_model": d_model, "drop_prefix": drop_prefix,
-        "K": args.K, "rank": args.rank,
-        "epochs": args.epochs, "lr": args.lr,
-        "val_frac": args.val_frac, "split_seed": args.split_seed,
-        "pool_size": pool_size, "refine_epochs": args.refine_epochs,
-        "batch_size": args.batch_size,
-    }
-    (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
-    print(f"Model saved to {out_dir}/mfa_model.pt")
+    if is_main:
+        cfg = {
+            "shard_dir": str(shard_dir), "layer": args.layer,
+            "window": window, "d_model": d_model, "drop_prefix": drop_prefix,
+            "K": args.K, "rank": args.rank,
+            "epochs": args.epochs, "lr": args.lr,
+            "val_frac": args.val_frac, "split_seed": args.split_seed,
+            "pool_size": pool_size, "refine_epochs": args.refine_epochs,
+            "batch_size": args.batch_size,
+            "world_size": world_size,
+        }
+        (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+        print(f"Model saved to {out_dir}/mfa_model.pt")
+
+    if use_ddp:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def cmd_overlap(args):
