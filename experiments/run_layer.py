@@ -502,6 +502,7 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         grad_clip=args.grad_clip,
         save_path=str(out_dir / "mfa_model.pt"),
         save_func=save_mfa,
+        ckpt_path=str(out_dir / "checkpoint.pt"),
     )
 
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model

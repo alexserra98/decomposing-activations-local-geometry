@@ -1,3 +1,5 @@
+import os
+import math
 import torch
 import torch.nn.functional as F
 from modeling.mfa import save_mfa
@@ -30,6 +32,12 @@ def _eval_nll_tensor(model, X, device, chunk=8192):
         tot += float(model.nll(xb).item()) * xb.size(0)
     return tot / max(N, 1)
 
+def _atomic_torch_save(obj, path):
+    tmp = f"{path}.tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
 def train_nll(
     model,
     loader,
@@ -43,10 +51,14 @@ def train_nll(
     save_func=None,
     log_interval=100,
     steps_per_epoch=None,
+    ckpt_path=None,
 ):
     """
     Train with NLL, keep the best (lowest) NLL model.
-    Works with loaders
+
+    If `ckpt_path` is given, a full training checkpoint (model + optimizer +
+    epoch + best state) is written atomically after every epoch. On startup,
+    if that file exists it is loaded and training resumes from the next epoch.
     """
     device = next(model.parameters()).device
     opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -54,8 +66,21 @@ def train_nll(
     best_metric = float("inf")
     best_state  = _cpu_state_dict(model)
     best_epoch  = 0
+    start_epoch = 1
 
-    for ep in range(1, epochs + 1):
+    if ckpt_path and os.path.exists(ckpt_path):
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        opt.load_state_dict(ckpt["optimizer"])
+        best_metric = ckpt["best_metric"]
+        best_state  = ckpt["best_state"]
+        best_epoch  = ckpt["best_epoch"]
+        start_epoch = ckpt["epoch"] + 1
+        print(f"[ckpt] resumed from epoch {ckpt['epoch']:02d}  "
+              f"best_metric={best_metric:.6f}  best_epoch={best_epoch:02d}  "
+              f"next={start_epoch:02d}/{epochs:02d}")
+
+    for ep in range(start_epoch, epochs + 1):
         model.train()
         total_nll, total_n = 0.0, 0
 
@@ -104,7 +129,7 @@ def train_nll(
             val_nll = float("nan")
             select_metric = avg_train_nll
 
-        improved = (select_metric < best_metric) if not (torch.isnan(torch.tensor(select_metric))) else False
+        improved = (select_metric < best_metric) if not math.isnan(select_metric) else False
         if improved:
             best_metric = select_metric
             best_state  = _cpu_state_dict(model)
@@ -117,6 +142,16 @@ def train_nll(
             f"val NLL={val_nll:.6f} "
             f"{'** best **' if improved else ''}"
         )
+
+        if ckpt_path:
+            _atomic_torch_save({
+                "epoch": ep,
+                "model": model.state_dict(),
+                "optimizer": opt.state_dict(),
+                "best_metric": best_metric,
+                "best_state": best_state,
+                "best_epoch": best_epoch,
+            }, ckpt_path)
 
     model.load_state_dict(best_state)
     print(f"Restored best model from epoch {best_epoch:02d} with metric={best_metric:.6f}")
