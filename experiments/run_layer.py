@@ -426,11 +426,6 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         drop_prefix=drop_prefix, shuffle_shards=True,
         shuffle_within_shard=True, seed=(args.seed or 0),
     )
-    val_ds = ShardActivationDataset(
-        shard_dir, layer=args.layer, row_subset=val_pos,
-        drop_prefix=drop_prefix, shuffle_shards=False,
-        shuffle_within_shard=False, seed=(args.seed or 0),
-    )
 
     nw = args.num_workers
     train_loader = DataLoader(
@@ -438,11 +433,30 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         pin_memory=(args.device == "cuda"),
         persistent_workers=(nw > 0),
     )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, num_workers=max(1, nw // 2),
-        pin_memory=(args.device == "cuda"),
-        persistent_workers=(nw > 0),
+
+    # Materialize val set once into a single device-resident tensor (fp16).
+    # ~3.7M tokens * 2048 * 2B ≈ 15 GB, fits alongside MFA on an H100.
+    import time as _time
+    print(f"[val] streaming {len(val_pos):,} rows into {args.device} memory...")
+    _t0 = _time.time()
+    val_ds = ShardActivationDataset(
+        shard_dir, layer=args.layer, row_subset=val_pos,
+        drop_prefix=drop_prefix, shuffle_shards=False,
+        shuffle_within_shard=False, seed=(args.seed or 0),
+        dtype=torch.float16,
     )
+    val_prefetch = DataLoader(
+        val_ds, batch_size=args.batch_size,
+        num_workers=max(1, nw // 2),
+        pin_memory=(args.device == "cuda"),
+    )
+    val_chunks = []
+    for xb, _ in val_prefetch:
+        val_chunks.append(xb.to(args.device, non_blocking=True))
+    val_tensor = torch.cat(val_chunks, dim=0)
+    del val_chunks
+    print(f"[val] done: shape={tuple(val_tensor.shape)} dtype={val_tensor.dtype} "
+          f"in {_time.time() - _t0:.1f}s")
 
     max_pool = args.max_pool_size or 2_000_000
     if args.pool_size is not None and args.pool_size > 0:
@@ -483,7 +497,7 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
 
     train_nll(
         model, train_loader,
-        val_loader=val_loader,
+        val_tensor=val_tensor,
         epochs=args.epochs, lr=args.lr,
         grad_clip=args.grad_clip,
         save_path=str(out_dir / "mfa_model.pt"),

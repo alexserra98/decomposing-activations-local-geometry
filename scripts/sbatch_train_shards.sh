@@ -15,7 +15,7 @@ SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations}
 LAYER=$SLURM_ARRAY_TASK_ID
 OUT_DIR="$SHARD_DIR/layer$(printf '%02d' "$LAYER")_mfa"
 
-K=${K:-1000}
+K=${K:-8000}
 RANK=${RANK:-10}
 EPOCHS=${EPOCHS:-20}
 REFINE_EPOCHS=${REFINE_EPOCHS:-10}
@@ -25,6 +25,8 @@ POOL_SIZE=${POOL_SIZE:-}                   # default heuristic if empty
 VAL_FRAC=${VAL_FRAC:-0.05}
 SPLIT_SEED=${SPLIT_SEED:-42}
 SEED=${SEED:-42}
+
+OUT_DIR="$SHARD_DIR/layer$(printf '%02d' "$LAYER")_$(printf "$K")mfa"
 
 POOL_FLAG=""
 if [[ -n "$POOL_SIZE" ]]; then

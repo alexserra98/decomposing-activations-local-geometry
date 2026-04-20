@@ -18,11 +18,24 @@ def _eval_nll(model, loader, device):
         tot_n   += B
     return tot_nll / tot_n
 
+@torch.no_grad()
+def _eval_nll_tensor(model, X, device, chunk=8192):
+    """Chunk-evaluate NLL on a tensor already on `device` (or move here)."""
+    model.eval()
+    X = X.to(device, non_blocking=True)
+    N = X.shape[0]
+    tot = 0.0
+    for i in range(0, N, chunk):
+        xb = X[i:i + chunk].view(X[i:i + chunk].size(0), -1)
+        tot += float(model.nll(xb).item()) * xb.size(0)
+    return tot / max(N, 1)
+
 def train_nll(
     model,
     loader,
     *,
     val_loader=None,
+    val_tensor=None,
     epochs=5,
     lr=1e-3,
     grad_clip=None,
@@ -81,7 +94,10 @@ def train_nll(
         else:
             avg_train_nll = total_nll / total_n
 
-        if val_loader is not None:
+        if val_tensor is not None:
+            val_nll = _eval_nll_tensor(model, val_tensor, device)
+            select_metric = val_nll
+        elif val_loader is not None:
             val_nll = _eval_nll(model, val_loader, device)
             select_metric = val_nll
         else:
