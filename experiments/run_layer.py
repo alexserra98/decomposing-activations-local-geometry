@@ -589,33 +589,97 @@ def cmd_overlap(args):
     from experiments.cluster_overlap import compute_overlap
 
     data_dir = args.data_dir
-    model_path = os.path.join(data_dir, "mfa_model.pt")
+    # Allow --data-dir to point directly to a .pt file or to a directory
+    if os.path.isfile(data_dir):
+        model_path = data_dir
+        data_dir = os.path.dirname(data_dir)
+    else:
+        model_path = os.path.join(data_dir, "mfa_model.pt")
+
+    out_dir = args.out_dir or data_dir
+    os.makedirs(out_dir, exist_ok=True)
+
     results = compute_overlap(model_path, device=args.device, batch_pairs=args.batch_pairs)
 
-    save_path = os.path.join(data_dir, "overlap.pt")
+    save_path = os.path.join(out_dir, "overlap.pt")
     torch.save(results, save_path)
     print(f"Overlap saved to {save_path}")
 
 
 def cmd_intrinsic_dim(args):
-    """Compute intrinsic dimensionality per cluster."""
-    from experiments.cluster_intrinsic_dim import compute_intrinsic_dims
+    """Compute intrinsic dimensionality per cluster.
 
-    data_dir = args.data_dir
-    model_path = os.path.join(data_dir, "mfa_model.pt")
-    act_path = os.path.join(data_dir, "activations.pt")
-    tok_path = os.path.join(data_dir, "tokens.pt")
-
-    results = compute_intrinsic_dims(
-        model_path, act_path, tok_path,
-        device=args.device,
-        batch_size=args.batch_size,
-        variance_threshold=args.variance_threshold,
-        min_population=args.min_population,
-        max_samples=args.max_samples_per_cluster,
+    Two input layouts supported:
+      (A) monolithic --act-dir with activations.pt/tokens.pt,
+      (B) sharded    --shard-dir from `extract-windows`, with --layer.
+    """
+    from experiments.cluster_intrinsic_dim import (
+        compute_intrinsic_dims, compute_intrinsic_dims_from_loader,
     )
 
-    save_path = os.path.join(data_dir, "intrinsic_dims.pt")
+    data_dir = args.data_dir
+    if os.path.isfile(data_dir):
+        model_path = data_dir
+        data_dir = os.path.dirname(data_dir)
+    else:
+        model_path = os.path.join(data_dir, "mfa_model.pt")
+
+    out_dir = args.out_dir or data_dir
+    os.makedirs(out_dir, exist_ok=True)
+
+    if args.shard_dir is not None:
+        if args.layer is None:
+            raise SystemExit("intrinsic-dim: --layer is required with --shard-dir")
+        from pathlib import Path
+        from data_utils.shard_activations import (
+            ShardActivationDataset, load_meta_index,
+        )
+
+        shard_dir = Path(args.shard_dir)
+        extract_cfg = json.loads((shard_dir / "config.json").read_text())
+        drop_prefix = int(extract_cfg.get("drop_prefix", 32))
+        meta_index = load_meta_index(shard_dir)
+        positions = list(range(len(meta_index)))
+        print(f"shard_dir={shard_dir}  layer={args.layer}  rows={len(positions):,}")
+
+        ds = ShardActivationDataset(
+            shard_dir, layer=args.layer, row_subset=positions,
+            drop_prefix=drop_prefix,
+            shuffle_shards=False, shuffle_within_shard=False,
+            seed=(args.seed or 0),
+            dtype=torch.float32,
+        )
+        loader = DataLoader(
+            ds, batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=(args.device == "cuda"),
+            persistent_workers=(args.num_workers > 0),
+        )
+        results = compute_intrinsic_dims_from_loader(
+            model_path, loader,
+            device=args.device,
+            variance_threshold=args.variance_threshold,
+            min_population=args.min_population,
+            max_samples=args.max_samples_per_cluster,
+            pca_device=args.pca_device,
+            pca_workers=args.pca_workers,
+        )
+    else:
+        act_dir = args.act_dir or data_dir
+        act_path = os.path.join(act_dir, "activations.pt")
+        tok_path = os.path.join(act_dir, "tokens.pt")
+        results = compute_intrinsic_dims(
+            model_path, act_path, tok_path,
+            device=args.device,
+            batch_size=args.batch_size,
+            variance_threshold=args.variance_threshold,
+            min_population=args.min_population,
+            max_samples=args.max_samples_per_cluster,
+            pca_device=args.pca_device,
+            pca_workers=args.pca_workers,
+        )
+
+    save_path = os.path.join(out_dir, "intrinsic_dims.pt")
     torch.save(results, save_path)
     print(f"Intrinsic dims saved to {save_path}")
 
@@ -740,14 +804,39 @@ def build_parser():
     # -- overlap --
     sp = sub.add_parser("overlap", help="Compute pairwise overlap metrics")
     add_common(sp)
-    sp.add_argument("--data-dir", required=True)
+    sp.add_argument("--data-dir", required=True,
+                    help="Directory with mfa_model.pt, or direct path to a .pt model file")
+    sp.add_argument("--out-dir", default=None,
+                    help="Where to save overlap.pt (default: same as --data-dir)")
     sp.add_argument("--batch-pairs", type=int, default=4096, help="Pairs per batch for vectorized overlap")
     sp.set_defaults(func=cmd_overlap)
 
     # -- intrinsic-dim --
     sp = sub.add_parser("intrinsic-dim", help="Compute intrinsic dim per cluster")
     add_common(sp)
-    sp.add_argument("--data-dir", required=True)
+    sp.add_argument("--data-dir", required=True,
+                    help="Directory with mfa_model.pt, or direct path to a .pt model file")
+    sp.add_argument("--act-dir", default=None,
+                    help="Monolithic layout: dir with activations.pt/tokens.pt "
+                         "(default: same as --data-dir)")
+    sp.add_argument("--shard-dir", default=None,
+                    help="Shard layout: extract-windows output dir "
+                         "(mutually exclusive with --act-dir)")
+    sp.add_argument("--layer", type=int, default=None,
+                    help="Layer to read from shards (required with --shard-dir)")
+    sp.add_argument("--num-workers", type=int, default=2,
+                    help="DataLoader workers for the assignment phase "
+                         "(shard layout only). Raise to parallelize shard I/O; "
+                         "each worker mmaps one shard so watch RAM.")
+    sp.add_argument("--pca-device", default=None,
+                    help="Device for the PCA phase (default: same as --device). "
+                         "Set to 'cpu' to free the GPU for other jobs.")
+    sp.add_argument("--pca-workers", type=int, default=1,
+                    help="Thread-pool size for PCA (CPU only — ignored on CUDA). "
+                         "Each thread does one cluster's SVD; torch releases the "
+                         "GIL so threads scale near-linearly.")
+    sp.add_argument("--out-dir", default=None,
+                    help="Where to save intrinsic_dims.pt (default: same as --data-dir)")
     sp.add_argument("--variance-threshold", type=float, default=0.90)
     sp.add_argument("--min-population", type=int, default=100)
     sp.add_argument("--max-samples-per-cluster", type=int, default=10000)

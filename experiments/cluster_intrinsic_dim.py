@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import argparse
+import concurrent.futures as _futures
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
@@ -24,68 +25,136 @@ from modeling.mfa import load_mfa
 # ── Core computation ────────────────────────────────────────────────────
 
 
-def intrinsic_dim_pca(X_cluster: torch.Tensor, threshold: float = 0.90) -> int:
+def intrinsic_dim_pca(
+    X_cluster: torch.Tensor,
+    threshold: float = 0.90,
+    device: str | torch.device | None = None,
+) -> int:
     """
     Number of PCA components needed to explain `threshold` of total variance.
-    Uses economy SVD on mean-centered data.
+    Uses `svdvals` on mean-centered data (cheaper than full SVD since we only
+    need the singular values). If `device` is set, runs the SVD there.
     """
     if X_cluster.shape[0] < 2:
         return 1
-    X_c = X_cluster.float() - X_cluster.float().mean(dim=0)
-    _, S, _ = torch.linalg.svd(X_c, full_matrices=False)  # S: (min(N,D),)
+    if device is not None:
+        X_cluster = X_cluster.to(device, non_blocking=True)
+    X = X_cluster.float()
+    X_c = X - X.mean(dim=0)
+    S = torch.linalg.svdvals(X_c)
     var = S ** 2
     cumvar = var.cumsum(0) / var.sum()
     above = (cumvar >= threshold).nonzero(as_tuple=True)[0]
-    return int(above[0].item()) + 1 if len(above) > 0 else len(S)
+    return int(above[0].item()) + 1 if len(above) > 0 else int(S.numel())
 
 
-def compute_intrinsic_dims(
+def _pca_loop(
+    buffers, sizes, *, threshold, min_population, pca_device, pca_workers
+):
+    """Run intrinsic_dim_pca over all clusters. GPU path is sequential (kernel
+    launches are cheap and the GPU is already saturated). CPU path uses a
+    thread pool — torch SVD releases the GIL, so threads give real speedup
+    without the RAM duplication of processes."""
+    K = len(buffers)
+    dims = torch.zeros(K, dtype=torch.long)
+    num_skipped = 0
+
+    todo = [k for k in range(K)
+            if int(sizes[k]) >= min_population and buffers[k]]
+    num_skipped = K - len(todo)
+
+    def _one(k):
+        X_k = torch.cat(buffers[k], dim=0)
+        return k, intrinsic_dim_pca(X_k, threshold=threshold, device=pca_device)
+
+    use_threads = (pca_workers and pca_workers > 1
+                   and (pca_device is None or str(pca_device).startswith("cpu")))
+
+    if use_threads:
+        # Keep each SVD single-threaded so workers don't fight over cores.
+        old_t = torch.get_num_threads()
+        torch.set_num_threads(max(1, old_t // pca_workers))
+        try:
+            with _futures.ThreadPoolExecutor(max_workers=pca_workers) as pool:
+                futs = [pool.submit(_one, k) for k in todo]
+                for fut in tqdm(_futures.as_completed(futs),
+                                total=len(futs),
+                                desc=f"PCA per cluster (cpu×{pca_workers})"):
+                    k, d = fut.result()
+                    dims[k] = d
+        finally:
+            torch.set_num_threads(old_t)
+    else:
+        tag = pca_device if pca_device else "cpu"
+        for k in tqdm(todo, desc=f"PCA per cluster ({tag})"):
+            _, d = _one(k)
+            dims[k] = d
+
+    return dims, num_skipped
+
+
+def compute_intrinsic_dims_from_loader(
     model_path,
-    act_path,
-    tok_path,
+    loader,
     *,
     device="cpu",
-    batch_size=512,
     variance_threshold=0.90,
     min_population=100,
     max_samples=10_000,
+    store_dtype=torch.float16,
+    pca_device=None,
+    pca_workers=1,
 ):
     """
-    Compute intrinsic dimensionality per MFA cluster.
+    Streaming intrinsic-dim computation. Works with any DataLoader yielding
+    either (x, ...) tuples or plain x tensors — including the sharded
+    `ShardActivationDataset` used at training time.
 
-    Args:
-        model_path: Path to saved MFA model.
-        act_path: Path to activations.pt (N, D).
-        tok_path: Path to tokens.pt (N,).
-        device: Device for responsibility computation.
-        batch_size: Batch size for responsibility computation.
-        variance_threshold: Fraction of variance to explain.
-        min_population: Skip clusters smaller than this.
-        max_samples: Cap samples per cluster for SVD.
+    Parallelism:
+    - Assignment phase is driven by the caller's DataLoader (raise its
+      num_workers to parallelize shard I/O). Bump `loader.num_workers`, not
+      any arg here.
+    - PCA phase runs on `pca_device` (defaults to `device`). On CUDA it's
+      sequential because the GPU is already the parallelism. On CPU, set
+      `pca_workers > 1` to use a thread pool (torch SVD releases the GIL).
 
-    Returns:
-        dict with keys: intrinsic_dims, cluster_sizes, assignments,
-                        variance_threshold, K, rank, D.
+    Memory footprint: peak ~K * max_samples * D * sizeof(store_dtype). With
+    K=1000, max_samples=2000, D=2304, fp16 that's ~9 GB. Drop max_samples if
+    you hit RAM limits.
     """
-    X = torch.load(act_path, weights_only=True)
-    tok = torch.load(tok_path, weights_only=True)
-    print(f"Activations: {X.shape}  dtype={X.dtype}")
-
     model = load_mfa(model_path, map_location="cpu").to(device)
     model.eval()
     K, D, q = model.K, model.D, model.q
     print(f"MFA: K={K} components  rank={q}  D={D}")
+    if pca_device is None:
+        pca_device = device
 
-    # Hard assignments via responsibilities
-    loader = DataLoader(TensorDataset(X, tok), batch_size=batch_size, shuffle=False)
-    all_assignments = []
+    sizes = torch.zeros(K, dtype=torch.long)
+    saved = torch.zeros(K, dtype=torch.long)
+    buffers: list[list[torch.Tensor]] = [[] for _ in range(K)]
+    all_assignments: list[torch.Tensor] = []
+
     with torch.no_grad():
-        for x_batch, _ in tqdm(loader, desc="Computing responsibilities"):
-            r = model.responsibilities(x_batch.to(device))
-            all_assignments.append(r.argmax(dim=1).cpu())
+        for batch in tqdm(loader, desc="Streaming + assigning"):
+            x_batch = batch[0] if isinstance(batch, (list, tuple)) else batch
+            x_dev = x_batch.to(device, non_blocking=True)
+            r = model.responsibilities(x_dev)
+            assign = r.argmax(dim=1).cpu()
+            sizes += torch.bincount(assign, minlength=K)
+            all_assignments.append(assign)
+
+            x_cpu = x_batch.to(store_dtype).cpu() if x_batch.device.type != "cpu" \
+                    else x_batch.to(store_dtype)
+            for k in assign.unique().tolist():
+                already = int(saved[k])
+                if already >= max_samples:
+                    continue
+                chunk = x_cpu[assign == k][: max_samples - already]
+                if chunk.shape[0] > 0:
+                    buffers[k].append(chunk)
+                    saved[k] += chunk.shape[0]
 
     assignments = torch.cat(all_assignments)
-    sizes = torch.bincount(assignments, minlength=K)
 
     print(f"\nCluster sizes — min={sizes.min().item()}  "
           f"max={sizes.max().item()}  "
@@ -93,20 +162,13 @@ def compute_intrinsic_dims(
           f"median={sizes.float().median():.1f}")
     print(f"Empty clusters: {(sizes == 0).sum().item()}")
 
-    # PCA intrinsic dimension per cluster
-    dims = torch.zeros(K, dtype=torch.long)
-    num_skipped = 0
-
-    for k in tqdm(range(K), desc="PCA per cluster"):
-        idx = (assignments == k).nonzero(as_tuple=True)[0]
-        n = idx.numel()
-        if n < min_population:
-            dims[k] = 0
-            num_skipped += 1
-            continue
-        if n > max_samples:
-            idx = idx[torch.randperm(n)[:max_samples]]
-        dims[k] = intrinsic_dim_pca(X[idx], threshold=variance_threshold)
+    dims, num_skipped = _pca_loop(
+        buffers, sizes,
+        threshold=variance_threshold,
+        min_population=min_population,
+        pca_device=pca_device,
+        pca_workers=pca_workers,
+    )
 
     valid = dims > 0
     print(f"\nIntrinsic dims at {variance_threshold*100:.0f}% variance threshold:")
@@ -126,6 +188,37 @@ def compute_intrinsic_dims(
         "rank": q,
         "D": D,
     }
+
+
+def compute_intrinsic_dims(
+    model_path,
+    act_path,
+    tok_path,
+    *,
+    device="cpu",
+    batch_size=512,
+    variance_threshold=0.90,
+    min_population=100,
+    max_samples=10_000,
+    pca_device=None,
+    pca_workers=1,
+):
+    """Monolithic-layout wrapper: loads activations.pt/tokens.pt and streams
+    them through `compute_intrinsic_dims_from_loader`."""
+    X = torch.load(act_path, weights_only=True)
+    tok = torch.load(tok_path, weights_only=True)
+    print(f"Activations: {X.shape}  dtype={X.dtype}")
+
+    loader = DataLoader(TensorDataset(X, tok), batch_size=batch_size, shuffle=False)
+    return compute_intrinsic_dims_from_loader(
+        model_path, loader,
+        device=device,
+        variance_threshold=variance_threshold,
+        min_population=min_population,
+        max_samples=max_samples,
+        pca_device=pca_device,
+        pca_workers=pca_workers,
+    )
 
 
 # ── CLI entry point ─────────────────────────────────────────────────────

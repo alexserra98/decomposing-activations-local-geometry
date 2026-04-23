@@ -5,14 +5,15 @@
 #     #SBATCH --gres=gpu:A100:4      (4× A100)
 # NPROC is auto-derived from SLURM_GPUS_ON_NODE below — no other edits needed.
 # Rule of thumb: keep --cpus-per-task ≈ 8×GPUs and --mem ≈ 80G×GPUs.
-#SBATCH --partition=DGX
+#SBATCH --partition=H100
+#SBATCH --nodelist=dgx003 
 #SBATCH --account=LADE
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --gres=gpu:A100:2
+#SBATCH --gres=gpu:H100:2
 #SBATCH --mem=160G
-#SBATCH --time=15:00:00
+#SBATCH --time=18:00:00
 #SBATCH --job-name=mfa_train_ddp
 #SBATCH --array=5,17
 #SBATCH --output=output_job/mfa_train_ddp_%A_%a.out
@@ -22,12 +23,12 @@ SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations}
 LAYER=$SLURM_ARRAY_TASK_ID
 OUT_DIR="$SHARD_DIR/layer$(printf '%02d' "$LAYER")_mfa"
 
-K=${K:-1000}
+K=${K:-32000}
 RANK=${RANK:-10}
 EPOCHS=${EPOCHS:-20}
 REFINE_EPOCHS=${REFINE_EPOCHS:-10}
 BATCH=${BATCH:-4096}
-NUM_WORKERS=${NUM_WORKERS:-4}
+NUM_WORKERS=${NUM_WORKERS:-2}
 POOL_SIZE=${POOL_SIZE:-}                   # default heuristic if empty
 VAL_FRAC=${VAL_FRAC:-0.05}
 SPLIT_SEED=${SPLIT_SEED:-42}
