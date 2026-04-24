@@ -29,7 +29,6 @@ uv.lock
 *.npz
 *.h5
 *.hdf5
-data/
 
 # Experiment outputs
 experiments/data/
@@ -42,6 +41,7 @@ output_job/
 wandb/
 runs/
 lightning_logs/
+*.out
 
 # OS
 .DS_Store
@@ -54,5 +54,9 @@ Thumbs.db
 *.swo
 
 # DATA
-data/
+
 *.png
+
+# AI
+.codex
+CLAUDE.md

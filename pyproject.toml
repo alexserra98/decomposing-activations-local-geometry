@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "decomposing-activations-local-geometry"
 version = "0.1.0"
@@ -9,3 +13,16 @@ dependencies = [
     "huggingface-hub>=0.34.0,<1.0",
     "scipy>=1.17.1",
 ]
+
+[project.scripts]
+dalg-run-layer = "dalg.cli.run_layer:main"
+dalg-interpret-mfa = "dalg.cli.interpret_mfa:main"
+dalg-cluster-overlap = "dalg.analysis.cluster_overlap:main"
+dalg-cluster-intrinsic-dim = "dalg.analysis.cluster_intrinsic_dim:main"
+dalg-build-pile-windows = "dalg.data.build_pile_windows:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

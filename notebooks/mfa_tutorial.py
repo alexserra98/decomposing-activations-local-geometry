@@ -22,8 +22,8 @@ import random
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from llm_utils.activation_generator import ActivationGenerator, extract_token_ids
-from data_utils.concept_dataset import SupervisedConceptDataset
+from dalg.llm.activation_generator import ActivationGenerator, extract_token_ids
+from dalg.data.concept_dataset import SupervisedConceptDataset
 
 
 # %% [markdown]
@@ -97,7 +97,7 @@ print(f"Training on {len(full_ds):,} token activations")
 # Alternatively, you can just sample random points as centroids (second cell below).
 
 # %%
-from initializations.projected_knn import ReservoirKMeans
+from dalg.init.projected_knn import ReservoirKMeans
 
 num_centroids = 500
 pool_size = len(full_ds) // 5  # 20 % of the data
@@ -131,8 +131,8 @@ torch.save(tok, "tokens.pt")
 # converges; 10 epochs is usually enough to see interpretable structure.
 
 # %%
-from modeling.mfa import MFA
-from modeling.train import train_nll
+from dalg.models.mfa import MFA
+from dalg.models.train import train_nll
 
 model = MFA(centroids=centroids, rank=10).to(model_device)
 
@@ -143,7 +143,7 @@ model = MFA(centroids=centroids, rank=10).to(model_device)
 # under component k, then surface the tokens with the highest scores.
 
 # %%
-from analysis.subspace_interpretation import get_top_strings_per_concept
+from dalg.analysis.subspace_interpretation import get_top_strings_per_concept
 
 def tok_to_str(tok_id):
     return act_generator.model.to_string(tok_id)
@@ -175,7 +175,7 @@ for k, tokens_list in list(results.items())[:N_COMPONENTS]:
 # coefficients in that basis.
 
 # %%
-import analysis.subspace_visualization as sv
+import dalg.analysis.subspace_visualization as sv
 
 k_to_visualize = 20
 
@@ -198,7 +198,7 @@ sv.plot_subspace_scatter(subspace_data, dims=(0, 8), max_labels=250)
 # alpha=1 replaces the activation entirely; lower values give gentler nudges.
 
 # %%
-from intervention.mfa_steering import MFASteerer
+from dalg.intervention.mfa_steering import MFASteerer
 
 steerer = MFASteerer(act_generator.model, model)
 

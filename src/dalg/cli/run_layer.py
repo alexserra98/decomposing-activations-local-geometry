@@ -10,28 +10,26 @@ Subcommands:
 
 Example usage:
     # Step 1: extract (expensive LLM forward pass)
-    python experiments/run_layer.py extract \
+    dalg-run-layer extract \
         --model gpt2-small --dataset ./data/supervised.json \
         --layer 4 --out-dir results/gpt2-small/layer_04 \
         --max-tokens 250000 --device cuda
 
     # Step 2: train (can re-run with different K without re-extracting)
-    python experiments/run_layer.py train \
+    dalg-run-layer train \
         --data-dir results/gpt2-small/layer_04 \
         --K 500 --rank 10 --epochs 10 --device cuda
 
     # Step 3: analysis
-    python experiments/run_layer.py overlap \
+    dalg-run-layer overlap \
         --data-dir results/gpt2-small/layer_04 --device cuda
-    python experiments/run_layer.py intrinsic-dim \
+    dalg-run-layer intrinsic-dim \
         --data-dir results/gpt2-small/layer_04 --device cuda
 """
 import os
-import sys
 import json
 import argparse
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import torch
@@ -43,8 +41,8 @@ from torch.utils.data import DataLoader, TensorDataset
 
 def cmd_extract(args):
     """Extract activations for one layer and save to disk."""
-    from llm_utils.activation_generator import ActivationGenerator, extract_token_ids
-    from data_utils.concept_dataset import SupervisedConceptDataset, ConceptDataset
+    from dalg.llm.activation_generator import ActivationGenerator, extract_token_ids
+    from dalg.data.concept_dataset import SupervisedConceptDataset, ConceptDataset
 
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -94,7 +92,7 @@ def cmd_extract(args):
 def cmd_extract_windows(args):
     """Extract activations from a pre-tokenized HF windows dataset.
 
-    Works on the output of data_utils/build_pile_windows.py (rows have a
+    Works on the output of dalg-build-pile-windows (rows have a
     `token_ids` column of length WINDOW_SIZE). One forward pass per batch,
     caches only the requested layers — so layers 8+22 come out in a single
     sweep. Resume-safe: existing shards are skipped.
@@ -292,9 +290,9 @@ def cmd_train(args):
       (B) sharded    --shard-dir from `extract-windows`, with --layer and an
           automatic stratified-by-subset train/val split.
     """
-    from initializations.projected_knn import ReservoirKMeans
-    from modeling.mfa import MFA, save_mfa
-    from modeling.train import train_nll
+    from dalg.init.projected_knn import ReservoirKMeans
+    from dalg.models.mfa import MFA, save_mfa
+    from dalg.models.train import train_nll
 
     use_shards = getattr(args, "shard_dir", None) is not None
     data_dir_set = getattr(args, "data_dir", None) is not None
@@ -387,7 +385,7 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
     import time as _time
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel as DDP
-    from data_utils.shard_activations import (
+    from dalg.data.shard_activations import (
         ShardActivationDataset, load_meta_index,
         stratified_split, per_subset_counts,
     )
@@ -423,7 +421,7 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
     drop_prefix = int(extract_cfg.get("drop_prefix", 32))
     per_row_tokens = window - drop_prefix
 
-    out_dir = Path(args.out_dir or (shard_dir / f"layer{args.layer:02d}_mfa"))
+    out_dir = Path(args.out_dir or (shard_dir / f"layer{args.layer:02d}_{args.K}_mfa"))
     if is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
     if use_ddp:
@@ -586,7 +584,7 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
 
 def cmd_overlap(args):
     """Compute pairwise overlap metrics between MFA components."""
-    from experiments.cluster_overlap import compute_overlap
+    from dalg.analysis.cluster_overlap import compute_overlap
 
     data_dir = args.data_dir
     # Allow --data-dir to point directly to a .pt file or to a directory
@@ -613,7 +611,7 @@ def cmd_intrinsic_dim(args):
       (A) monolithic --act-dir with activations.pt/tokens.pt,
       (B) sharded    --shard-dir from `extract-windows`, with --layer.
     """
-    from experiments.cluster_intrinsic_dim import (
+    from dalg.analysis.cluster_intrinsic_dim import (
         compute_intrinsic_dims, compute_intrinsic_dims_from_loader,
     )
 
@@ -631,7 +629,7 @@ def cmd_intrinsic_dim(args):
         if args.layer is None:
             raise SystemExit("intrinsic-dim: --layer is required with --shard-dir")
         from pathlib import Path
-        from data_utils.shard_activations import (
+        from dalg.data.shard_activations import (
             ShardActivationDataset, load_meta_index,
         )
 
@@ -744,7 +742,7 @@ def build_parser():
                         help="Extract activations from pre-tokenized HF windows dataset (multi-layer)")
     add_common(sp)
     sp.add_argument("--dataset", required=True,
-                    help="HF dataset dir saved by build_pile_windows.py")
+                    help="HF dataset dir saved by dalg-build-pile-windows")
     sp.add_argument("--out-dir", required=True)
     sp.add_argument("--model", default="google/gemma-2b")
     sp.add_argument("--layers", type=int, nargs="+", default=[8, 22])

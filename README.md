@@ -9,6 +9,11 @@ We’ve uploaded an **end-to-end tutorial** that walks through the core MFA work
 * **Visualizing** subspaces
 * **Steering** using region-level structure and local subspaces
 
+The repository uses a standard `src/` layout: reusable library code lives in
+`src/dalg/`, runnable workflows are exposed as CLI entrypoints such as
+`dalg-run-layer` and `dalg-interpret-mfa`, and generated artifacts live under
+`outputs/`.
+
 **Coming soon:** additional code to **recreate the paper experiments**, along with **released trained MFAs** for **Llama-3.1-8B** and **Gemma-2-2B**.
 
 For any questions, feel free to reach out!

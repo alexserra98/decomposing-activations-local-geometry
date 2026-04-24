@@ -7,7 +7,7 @@ import torch
 from tqdm import tqdm
 from transformer_lens import HookedTransformer, utils
 
-from data_utils.concept_dataset import ConceptDataset, SupervisedConceptDataset
+from dalg.data.concept_dataset import ConceptDataset, SupervisedConceptDataset
 
 
 # Maps mode names to hook-string factories (layer -> cache key).

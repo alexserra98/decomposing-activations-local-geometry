@@ -9,13 +9,13 @@
 #SBATCH --time=15:00:00
 #SBATCH --job-name=mfa_id_cluster
 ##SBATCH --array=5,17
-#SBATCH --output=output_job/mfa_id_cluster_%A_%a.out
+#SBATCH --output=outputs/jobs/mfa_id_cluster_%A_%a.out
 
-python experiments/run_layer.py intrinsic-dim \
+uv run dalg-run-layer intrinsic-dim \
                                 --data-dir /orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations/layer05_8000mfa/\
                                 --shard-dir /orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations\
                                 --layer 5\
-                                --out-dir 8000_05\
+                                --out-dir outputs/experiments/8000_05\
                                 --device cuda\
                                 --num-workers 4\
                                 --max-samples-per-cluster 2000

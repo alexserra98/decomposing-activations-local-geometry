@@ -20,15 +20,13 @@
 
 # %%
 import os
-import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import argparse
 import torch
 from tqdm import tqdm
 
-from modeling.mfa import load_mfa
+from dalg.models.mfa import load_mfa
 
 
 # ── Vectorized overlap computation ──────────────────────────────────────

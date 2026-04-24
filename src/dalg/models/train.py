@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-from modeling.mfa import save_mfa
+from dalg.models.mfa import save_mfa
 from tqdm import tqdm
 
 

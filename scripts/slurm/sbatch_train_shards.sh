@@ -6,17 +6,17 @@
 # NPROC is auto-derived from SLURM_GPUS_ON_NODE below — no other edits needed.
 # Rule of thumb: keep --cpus-per-task ≈ 8×GPUs and --mem ≈ 80G×GPUs.
 #SBATCH --partition=H100
-#SBATCH --nodelist=dgx003 
+##SBATCH --nodelist=dgx003 
 #SBATCH --account=LADE
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --gres=gpu:H100:2
+#SBATCH --gres=gpu:H100:1
 #SBATCH --mem=160G
-#SBATCH --time=18:00:00
+#SBATCH --time=22:00:00
 #SBATCH --job-name=mfa_train_ddp
 #SBATCH --array=5,17
-#SBATCH --output=output_job/mfa_train_ddp_%A_%a.out
+#SBATCH --output=/orfeo/cephfs/home/dssc/zenocosini/decomposing-activations-local-geometry/outputs/jobs/mfa_train_ddp_%A_%a.out
 
 # ── Config (edit to taste) ───────────────────────────────────────────────
 SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations}
@@ -42,7 +42,7 @@ if [[ -n "$POOL_SIZE" ]]; then
 fi
 
 # ── Env ──────────────────────────────────────────────────────────────────
-mkdir -p output_job
+mkdir -p outputs/jobs
 cd "$SLURM_SUBMIT_DIR" || exit 1
 
 # Auto-derive from the --gres allocation; env override still wins.
@@ -55,7 +55,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 # ── Run (DDP via torchrun) ───────────────────────────────────────────────
 uv run torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC" \
-    experiments/run_layer.py train \
+    dalg-run-layer train \
     --shard-dir "$SHARD_DIR" --layer "$LAYER" --out-dir "$OUT_DIR" \
     --K "$K" --rank "$RANK" --epochs "$EPOCHS" \
     --refine-epochs "$REFINE_EPOCHS" \

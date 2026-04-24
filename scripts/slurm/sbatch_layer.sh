@@ -12,8 +12,8 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH --time=6:00:00
-#SBATCH --output=logs/mfa-layer-%a.out
-#SBATCH --error=logs/mfa-layer-%a.err
+#SBATCH --output=outputs/jobs/mfa-layer-%a.out
+#SBATCH --error=outputs/jobs/mfa-layer-%a.err
 
 # ── Configuration (edit these) ──────────────────────────────────────────
 
@@ -32,14 +32,14 @@ SEED=42
 LAYER=$SLURM_ARRAY_TASK_ID
 OUT_DIR="${BASE_DIR}/layer_$(printf '%02d' $LAYER)"
 
-mkdir -p logs
+mkdir -p outputs/jobs
 
 echo "=== Layer $LAYER === $(date) ==="
 echo "Output: $OUT_DIR"
 
 # ── Run ─────────────────────────────────────────────────────────────────
 
-uv run python experiments/run_layer.py all \
+uv run dalg-run-layer all \
     --model "$MODEL" \
     --dataset "$DATASET" \
     --layer "$LAYER" \
