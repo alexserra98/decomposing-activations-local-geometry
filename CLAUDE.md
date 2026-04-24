@@ -1,103 +1,289 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file gives future agents the minimum context needed to work effectively in this repository.
 
-## Project Overview
+## Project Goal
 
-Research codebase for **"From Directions to Regions: Decomposing Activations in Language Models via Local Geometry"**. The core idea is to model LLM residual-stream activations as a Mixture of Factor Analyzers (MFA) — each component defines a region (centroid) plus a low-rank local subspace (loading matrix W_k). This supports interpretability, visualization, and activation steering.
+This is a machine learning research codebase for **"From Directions to Regions: Decomposing Activations in Language Models via Local Geometry"**.
 
-## Environment Setup
+The main idea is:
+- model LLM activations with a **Mixture of Factor Analyzers (MFA)**
+- each component is a **region** with a centroid `mu_k`
+- each region also has a **local low-rank subspace** defined by `W_k`
+
+This supports:
+- training MFA models on activations
+- analyzing regions and overlaps
+- estimating local intrinsic dimensionality
+- interpreting clusters from top-activating tokens
+- steering models with region-level structure
+
+## What The User Cares About
+
+The user is doing research, not building a polished production system.
+
+Priorities:
+- keep code **simple**
+- keep code **readable**
+- keep code **easy to modify**
+- prefer direct implementations over abstractions
+- do not over-engineer
+
+Do not optimize prematurely. If something is a bit repetitive but clearer, clarity wins.
+
+## Current Repository Layout
+
+The repo now uses a `src/` layout.
+
+```text
+src/dalg/
+  cli/            Main runnable entrypoints
+  models/         MFA model and training code
+  init/           Initialization / KMeans
+  data/           Dataset loaders and sharded activation streaming
+  llm/            Activation extraction from TransformerLens models
+  analysis/       Overlap, intrinsic dimension, assignments, interpretation helpers
+  intervention/   Steering code
+
+scripts/slurm/    Cluster job scripts
+outputs/          Generated experiment artifacts and job logs
+notebooks/        Exploratory notebooks
+```
+
+Important top-level files:
+- `pyproject.toml`: package + CLI entrypoints
+- `.vscode/launch.json`: useful local debug configs
+- `mfa_tutorial.py` and `mfa_tutorial.ipynb`: tutorial material
+- `README.md`: short project description
+
+## Main Entry Points
+
+Preferred CLI entrypoints are defined in `pyproject.toml`:
+- `dalg-run-layer`
+- `dalg-interpret-mfa`
+- `dalg-cluster-overlap`
+- `dalg-cluster-intrinsic-dim`
+- `dalg-build-pile-windows`
+
+The most important one is:
+- `dalg-run-layer`
+
+It lives in `src/dalg/cli/run_layer.py` and orchestrates the main workflow with subcommands:
+- `extract`
+- `extract-windows`
+- `train`
+- `overlap`
+- `intrinsic-dim`
+- `all`
+
+When in doubt, start from `src/dalg/cli/run_layer.py`.
+
+## Core Code Map
+
+### `src/dalg/models/mfa.py`
+
+This is the core model.
+
+Key parameters:
+- `mu`: component means, shape `(K, D)`
+- `dir_raw` and derived loadings: local directions
+- `scale_rho`: loading scales
+- `psi_rho`: diagonal noise
+- `pi_logits`: mixture weights
+
+Important detail:
+- likelihood and posterior computations rely on the **Woodbury identity**
+- `q` is much smaller than `D`, so many operations are done in the small latent space
+
+Common methods:
+- `responsibilities`
+- `log_prob`
+- `nll`
+- `component_posterior`
+- `reconstruct`
+
+Serialization helpers:
+- `save_mfa`
+- `load_mfa`
+
+### `src/dalg/models/train.py`
+
+Contains `train_nll`, the main optimizer loop.
+
+Important detail:
+- it is DDP-aware
+- only rank 0 handles some logging / checkpointing decisions
+
+### `src/dalg/init/projected_knn.py`
+
+Contains `ReservoirKMeans`, used to initialize MFA centroids at scale.
+
+High-level idea:
+- stream activations from a loader
+- sample a reservoir
+- optionally project to `proj_dim`
+- run KMeans
+- refine centroids
+
+### `src/dalg/data/shard_activations.py`
+
+Very important for large runs.
+
+This is the streaming layer for pre-extracted activation shards. It is used heavily by the shard-based training path.
+
+### `src/dalg/llm/activation_generator.py`
+
+Wraps TransformerLens to extract activations from a model.
+
+Supported activation modes include:
+- `residual`
+- `residual_pre`
+- `mlp`
+- `mlp_out`
+- `attn_out`
+
+### `src/dalg/analysis/`
+
+Main analysis modules:
+- `cluster_overlap.py`: pairwise overlap metrics between MFA components
+- `cluster_intrinsic_dim.py`: per-cluster PCA-based intrinsic dimension
+- `cluster_assignments.py`: save hard assignments and cluster sizes
+- `subspace_interpretation.py`: top strings / examples per component
+- `subspace_visualization.py`: projection and visualization helpers
+
+### `src/dalg/cli/interpret_mfa.py`
+
+Interpretation pipeline for trained MFA models.
+
+Typical flow:
+1. stream over shards
+2. compute top-responsibility tokens per cluster
+3. recover local text context
+4. optionally label clusters with an LLM
+
+## Main Workflow
+
+For large-scale work, the usual research path is:
+
+1. build token windows dataset
+2. extract activations into shards
+3. train MFA from shards
+4. analyze overlaps / intrinsic dimension / assignments
+5. interpret regions
+6. optionally steer with the learned structure
+
+In practice:
+- extraction and training often happen through `scripts/slurm/`
+- local debugging often happens through `.vscode/launch.json`
+
+## Cluster / SLURM Notes
+
+The user usually works on a SLURM cluster and often debugs via VS Code remote/tunneling.
+
+Important operational assumptions:
+- you are often on a GPU node
+- local home storage is limited
+- large data usually lives in `/orfeo/scratch/dssc/zenocosini`
+- do not delete things from scratch unless explicitly asked
+
+Useful locations:
+- job scripts: `scripts/slurm/`
+- job logs: `outputs/jobs/`
+- experiment artifacts: `outputs/experiments/`
+
+Important script:
+- `scripts/slurm/sbatch_train_shards.sh`
+
+That script is the reference for distributed shard training and mirrors the real production training shape more than small local runs do.
+
+## Local Development / Debugging
+
+The repo uses a virtual environment in `.venv`.
+
+Typical setup:
 
 ```bash
 source .venv/bin/activate
-uv pip install -r requirements.txt
 ```
 
-On Apple Silicon, set before running any model code:
+When using package imports locally without installing the package, `PYTHONPATH=src` is often needed.
+
+VS Code launch configs already account for this.
+
+On Apple Silicon or mixed backends:
+
 ```bash
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 ```
-To add new packages use:
-```
-uv add ...
-```
-## Running the Tutorial
 
-```bash
-# As a Python script (requires %magic comments stripped or use ipython):
-jupyter notebook mfa_tutorial.ipynb
+## Data / Batch Conventions
 
-# Or run the .py version directly in an environment with ipykernel:
-python mfa_tutorial.py
-```
+Some recurring conventions across the codebase:
+- loaders often yield `(activations, token_ids)` or `(x, ...)`
+- shard-based training uses token windows and drops a prefix (`drop_prefix`) before training
+- positive MFA parameters are represented via raw tensors passed through `softplus`
+- many analysis utilities stream activations instead of loading everything into memory
 
-## Architecture
+Do not casually change these conventions unless the caller chain is checked carefully.
 
-The pipeline flows in one direction: **data → activations → initialization → MFA training → interpretation/steering**.
+## Important Implementation Details
 
-### Data (`data_utils/concept_dataset.py`)
-Two dataset classes share a `get_batches(batch_size) -> List[dict]` interface:
-- `ConceptDataset`: unsupported prompts only; batches yield `{"prompt": [...]}`. Accepts CSV, JSON, JSONL.
-- `SupervisedConceptDataset`: (prompt, label) pairs; batches yield `{"prompt": [...], "label": [...]}`. Accepts CSV or JSON. JSON can be a list of dicts or a `{label: [prompts]}` dict.
+### Sharded training
 
-### Activation Extraction (`llm_utils/activation_generator.py`)
-`ActivationGenerator` wraps a TransformerLens `HookedTransformer`. Key method:
-- `generate_activations(dataset, layers, ...)` → `(List[Tensor(N,D)], freq_tensor)` — one tensor per layer, filtered to non-padding/non-BOS tokens.
-- `extract_token_ids(dataset, act_generator, ...)` — tokenizes without a forward pass; returns token IDs, sample IDs, and per-token labels.
-- Supported `mode` values: `"residual"`, `"residual_pre"`, `"mlp"`, `"mlp_out"`, `"attn_out"`.
+The shard-based path in `dalg-run-layer train` is different from the simple monolithic path.
 
-### Initialization (`initializations/projected_knn.py`)
-`ReservoirKMeans` scales K-Means to large activation sets:
-1. Reservoir-samples a pool from the DataLoader (with optional inverse-frequency weighting).
-2. Optionally sketches to `proj_dim` dimensions via a random orthonormal projection.
-3. Runs `KMeansTorch` (k-means++ init, multiple restarts) on the sketch.
-4. Refines centroids in full-dimensional space via Lloyd iterations (`lloyd_refine_projected`).
+Important details:
+- it can run under DDP / `torchrun`
+- rank 0 may compute centroids and save them
+- other ranks wait and then load the saved centroids
+- many debugging issues appear only in this path, not in single-process training
 
-### MFA Model (`modeling/mfa.py`)
-`MFA(nn.Module)` — parameters:
-- `mu` (K, D): component means
-- `dir_raw` (K, D, q): raw loading directions (normalized internally)
-- `scale_rho` (K, q): softplus-parameterized loading scales
-- `psi_rho` (K, D) or (D,): softplus-parameterized diagonal noise variance
-- `pi_logits` (K,): mixture log-weights
+### Outputs
 
-The core computation (`_core`) uses the **Woodbury identity** with a Cholesky factor of the q×q matrix `M_k = I + W_k^T Ψ^{-1} W_k` (cheap since q ≪ D) to compute log-likelihoods and posterior latents in one batched pass.
+Generated outputs should generally go under:
+- `outputs/jobs/`
+- `outputs/experiments/`
 
-Key methods: `responsibilities(x)`, `log_prob(x)`, `nll(x)`, `component_posterior(x)`, `reconstruct(x)`.
+Avoid scattering logs and generated files across source directories.
 
-Serialization: `save_mfa(model, path)` / `load_mfa(path)` preserve all parameters and optional rotation state.
+### Tutorial files
 
-`MFAEncoderDecoder` builds a shared dictionary `[mu_k | W_k columns]` over all K components and encodes activations as sparse-style coefficients (responsibilities × posterior latent coords).
+`mfa_tutorial.py` is not a normal clean Python script; it contains notebook-style magics and is closer to a synced notebook representation.
 
-### Training (`modeling/train.py`)
-`train_nll(model, loader, ...)` — Adam optimizer minimizing mixture NLL, with optional validation loader for best-model selection. DataLoader batches must yield `(activations, ...)` where activations are `(B, D)`.
+Be careful when linting or compiling it.
 
-### Interpretation (`analysis/subspace_interpretation.py`)
-- `get_top_strings_per_concept(model, loader, tok2str, score=...)` — for each component k, returns the top-scoring token strings by posterior responsibility or per-component log-likelihood.
-- `get_top_indices_per_concept(...)` — same but returns sample indices instead of strings.
+## Guidance For Future Agents
 
-### Visualization (`analysis/subspace_visualization.py`)
-- `project_loader_to_subspace(model, loader, k, ...)` — projects activations assigned to component k onto span(W_k) via least-squares, returning coordinates, energy, and token labels.
-- `plot_subspace_scatter(data, dims=(i,j))` — 2D scatter of subspace coordinates.
+When modifying this repo:
+- preserve the user's research-first style
+- prefer small, local edits
+- avoid heavy abstractions
+- do not turn the code into a framework
+- keep command paths and SLURM flows aligned with the current package layout
 
-### Steering (`intervention/mfa_steering.py`)
-`MFASteerer(model, mfa)` patches TransformerLens forward hooks to modify residual-stream activations at specified layers. Two strategies:
-- **Mean steering** (`intervene` / `generate`): `x' = (1−α)x + α·μ_k`
-- **Latent two-stage** (`intervene_latent` / `generate_latent`): centroid pull then subspace displacement `x' = x₁ + W_k @ z`
-- Setting `k=None` uses responsibility-weighted mixture centroids/loadings.
+When investigating bugs:
+- first determine whether the issue is in the simple path or the shard/DDP path
+- check `scripts/slurm/` and `.vscode/launch.json`
+- inspect `outputs/jobs/` logs
 
-## Key Conventions
+When adding new analysis code:
+- prefer putting reusable logic under `src/dalg/analysis/`
+- expose a CLI only if it is genuinely useful as a standalone workflow
 
-- DataLoaders throughout the pipeline yield `(activations_tensor, token_ids_tensor)` batches.
-- MFA positive parameters (`psi`, `scale`) are stored as raw values and passed through `F.softplus` — never modify them directly.
-- `model_device` is for forward passes; `data_device` is where output tensors land (useful when offloading activations to CPU while keeping the LLM on GPU/MPS).
-- The tutorial caps at 250k tokens (`MAX_TOKENS`) for speed; remove this cap for full experiments.
+When adding new runnable workflows:
+- prefer package entrypoints over ad hoc top-level scripts
 
-## General Instructions
-- I don’t need to a production grade code because I am running experiments for machine learning research and I want to iterate quickly. So I care more about readability and ease of modification than about efficiency or edge cases.
-- Keep the code simple and straightforward, and avoid over-engineering. I will handle any necessary optimizations or refactoring later on.
-- Focus on the core logic and functionality, and avoid adding unnecessary features or abstractions. I want to be able to understand and modify the code easily, so please prioritize clarity and simplicity over completeness
+## Things To Avoid
 
-## Environment
-- You are in a slurm cluster, usually you will be in a working node with GPU, where I am accessing through tunneling with VScode.
-- In my personal folder /u/dssc/zenocosini I can do whatever I want but I have storaged capped to 200GB. Outside I can read or write so command like ´sudo apt install´ won't work. I usually keep big stuff in /orfeo/scratch/dssc/zenocosini where you should never delete anything but you can write.
+- do not reintroduce old imports like `from modeling...` or `from experiments...`
+- do not add new generated outputs inside source folders
+- do not over-abstract simple research code
+- do not delete scratch data or large experiment outputs unless the user explicitly asks
+
+## Short Mental Model
+
+If you need a quick picture of the repo:
+
+**windows dataset -> activation shards -> centroid init -> MFA training -> analysis / interpretation / steering**
+
+That is the backbone of the project.

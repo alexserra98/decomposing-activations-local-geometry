@@ -16,7 +16,7 @@
 #SBATCH --time=22:00:00
 #SBATCH --job-name=mfa_train_ddp
 #SBATCH --array=5,17
-#SBATCH --output=/orfeo/cephfs/home/dssc/zenocosini/decomposing-activations-local-geometry/outputs/jobs/mfa_train_ddp_%A_%a.out
+#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/jobs/mfa_train_ddp_%A_%a.out
 
 # ── Config (edit to taste) ───────────────────────────────────────────────
 SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations}
@@ -42,20 +42,25 @@ if [[ -n "$POOL_SIZE" ]]; then
 fi
 
 # ── Env ──────────────────────────────────────────────────────────────────
-mkdir -p outputs/jobs
-cd "$SLURM_SUBMIT_DIR" || exit 1
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+
+mkdir -p "$REPO_ROOT/outputs/jobs"
+cd "$REPO_ROOT" || exit 1
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
 # Auto-derive from the --gres allocation; env override still wins.
 NPROC=${NPROC:-${SLURM_GPUS_ON_NODE:-2}}
 
 echo "=== $(date) === job $SLURM_JOB_ID.$SLURM_ARRAY_TASK_ID on $(hostname) ==="
+echo "repo_root: $REPO_ROOT"
 echo "shard_dir: $SHARD_DIR   layer: $LAYER   out_dir: $OUT_DIR"
 echo "K=$K  rank=$RANK  epochs=$EPOCHS  refine=$REFINE_EPOCHS  batch=$BATCH  num_workers=$NUM_WORKERS  nproc=$NPROC"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 # ── Run (DDP via torchrun) ───────────────────────────────────────────────
-uv run torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC" \
-    dalg-run-layer train \
+uv run python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node="$NPROC" \
+    -m dalg.cli.run_layer train \
     --shard-dir "$SHARD_DIR" --layer "$LAYER" --out-dir "$OUT_DIR" \
     --K "$K" --rank "$RANK" --epochs "$EPOCHS" \
     --refine-epochs "$REFINE_EPOCHS" \

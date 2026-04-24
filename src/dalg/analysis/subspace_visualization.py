@@ -1,14 +1,15 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Optional, Tuple, Literal
+from collections.abc import Callable, Iterable, Sequence
+from typing import Any, Optional, Tuple, Literal
 import torch
 
 @torch.no_grad()
 def project_loader_to_subspace(
-    model,
-    loader,
+    model: Any,
+    loader: Iterable[tuple[torch.Tensor, Sequence[Any]]],
     k: int,
-    token_to_str,
+    token_to_str: Callable[[Any], str] | None,
     *,
     max_points: Optional[int] = 100_000,
     center: bool = False,                              # center around m_perp if True
@@ -16,7 +17,7 @@ def project_loader_to_subspace(
     assign: Literal["hard", "threshold"] = "hard",     # how to select points for concept k
     min_alpha: float = 0.2,                            # used when assign="threshold"
     tau: float = 1.0,                                  # temperature for responsibilities
-):
+) -> dict[str, Any]:
     """
     Projects only points that belong to component k (by hard argmax or alpha-threshold)
     onto span(U_k) to get subspace coordinates. Uses m_perp for centering if center=True.
@@ -43,7 +44,7 @@ def project_loader_to_subspace(
     """
 
     # ---- helpers to unify MFA / MPPCA ----
-    def get_dirs_and_mu(m):
+    def get_dirs_and_mu(m: Any) -> tuple[torch.Tensor, torch.Tensor]:
         # Preferred: use public W (already rotated if rotation is enabled)
         if hasattr(m, "W"):
             W = m.W  # (K,D,q) — rotated view if apply_oblimin_rotation() was called
@@ -67,7 +68,12 @@ def project_loader_to_subspace(
         raise AttributeError("Model must provide loadings via W/_W_factored/_dir_hat.")
 
 
-    def chol_with_jitter(G, max_tries=6, eps0=1e-8, growth=10.0):
+    def chol_with_jitter(
+        G: torch.Tensor,
+        max_tries: int = 6,
+        eps0: float = 1e-8,
+        growth: float = 10.0,
+    ) -> torch.Tensor:
         # Try Cholesky; if it fails, add εI and retry.
         eps = eps0
         I = torch.eye(G.shape[-1], dtype=G.dtype, device=G.device)
@@ -196,7 +202,12 @@ def project_loader_to_subspace(
     }
 
 
-def plot_subspace_scatter(data, dims=(0, 1), max_labels=200, figsize=(9, 6)):
+def plot_subspace_scatter(
+    data: dict[str, Any],
+    dims: tuple[int, int] = (0, 1),
+    max_labels: int = 200,
+    figsize: tuple[float, float] = (9, 6),
+) -> tuple[plt.Figure, plt.Axes]:
     coords = data["coords"]
     if isinstance(coords, torch.Tensor):
         coords = coords.tolist()  # safe: no numpy needed

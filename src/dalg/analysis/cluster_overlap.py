@@ -23,19 +23,37 @@ import os
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import argparse
+from pathlib import Path
+
 import torch
 from tqdm import tqdm
 
 from dalg.models.mfa import load_mfa
 
 
+OverlapResults = dict[str, torch.Tensor]
+
+
 # ── Vectorized overlap computation ──────────────────────────────────────
 
 
 def _batched_kl_one_way(
-    mu_i, mu_j, W_i, W_j, psi_i, psi_j, B_i, B_j,
-    L_i, L_j, Minv_i, Minv_j, logdet_i, logdet_j, D,
-):
+    mu_i: torch.Tensor,
+    mu_j: torch.Tensor,
+    W_i: torch.Tensor,
+    W_j: torch.Tensor,
+    psi_i: torch.Tensor,
+    psi_j: torch.Tensor,
+    B_i: torch.Tensor,
+    B_j: torch.Tensor,
+    L_i: torch.Tensor,
+    L_j: torch.Tensor,
+    Minv_i: torch.Tensor,
+    Minv_j: torch.Tensor,
+    logdet_i: torch.Tensor,
+    logdet_j: torch.Tensor,
+    D: int,
+) -> torch.Tensor:
     """
     Batched KL(p_i || p_j) for P pairs simultaneously.
 
@@ -72,8 +90,17 @@ def _batched_kl_one_way(
 
 
 def _batched_bhattacharyya(
-    mu_i, mu_j, W_i, W_j, psi_i, psi_j, logdet_i, logdet_j, q, eps=1e-6,
-):
+    mu_i: torch.Tensor,
+    mu_j: torch.Tensor,
+    W_i: torch.Tensor,
+    W_j: torch.Tensor,
+    psi_i: torch.Tensor,
+    psi_j: torch.Tensor,
+    logdet_i: torch.Tensor,
+    logdet_j: torch.Tensor,
+    q: int,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Batched Bhattacharyya distance for P pairs.
 
@@ -121,7 +148,12 @@ def _batched_bhattacharyya(
     return db_mean, db_cov, db, bc
 
 
-def compute_overlap(model_path, *, device="cpu", batch_pairs=4096):
+def compute_overlap(
+    model_path: Path,
+    *,
+    device: str | torch.device = "cpu",
+    batch_pairs: int = 4096,
+) -> OverlapResults:
     """
     Compute pairwise overlap metrics between all MFA components.
 
@@ -133,6 +165,7 @@ def compute_overlap(model_path, *, device="cpu", batch_pairs=4096):
     Returns:
         dict with keys: kl_sym, db, db_mean, db_cov, bc — each (K, K) tensors.
     """
+    model_path = Path(model_path)
     model = load_mfa(model_path, map_location="cpu")
     model.eval()
     K, D, q = model.K, model.D, model.q
@@ -236,10 +269,10 @@ def compute_overlap(model_path, *, device="cpu", batch_pairs=4096):
 # ── CLI entry point ─────────────────────────────────────────────────────
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Pairwise overlap metrics for MFA components")
-    parser.add_argument("--model-path", required=True, help="Path to mfa_model.pt")
-    parser.add_argument("--save-path", default=None, help="Where to save results (default: next to model)")
+    parser.add_argument("--model-path", type=Path, required=True, help="Path to mfa_model.pt")
+    parser.add_argument("--save-path", type=Path, default=None, help="Where to save results (default: next to model)")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--batch-pairs", type=int, default=4096,
                         help="Pairs per batch (tune for GPU memory)")
@@ -247,7 +280,7 @@ def main():
 
     results = compute_overlap(args.model_path, device=args.device, batch_pairs=args.batch_pairs)
 
-    save_path = args.save_path or os.path.join(os.path.dirname(args.model_path), "overlap.pt")
+    save_path = args.save_path or args.model_path.parent / "overlap.pt"
     torch.save(results, save_path)
     print(f"Saved to {save_path}")
 

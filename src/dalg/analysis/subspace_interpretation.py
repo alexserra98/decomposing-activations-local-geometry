@@ -1,13 +1,14 @@
 import torch
 import heapq
+from collections.abc import Iterable
 from typing import Callable, Dict, List, Tuple, Any, Optional, Union, Literal
 from collections import defaultdict
 
 
 @torch.no_grad()
 def get_top_strings_per_concept(
-    model,
-    loader,
+    model: Any,
+    loader: Iterable[Any],
     tok2str: Callable[[Any], str],
     *,
     topk: int = 50,
@@ -114,8 +115,8 @@ def get_top_strings_per_concept(
 
 @torch.no_grad()
 def get_top_indices_per_concept(
-    model,
-    loader,
+    model: Any,
+    loader: Iterable[Any],
     *,
     topk: int = 50,
     device: Optional[torch.device] = None,

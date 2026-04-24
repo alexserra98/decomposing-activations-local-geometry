@@ -29,7 +29,7 @@ Example usage:
 import os
 import json
 import argparse
-
+from pathlib import Path
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import torch
@@ -590,9 +590,9 @@ def cmd_overlap(args):
     # Allow --data-dir to point directly to a .pt file or to a directory
     if os.path.isfile(data_dir):
         model_path = data_dir
-        data_dir = os.path.dirname(data_dir)
+        data_dir = Path(os.path.dirname(data_dir))
     else:
-        model_path = os.path.join(data_dir, "mfa_model.pt")
+        model_path = Path(os.path.join(data_dir, "mfa_model.pt"))
 
     out_dir = args.out_dir or data_dir
     os.makedirs(out_dir, exist_ok=True)
@@ -614,15 +614,16 @@ def cmd_intrinsic_dim(args):
     from dalg.analysis.cluster_intrinsic_dim import (
         compute_intrinsic_dims, compute_intrinsic_dims_from_loader,
     )
-
+    from pathlib import Path # why do we need to reimport??
     data_dir = args.data_dir
     if os.path.isfile(data_dir):
         model_path = data_dir
-        data_dir = os.path.dirname(data_dir)
+        data_dir = Path(os.path.dirname(data_dir))
     else:
-        model_path = os.path.join(data_dir, "mfa_model.pt")
+        model_path = Path(os.path.join(data_dir, "mfa_model.pt"))
 
     out_dir = args.out_dir or data_dir
+    out_dir = Path(out_dir) 
     os.makedirs(out_dir, exist_ok=True)
 
     if args.shard_dir is not None:
@@ -660,12 +661,11 @@ def cmd_intrinsic_dim(args):
             min_population=args.min_population,
             max_samples=args.max_samples_per_cluster,
             pca_device=args.pca_device,
-            pca_workers=args.pca_workers,
         )
     else:
         act_dir = args.act_dir or data_dir
-        act_path = os.path.join(act_dir, "activations.pt")
-        tok_path = os.path.join(act_dir, "tokens.pt")
+        act_path = Path(os.path.join(act_dir, "activations.pt"))
+        tok_path = Path(os.path.join(act_dir, "tokens.pt"))
         results = compute_intrinsic_dims(
             model_path, act_path, tok_path,
             device=args.device,
@@ -674,7 +674,6 @@ def cmd_intrinsic_dim(args):
             min_population=args.min_population,
             max_samples=args.max_samples_per_cluster,
             pca_device=args.pca_device,
-            pca_workers=args.pca_workers,
         )
 
     save_path = os.path.join(out_dir, "intrinsic_dims.pt")
@@ -822,17 +821,11 @@ def build_parser():
                          "(mutually exclusive with --act-dir)")
     sp.add_argument("--layer", type=int, default=None,
                     help="Layer to read from shards (required with --shard-dir)")
-    sp.add_argument("--num-workers", type=int, default=2,
-                    help="DataLoader workers for the assignment phase "
-                         "(shard layout only). Raise to parallelize shard I/O; "
-                         "each worker mmaps one shard so watch RAM.")
     sp.add_argument("--pca-device", default=None,
                     help="Device for the PCA phase (default: same as --device). "
                          "Set to 'cpu' to free the GPU for other jobs.")
-    sp.add_argument("--pca-workers", type=int, default=1,
-                    help="Thread-pool size for PCA (CPU only — ignored on CUDA). "
-                         "Each thread does one cluster's SVD; torch releases the "
-                         "GIL so threads scale near-linearly.")
+    sp.add_argument("--num-workers", type=int, default=0,
+                    help="DataLoader workers for shard layout")
     sp.add_argument("--out-dir", default=None,
                     help="Where to save intrinsic_dims.pt (default: same as --data-dir)")
     sp.add_argument("--variance-threshold", type=float, default=0.90)
@@ -875,7 +868,11 @@ def build_parser():
     return p
 
 
-if __name__ == "__main__":
+def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     args.func(args)
+
+
+if __name__ == "__main__":
+    main()

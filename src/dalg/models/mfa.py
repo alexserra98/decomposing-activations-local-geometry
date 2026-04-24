@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, Any, List
 from dataclasses import dataclass
+from pathlib import Path
 
 class MFA(nn.Module):
     def __init__(
@@ -278,7 +279,7 @@ def save_mfa(model: MFA, path: str, *, extra: Optional[Dict[str, Any]] = None) -
 
 
 def load_mfa(
-    path: str,
+    path: str | Path,
     *,
     map_location: Optional[str | torch.device] = None,
     device: Optional[torch.device] = None,
