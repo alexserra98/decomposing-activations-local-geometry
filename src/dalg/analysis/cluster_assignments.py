@@ -13,9 +13,9 @@ from dalg.models.mfa import load_mfa
 PEAKEDNESS_METRICS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "entropy":         lambda r: -(r * (r + 1e-8).log()).sum(dim=1),
     "one_minus_max":   lambda r: 1.0 - r.max(dim=1).values,
-    "top1_minus_top2": lambda r: (
+    "top1_minus_top2": lambda r: ( # TODO: fix this metric, the results are non senical
         lambda s: s[:, 0] - s[:, -1]
-    )(r.topk(min(2, r.shape[1]), dim=1).values),
+    )(r.topk(min(2, r.shape[1]), dim=1).values), 
 }
 
 

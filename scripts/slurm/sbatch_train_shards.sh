@@ -11,9 +11,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --gres=gpu:H100:1
+#SBATCH --gres=gpu:H100:2
 #SBATCH --mem=160G
-#SBATCH --time=22:00:00
+#SBATCH --time=23:00:00
 #SBATCH --job-name=mfa_train_ddp
 #SBATCH --array=5,17
 #SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/jobs/mfa_train_ddp_%A_%a.out
@@ -27,12 +27,13 @@ K=${K:-32000}
 RANK=${RANK:-10}
 EPOCHS=${EPOCHS:-20}
 REFINE_EPOCHS=${REFINE_EPOCHS:-10}
-BATCH=${BATCH:-4096}
+BATCH=${BATCH:-2048}
 NUM_WORKERS=${NUM_WORKERS:-2}
 POOL_SIZE=${POOL_SIZE:-}                   # default heuristic if empty
 VAL_FRAC=${VAL_FRAC:-0.05}
 SPLIT_SEED=${SPLIT_SEED:-42}
 SEED=${SEED:-42}
+VAL_ON_GPU=${VAL_ON_GPU:-0}                # 1 = preload val tensor on GPU (faster eval, more GPU RAM)
 
 OUT_DIR="$SHARD_DIR/layer$(printf '%02d' "$LAYER")_$(printf "$K")_mfa"
 
@@ -41,9 +42,16 @@ if [[ -n "$POOL_SIZE" ]]; then
     POOL_FLAG="--pool-size $POOL_SIZE"
 fi
 
+VAL_ON_GPU_FLAG=""
+if [[ "$VAL_ON_GPU" == "1" ]]; then
+    VAL_ON_GPU_FLAG="--val-on-gpu"
+fi
+
 # ── Env ──────────────────────────────────────────────────────────────────
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+SCRIPT_DIR="/u/dssc/zenocosini/decomposing-activations-local-geometry/src/dalg/cli/run_layer.py"
+#$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
+#$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
 mkdir -p "$REPO_ROOT/outputs/jobs"
 cd "$REPO_ROOT" || exit 1
@@ -67,6 +75,6 @@ uv run python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=
     --batch-size "$BATCH" --num-workers "$NUM_WORKERS" \
     --val-frac "$VAL_FRAC" --split-seed "$SPLIT_SEED" \
     --device cuda --seed "$SEED" \
-    $POOL_FLAG
+    $POOL_FLAG $VAL_ON_GPU_FLAG
 
 echo "=== $(date) === done ==="

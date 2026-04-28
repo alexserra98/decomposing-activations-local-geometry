@@ -15,6 +15,7 @@ import os
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import argparse
+import concurrent.futures as _futures
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +91,71 @@ def _update_reservoir(
     return merged_buffer[keep_idx], keep_priorities
 
 
+def _run_cluster_pca(
+    buffers: list[torch.Tensor | None],
+    sizes: torch.Tensor,
+    *,
+    threshold: float,
+    min_population: int,
+    pca_device: str | torch.device | None,
+    pca_workers: int,
+) -> tuple[torch.Tensor, list[torch.Tensor], int]:
+    """
+    Run the per-cluster PCA stage.
+
+    CPU PCA can benefit from thread-level parallelism because each cluster is
+    independent. For GPU PCA we stay sequential to avoid fighting over one
+    device with many concurrent SVD calls.
+    """
+    K = len(buffers)
+    dims = torch.zeros(K, dtype=torch.long)
+    cluster_variances: list[torch.Tensor] = [torch.zeros(0) for _ in range(K)]
+
+    valid_clusters = [
+        k for k in range(K)
+        if int(sizes[k]) >= min_population and buffers[k] is not None and buffers[k].shape[0] >= 2
+    ]
+    num_skipped = K - len(valid_clusters)
+
+    def _one(k: int) -> tuple[int, int, torch.Tensor]:
+        d, var = intrinsic_dim_pca(
+            buffers[k],
+            threshold=threshold,
+            device=pca_device,
+        )
+        return k, d, var.cpu()
+
+    use_threads = (
+        pca_workers > 1
+        and (pca_device is None or str(pca_device).startswith("cpu"))
+    )
+
+    if use_threads:
+        old_threads = torch.get_num_threads()
+        torch.set_num_threads(max(1, old_threads // pca_workers))
+        try:
+            with _futures.ThreadPoolExecutor(max_workers=pca_workers) as pool:
+                futures = [pool.submit(_one, k) for k in valid_clusters]
+                for fut in tqdm(
+                    _futures.as_completed(futures),
+                    total=len(futures),
+                    desc=f"per-cluster PCA (cpu x{pca_workers})",
+                ):
+                    k, d, var = fut.result()
+                    dims[k] = d
+                    cluster_variances[k] = var
+        finally:
+            torch.set_num_threads(old_threads)
+    else:
+        tag = str(pca_device)
+        for k in tqdm(valid_clusters, desc=f"per-cluster PCA ({tag})"):
+            _, d, var = _one(k)
+            dims[k] = d
+            cluster_variances[k] = var
+
+    return dims, cluster_variances, num_skipped
+
+
 def compute_intrinsic_dims_from_loader(
     model_path: Path,
     loader: Any,
@@ -100,6 +166,7 @@ def compute_intrinsic_dims_from_loader(
     max_samples: int = 10_000,
     store_dtype: torch.dtype = torch.float16,
     pca_device: str | torch.device | None = None,
+    pca_workers: int = 4,
     seed: int = 0,
     **_legacy,
 ) -> IntrinsicDimResults:
@@ -168,26 +235,14 @@ def compute_intrinsic_dims_from_loader(
         "K": K,
     }, model_path.parent / f"{model_path.stem}_assignments.pt")
 
-    dims = torch.zeros(K, dtype=torch.long)
-    cluster_variances: list[torch.Tensor] = [torch.zeros(0) for _ in range(K)]
-    num_skipped = 0
-    tag = str(pca_device)
-    for k in tqdm(range(K), desc=f"per-cluster PCA ({tag})"):
-        n = int(sizes[k])
-        if n < min_population:
-            num_skipped += 1
-            continue
-        if buffers[k] is None or sample_sizes[k] < 2:
-            num_skipped += 1
-            continue
-
-        d, var = intrinsic_dim_pca(
-            buffers[k],
-            threshold=variance_threshold,
-            device=pca_device,
-        )
-        dims[k] = d
-        cluster_variances[k] = var.cpu()
+    dims, cluster_variances, num_skipped = _run_cluster_pca(
+        buffers,
+        sizes,
+        threshold=variance_threshold,
+        min_population=min_population,
+        pca_device=pca_device,
+        pca_workers=pca_workers,
+    )
 
     valid = dims > 0
     if valid.any():
@@ -226,6 +281,7 @@ def compute_intrinsic_dims(
     max_samples: int = 10_000,
     store_dtype: torch.dtype = torch.float16,
     pca_device: str | torch.device | None = None,
+    pca_workers: int = 1,
     seed: int = 0,
     **_legacy,
 ) -> IntrinsicDimResults:
@@ -247,6 +303,7 @@ def compute_intrinsic_dims(
         max_samples=max_samples,
         store_dtype=store_dtype,
         pca_device=pca_device,
+        pca_workers=pca_workers,
         seed=seed,
     )
 
@@ -266,6 +323,7 @@ def main() -> None:
     parser.add_argument("--variance-threshold", type=float, default=0.90)
     parser.add_argument("--min-population", type=int, default=100)
     parser.add_argument("--max-samples", type=int, default=10_000)
+    parser.add_argument("--pca-workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -277,6 +335,7 @@ def main() -> None:
         min_population=args.min_population,
         max_samples=args.max_samples,
         pca_device=args.pca_device,
+        pca_workers=args.pca_workers,
         seed=args.seed,
     )
 

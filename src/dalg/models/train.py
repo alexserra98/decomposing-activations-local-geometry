@@ -33,13 +33,13 @@ def _eval_nll(model, loader, device):
 
 @torch.no_grad()
 def _eval_nll_tensor(model, X, device, chunk=8192):
-    """Chunk-evaluate NLL on a tensor already on `device` (or move here)."""
+    """Chunk-evaluate NLL on a (CPU/pinned) tensor; move each chunk to `device`."""
     model.eval()
-    X = X.to(device, non_blocking=True)
     N = X.shape[0]
     tot = 0.0
     for i in range(0, N, chunk):
-        xb = X[i:i + chunk].view(X[i:i + chunk].size(0), -1).float()
+        xb = X[i:i + chunk].to(device, non_blocking=True)
+        xb = xb.view(xb.size(0), -1).float()
         tot += float(model.nll(xb).item()) * xb.size(0)
     return tot / max(N, 1)
 

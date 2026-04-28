@@ -473,10 +473,15 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         persistent_workers=(nw > 0),
     )
 
-    # Val set: materialize once on rank 0 only (saves 15GB on rank >0).
+    # Val set: materialize once on rank 0 only. By default kept on pinned CPU
+    # memory and streamed chunk-by-chunk during eval (cheap on GPU RAM).
+    # With --val-on-gpu the full tensor lives on `device` (faster eval, but
+    # for a 32k-cluster model this can easily eat 15+ GB of GPU RAM).
     val_tensor = None
     if is_main:
-        log(f"[val] streaming {len(val_pos):,} rows into {device} memory...")
+        on_gpu = bool(args.val_on_gpu) and device != "cpu"
+        where = f"{device} memory" if on_gpu else "pinned CPU memory"
+        log(f"[val] streaming {len(val_pos):,} rows into {where}...")
         _t0 = _time.time()
         val_ds = ShardActivationDataset(
             shard_dir, layer=args.layer, row_subset=val_pos,
@@ -487,15 +492,19 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         val_prefetch = DataLoader(
             val_ds, batch_size=args.batch_size,
             num_workers=max(1, nw // 2),
-            pin_memory=(device != "cpu"),
+            pin_memory=(device != "cpu" and not on_gpu),
         )
         val_chunks = []
         for xb, _ in val_prefetch:
-            val_chunks.append(xb.to(device, non_blocking=True))
-        val_tensor = torch.cat(val_chunks, dim=0)
+            if on_gpu:
+                xb = xb.to(device, non_blocking=True)
+            val_chunks.append(xb)
+        val_tensor = torch.cat(val_chunks, dim=0).contiguous()
+        if not on_gpu and device != "cpu":
+            val_tensor = val_tensor.pin_memory()
         del val_chunks
         log(f"[val] done: shape={tuple(val_tensor.shape)} dtype={val_tensor.dtype} "
-            f"in {_time.time() - _t0:.1f}s")
+            f"on {val_tensor.device} in {_time.time() - _t0:.1f}s")
 
     max_pool = args.max_pool_size or 2_000_000
     if args.pool_size is not None and args.pool_size > 0:
@@ -661,6 +670,8 @@ def cmd_intrinsic_dim(args):
             min_population=args.min_population,
             max_samples=args.max_samples_per_cluster,
             pca_device=args.pca_device,
+            pca_workers=args.pca_workers,
+            seed=(args.seed or 0),
         )
     else:
         act_dir = args.act_dir or data_dir
@@ -674,6 +685,8 @@ def cmd_intrinsic_dim(args):
             min_population=args.min_population,
             max_samples=args.max_samples_per_cluster,
             pca_device=args.pca_device,
+            pca_workers=args.pca_workers,
+            seed=(args.seed or 0),
         )
 
     save_path = os.path.join(out_dir, "intrinsic_dims.pt")
@@ -779,6 +792,10 @@ def build_parser():
                     help="Stratified-by-subset val fraction (shard layout only)")
     sp.add_argument("--split-seed", type=int, default=42,
                     help="Seed for the stratified split")
+    sp.add_argument("--val-on-gpu", action="store_true",
+                    help="Preload the full val tensor onto the GPU (faster eval, "
+                         "but uses GPU RAM). Default: keep on pinned CPU and stream "
+                         "chunks during eval.")
     sp.add_argument("--num-workers", type=int, default=2,
                     help="DataLoader workers (shard layout only)")
     sp.add_argument("--K", type=int, required=True, help="Number of components")
@@ -824,6 +841,8 @@ def build_parser():
     sp.add_argument("--pca-device", default=None,
                     help="Device for the PCA phase (default: same as --device). "
                          "Set to 'cpu' to free the GPU for other jobs.")
+    sp.add_argument("--pca-workers", type=int, default=1,
+                    help="Parallel workers for the CPU PCA phase")
     sp.add_argument("--num-workers", type=int, default=0,
                     help="DataLoader workers for shard layout")
     sp.add_argument("--out-dir", default=None,
