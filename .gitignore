@@ -62,3 +62,6 @@ Thumbs.db
 # AI
 .codex
 CLAUDE.md
+
+# Local dev scripts (not tracked)
+run_test.py
