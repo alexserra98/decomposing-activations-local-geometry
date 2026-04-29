@@ -16,6 +16,7 @@ os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import argparse
 import concurrent.futures as _futures
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,13 @@ from tqdm import tqdm
 
 from dalg.analysis.cluster_assignments import PEAKEDNESS_METRICS
 from dalg.models.mfa import load_mfa
+
+
+# Slow tqdm refreshes when stderr is a non-interactive sink (e.g. SLURM
+# logs); otherwise tqdm emits a full line per refresh and the log balloons.
+_LOG_TTY = sys.stderr.isatty()
+_TQDM_MININTERVAL = 0.5 if _LOG_TTY else 30.0
+_TQDM_MAXINTERVAL = 10.0 if _LOG_TTY else 60.0
 
 
 IntrinsicDimResults = dict[str, Any]
@@ -140,6 +148,8 @@ def _run_cluster_pca(
                     _futures.as_completed(futures),
                     total=len(futures),
                     desc=f"per-cluster PCA (cpu x{pca_workers})",
+                    mininterval=_TQDM_MININTERVAL,
+                    maxinterval=_TQDM_MAXINTERVAL,
                 ):
                     k, d, var = fut.result()
                     dims[k] = d
@@ -148,7 +158,12 @@ def _run_cluster_pca(
             torch.set_num_threads(old_threads)
     else:
         tag = str(pca_device)
-        for k in tqdm(valid_clusters, desc=f"per-cluster PCA ({tag})"):
+        for k in tqdm(
+            valid_clusters,
+            desc=f"per-cluster PCA ({tag})",
+            mininterval=_TQDM_MININTERVAL,
+            maxinterval=_TQDM_MAXINTERVAL,
+        ):
             _, d, var = _one(k)
             dims[k] = d
             cluster_variances[k] = var
@@ -195,7 +210,12 @@ def compute_intrinsic_dims_from_loader(
     rng.manual_seed(int(seed))
 
     with torch.no_grad():
-        for batch in tqdm(loader, desc="streaming assignments + reservoir"):
+        for batch in tqdm(
+            loader,
+            desc="streaming assignments + reservoir",
+            mininterval=_TQDM_MININTERVAL,
+            maxinterval=_TQDM_MAXINTERVAL,
+        ):
             x = batch[0] if isinstance(batch, (list, tuple)) else batch
             x = x.to(device, non_blocking=True).float()
             r = model.responsibilities(x)          # (B, K)

@@ -1,10 +1,18 @@
 import os
+import sys
 import math
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 from dalg.models.mfa import save_mfa
 from tqdm import tqdm
+
+# tqdm refresh cadence: fast in a real terminal, slow when stderr is a
+# non-interactive sink (e.g. SLURM log files) — otherwise tqdm emits one
+# line per refresh and the log balloons.
+_LOG_TTY = sys.stderr.isatty()
+_TQDM_MININTERVAL = 0.5 if _LOG_TTY else 30.0
+_TQDM_MAXINTERVAL = 10.0 if _LOG_TTY else 60.0
 
 
 def _ddp_state():
@@ -116,7 +124,12 @@ def train_nll(
         total_nll, total_n = 0.0, 0
 
         iterable = enumerate(loader, 1)
-        pbar = tqdm(iterable, total=steps_per_epoch, disable=not is_main)
+        pbar = tqdm(
+            iterable, total=steps_per_epoch,
+            disable=not is_main,
+            mininterval=_TQDM_MININTERVAL,
+            maxinterval=_TQDM_MAXINTERVAL,
+        )
 
         for batch_idx, batch in pbar:
             x = batch[0] if isinstance(batch, (tuple, list)) else batch

@@ -471,7 +471,17 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         train_ds, batch_size=args.batch_size, num_workers=nw,
         pin_memory=(device != "cpu"),
         persistent_workers=(nw > 0),
+        drop_last=True,
     )
+
+    # Force every rank to break at the same step count. With an IterableDataset
+    # and num_workers>1, each worker emits its own partial last batch and the
+    # per-worker token splits change each epoch (shuffle_shards=True), so total
+    # batches per rank can differ by 1–2 → DDP collective hang at end of epoch.
+    # sum_w floor(T_w / B) ≥ floor(T / B) − (nw − 1), so this lower bound is
+    # always reachable on every rank.
+    per_rank_tokens = len(train_pos) * per_row_tokens
+    steps_per_epoch = per_rank_tokens // args.batch_size - max(0, nw - 1)
 
     # Val set: materialize once on rank 0 only. By default kept on pinned CPU
     # memory and streamed chunk-by-chunk during eval (cheap on GPU RAM).
@@ -565,6 +575,7 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         save_path=str(out_dir / "mfa_model.pt") if is_main else None,
         save_func=save_mfa if is_main else None,
         ckpt_path=str(out_dir / "checkpoint.pt"),
+        steps_per_epoch=steps_per_epoch,
     )
 
     raw_model = model.module if hasattr(model, "module") else model

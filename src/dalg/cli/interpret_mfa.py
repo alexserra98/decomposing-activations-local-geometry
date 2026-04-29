@@ -30,14 +30,13 @@ is reused (unless --overwrite).
 Example
 -------
   dalg-interpret-mfa \
-      --mfa-path   /.../pile_gemma2b_activations/layer05_mfa/mfa_model.pt \
+      --mfa-path   /orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations/layer05_1000_mfa/mfa_model.pt \
       --shard-dir  /orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations \
       --layer 5 \
       --windows-dataset /orfeo/scratch/dssc/zenocosini/pile_gemma2b_100M_windows/merged \
       --tokenizer google/gemma-2b \
-      --out-dir   /.../pile_gemma2b_activations/layer05_mfa/interpretation \
+      --out-dir    /orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations/layer05_1000_mfa/interpretation \
       --topk 100 --pad 10 \
-      --llm-model gpt-4o-mini
 """
 
 from __future__ import annotations
@@ -47,6 +46,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from dotenv import load_dotenv
 
 import torch
 from tqdm import tqdm
@@ -55,23 +55,130 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 from dalg.models.mfa import load_mfa
 
+load_dotenv()
 
 # ── Phase 1: top-K responsibilities over the full shard set ─────────────
 
+# def build_topk_index(
+#     mfa_path: str,
+#     shard_dir: str,
+#     layer: int,
+#     *,
+#     topk: int = 100,
+#     batch_size: int = 8192,
+#     device: str = "cuda",
+#     max_shards: Optional[int] = None,
+# ) -> Dict[str, Any]:
+#     """One streaming pass over all shards. Returns per-component top-K by
+#     responsibility, with (global_row, tok_pos_in_window, token_id).
+#     """
+#     shard_dir = Path(shard_dir)
+#     cfg = json.loads((shard_dir / "config.json").read_text())
+#     drop_prefix = int(cfg.get("drop_prefix", 32))
+#     window = int(cfg["window"])
+#     per_row = window - drop_prefix
+
+#     mfa = load_mfa(mfa_path, map_location="cpu").to(device).eval()
+#     K, D = mfa.K, mfa.D
+#     print(f"MFA: K={K} D={D} q={mfa.q}")
+
+#     neg_inf = torch.finfo(torch.float32).min
+#     g_resp = torch.full((K, topk), neg_inf, device=device)
+#     g_row  = torch.zeros((K, topk), dtype=torch.long, device=device)
+#     g_pos  = torch.zeros((K, topk), dtype=torch.long, device=device)
+#     g_tok  = torch.zeros((K, topk), dtype=torch.long, device=device)
+
+#     shard_paths = sorted((shard_dir / f"layer{layer:02d}").glob("shard_*.pt"))
+#     if max_shards is not None:
+#         shard_paths = shard_paths[:max_shards]
+#     print(f"Scanning {len(shard_paths)} shards for layer {layer}")
+
+#     meta_dir = shard_dir / "meta"
+#     tok_dir  = shard_dir / "tokens"
+
+#     for shard_path in tqdm(shard_paths, desc="shards"):
+#         shard_i = int(shard_path.stem.split("_")[1])
+#         meta = json.loads((meta_dir / f"shard_{shard_i:05d}.json").read_text())
+#         row_indices = torch.tensor(meta["row_indices"], dtype=torch.long, device=device)
+
+#         acts = torch.load(shard_path, mmap=True, weights_only=True)             # (R, W, D) fp16
+#         toks = torch.load(tok_dir / f"shard_{shard_i:05d}.pt",
+#                           mmap=True, weights_only=True)                          # (R, W) int32
+#         R = acts.shape[0]
+
+#         X = acts[:, drop_prefix:, :].reshape(-1, D)        # (N, D)
+#         T = toks[:, drop_prefix:].reshape(-1).long()        # (N,)
+#         N = X.shape[0]
+
+#         # Shard-local running top-K. Keeping this per-shard caps peak memory
+#         # to O(K * (topk + batch_size)) regardless of shard size.
+#         s_resp = torch.full((K, topk), neg_inf, device=device)
+#         s_idx  = torch.zeros((K, topk), dtype=torch.long, device=device)
+
+#         with torch.no_grad():
+#             for off in range(0, N, batch_size):
+#                 xb = X[off:off + batch_size].to(device, dtype=torch.float32,
+#                                                 non_blocking=True)
+#                 r = mfa.responsibilities(xb)                # (B, K)
+#                 B = xb.shape[0]
+#                 rT = r.T.contiguous()                        # (K, B)
+#                 ib = torch.arange(off, off + B, device=device)\
+#                           .unsqueeze(0).expand(K, -1)
+#                 cat_resp = torch.cat([s_resp, rT], dim=1)    # (K, topk+B)
+#                 cat_idx  = torch.cat([s_idx,  ib], dim=1)
+#                 s_resp, sel = cat_resp.topk(min(topk, cat_resp.shape[1]), dim=1)
+#                 s_idx = cat_idx.gather(1, sel)
+
+#         # Decode flat shard-local idx → (row_in_shard, tok_pos_in_window, token_id)
+#         row_in_shard = s_idx // per_row                      # (K, topk)
+#         tok_in_slice = s_idx %  per_row
+#         tok_pos      = tok_in_slice + drop_prefix
+#         global_row   = row_indices.gather(0, row_in_shard.reshape(-1)).reshape(K, topk)
+#         token_id     = T.to(device).gather(0, s_idx.reshape(-1)).reshape(K, topk)
+
+#         # Merge shard top-K into global top-K.
+#         cat_resp = torch.cat([g_resp, s_resp],     dim=1)
+#         cat_row  = torch.cat([g_row,  global_row], dim=1)
+#         cat_pos  = torch.cat([g_pos,  tok_pos],    dim=1)
+#         cat_tok  = torch.cat([g_tok,  token_id],   dim=1)
+#         g_resp, sel = cat_resp.topk(topk, dim=1)
+#         g_row = cat_row.gather(1, sel)
+#         g_pos = cat_pos.gather(1, sel)
+#         g_tok = cat_tok.gather(1, sel)
+
+#         del acts, toks, X, T
+
+#     return {
+#         "K": K, "topk": topk, "layer": layer,
+#         "drop_prefix": drop_prefix, "window": window,
+#         "resp":       g_resp.cpu(),
+#         "global_row": g_row.cpu(),
+#         "tok_pos":    g_pos.cpu(),
+#         "token_id":   g_tok.cpu(),
+#     }
 def build_topk_index(
-    mfa_path: str,
+    experiment_result_path: str,
     shard_dir: str,
     layer: int,
     *,
     topk: int = 100,
     batch_size: int = 8192,
     device: str = "cuda",
-    max_shards: Optional[int] = None,
+    max_samples: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """One streaming pass over all shards. Returns per-component top-K by
-    responsibility, with (global_row, tok_pos_in_window, token_id).
     """
-    shard_dir = Path(shard_dir)
+    Build top-k index from precomputed MFA cluster assignments.
+
+    """
+    OUT = Path(experiment_result_path) 
+
+    dims_data = torch.load(OUT / "intrinsic_dims.pt", weights_only=False)
+
+    cluster_sizes  = dims_data["cluster_sizes"]    # (K,)
+    mask = ~(cluster_sizes < 1000)
+    assignments = dims_data["assignments"]
+    peakdness_assignments = dims_data["peakedness"]["top1_minus_top2"]
+    shard_dir: Path = Path(shard_dir)
     cfg = json.loads((shard_dir / "config.json").read_text())
     drop_prefix = int(cfg.get("drop_prefix", 32))
     window = int(cfg["window"])
@@ -88,8 +195,6 @@ def build_topk_index(
     g_tok  = torch.zeros((K, topk), dtype=torch.long, device=device)
 
     shard_paths = sorted((shard_dir / f"layer{layer:02d}").glob("shard_*.pt"))
-    if max_shards is not None:
-        shard_paths = shard_paths[:max_shards]
     print(f"Scanning {len(shard_paths)} shards for layer {layer}")
 
     meta_dir = shard_dir / "meta"
@@ -103,30 +208,17 @@ def build_topk_index(
         acts = torch.load(shard_path, mmap=True, weights_only=True)             # (R, W, D) fp16
         toks = torch.load(tok_dir / f"shard_{shard_i:05d}.pt",
                           mmap=True, weights_only=True)                          # (R, W) int32
-        R = acts.shape[0]
+        R = toks.shape[0]
 
-        X = acts[:, drop_prefix:, :].reshape(-1, D)        # (N, D)
         T = toks[:, drop_prefix:].reshape(-1).long()        # (N,)
-        N = X.shape[0]
+        N = T.shape[0]
 
         # Shard-local running top-K. Keeping this per-shard caps peak memory
         # to O(K * (topk + batch_size)) regardless of shard size.
         s_resp = torch.full((K, topk), neg_inf, device=device)
         s_idx  = torch.zeros((K, topk), dtype=torch.long, device=device)
 
-        with torch.no_grad():
-            for off in range(0, N, batch_size):
-                xb = X[off:off + batch_size].to(device, dtype=torch.float32,
-                                                non_blocking=True)
-                r = mfa.responsibilities(xb)                # (B, K)
-                B = xb.shape[0]
-                rT = r.T.contiguous()                        # (K, B)
-                ib = torch.arange(off, off + B, device=device)\
-                          .unsqueeze(0).expand(K, -1)
-                cat_resp = torch.cat([s_resp, rT], dim=1)    # (K, topk+B)
-                cat_idx  = torch.cat([s_idx,  ib], dim=1)
-                s_resp, sel = cat_resp.topk(min(topk, cat_resp.shape[1]), dim=1)
-                s_idx = cat_idx.gather(1, sel)
+        
 
         # Decode flat shard-local idx → (row_in_shard, tok_pos_in_window, token_id)
         row_in_shard = s_idx // per_row                      # (K, topk)
@@ -155,8 +247,6 @@ def build_topk_index(
         "tok_pos":    g_pos.cpu(),
         "token_id":   g_tok.cpu(),
     }
-
-
 # ── Phase 2: build context snippets from the windows dataset ────────────
 
 def build_cluster_snippets(
@@ -166,6 +256,7 @@ def build_cluster_snippets(
     *,
     pad: int = 10,
     max_examples: Optional[int] = None,
+    max_clusters: Optional[int] = None,
 ) -> Dict[int, List[str]]:
     """For every cluster, return a list of text snippets with the target
     token wrapped in ⟨⟨ … ⟩⟩ and ±pad context on each side.
@@ -176,13 +267,16 @@ def build_cluster_snippets(
     ds = load_from_disk(windows_dataset_path)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
-    K = int(index["K"])
+    K_total = int(index["K"])
+    K = min(K_total, max_clusters) if max_clusters else K_total
+    if K < K_total:
+        print(f"[debug] limiting interpretation to first {K}/{K_total} clusters")
     topk = int(index["topk"])
     n = min(topk, max_examples) if max_examples else topk
     window = int(index["window"])
 
-    rows = index["global_row"][:, :n]     # (K, n)
-    poses = index["tok_pos"][:, :n]
+    rows = index["global_row"][:K, :n]     # (K, n)
+    poses = index["tok_pos"][:K, :n]
 
     # Bulk fetch unique rows once instead of K*n random accesses.
     unique_rows = sorted(set(rows.reshape(-1).tolist()))
@@ -222,7 +316,7 @@ def _user_prompt(snippets: List[str]) -> str:
 def label_clusters(
     cluster_snippets: Dict[int, List[str]],
     *,
-    llm_model: str = "gpt-4o-mini",
+    llm_model: str = "google/gemma-4-26B-A4B-it",
     max_workers: int = 8,
     api_key: Optional[str] = None,
 ) -> Dict[int, Dict[str, Any]]:
@@ -277,11 +371,18 @@ def main():
                     help="±pad tokens of context around each target")
     ap.add_argument("--max-examples-per-cluster", type=int, default=None,
                     help="Use fewer than --topk in the LLM prompt to save tokens")
+    ap.add_argument("--max-clusters", type=int, default=None,
+                    help="Only build snippets / label this many clusters "
+                         "(Phase 2/3). Useful to debug end-to-end quickly.")
 
     ap.add_argument("--batch-size", type=int, default=8192)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--max-shards", type=int, default=None,
                     help="Debug: cap the number of shards scanned")
+    ap.add_argument("--debug", action="store_true",
+                    help="Quick end-to-end debug run: caps shards, clusters, "
+                         "and examples-per-cluster to small values when those "
+                         "are not set explicitly.")
 
     ap.add_argument("--skip-topk", action="store_true",
                     help="Reuse existing topk_index.pt (fails if missing)")
@@ -294,6 +395,18 @@ def main():
     ap.add_argument("--llm-workers", type=int, default=8)
 
     args = ap.parse_args()
+
+    if args.debug:
+        if args.max_shards is None:
+            args.max_shards = 2
+        if args.max_clusters is None:
+            args.max_clusters = 4
+        if args.max_examples_per_cluster is None:
+            args.max_examples_per_cluster = 5
+        print(f"[debug] max_shards={args.max_shards} "
+              f"max_clusters={args.max_clusters} "
+              f"max_examples_per_cluster={args.max_examples_per_cluster}")
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     index_path = out_dir / "topk_index.pt"
@@ -319,6 +432,7 @@ def main():
     snippets = build_cluster_snippets(
         index, args.windows_dataset, args.tokenizer,
         pad=args.pad, max_examples=args.max_examples_per_cluster,
+        max_clusters=args.max_clusters,
     )
     snippets_path = out_dir / "snippets.json"
     snippets_path.write_text(json.dumps(
@@ -326,8 +440,9 @@ def main():
     print(f"Saved snippets → {snippets_path}")
 
     # Phase 3.
+    orfeo_api_key = os.getenv("ORFEO_API_KEY")
     labels = label_clusters(
-        snippets, llm_model=args.llm_model, max_workers=args.llm_workers,
+        snippets, llm_model=args.llm_model, max_workers=args.llm_workers, api_key=orfeo_api_key
     )
     labels_path = out_dir / "labels.json"
     labels_path.write_text(json.dumps(
