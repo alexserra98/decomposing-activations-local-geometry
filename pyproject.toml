@@ -22,6 +22,7 @@ dalg-interpret-mfa = "dalg.cli.interpret_mfa:main"
 dalg-cluster-overlap = "dalg.analysis.cluster_overlap:main"
 dalg-cluster-intrinsic-dim = "dalg.analysis.cluster_intrinsic_dim:main"
 dalg-build-pile-windows = "dalg.data.build_pile_windows:main"
+dalg-train-vae = "dalg.models.train_vae:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
