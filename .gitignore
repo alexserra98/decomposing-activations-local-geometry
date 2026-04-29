@@ -10,6 +10,8 @@ build/
 .eggs/
 *.so
 
+outputs/*
+
 # Virtual environments
 .venv/
 venv/
