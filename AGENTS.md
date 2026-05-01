@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 This file gives future agents the minimum context needed to work effectively in this repository.
 

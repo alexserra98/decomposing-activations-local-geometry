@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, Any, List
 from dataclasses import dataclass
 from pathlib import Path
+from contextlib import contextmanager
 
 class MFA(nn.Module):
     def __init__(
@@ -59,6 +60,7 @@ class MFA(nn.Module):
         self._rotation_on: bool = False
         self._rotation_kind: Optional[str] = None    # 'oblimin' or None
         self._rotation_params: dict = {}
+        self._inference_cache: Optional[Dict[str, Any]] = None
 
     def _psi(self) -> torch.Tensor:
         psi = F.softplus(self.psi_rho) + self._eps
@@ -99,6 +101,105 @@ class MFA(nn.Module):
     def W(self) -> torch.Tensor:
         W = self._W()
         return self._W_rotated(W) if self._rotation_on else W
+
+    @torch.no_grad()
+    def _build_inference_cache(self) -> Dict[str, Any]:
+        """
+        Precompute frozen MFA likelihood terms for repeated eval calls.
+
+        This is intentionally opt-in via inference_cache(): the cached tensors
+        can be large for big K, but they avoid rebuilding model-only quantities
+        for every activation batch during analysis.
+        """
+        psi = self._psi()
+        psi_inv = 1.0 / psi
+        W = self._W()
+
+        A = W * psi_inv[:, :, None].sqrt()
+        M = torch.einsum("kdi,kdj->kij", A, A)
+        Iq = torch.eye(self.q, dtype=W.dtype, device=W.device)
+        M = M + Iq[None]
+        L = torch.linalg.cholesky(M)
+        Minv = torch.cholesky_solve(
+            Iq.expand(self.K, self.q, self.q).clone(),
+            L,
+            upper=False,
+        )
+
+        PinvW = psi_inv[:, :, None] * W
+        pinvw_flat = PinvW.permute(1, 0, 2).reshape(self.D, self.K * self.q).contiguous()
+        wt_pinv_mu = torch.einsum("kd,kdq->kq", self.mu, PinvW)
+        mu_pinv_t = (psi_inv * self.mu).T.contiguous()
+        mu_quad = (self.mu ** 2 * psi_inv).sum(dim=-1)
+        logdet_psi = torch.log(psi).sum(dim=-1)
+        logdet_m = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
+
+        return {
+            "psi_inv": psi_inv,
+            "shared_psi": not self.psi_per_component,
+            "mu_pinv_t": mu_pinv_t,
+            "mu_quad": mu_quad,
+            "pinvw_flat": pinvw_flat,
+            "wt_pinv_mu": wt_pinv_mu,
+            "Minv": Minv,
+            "logdet_c": logdet_psi + logdet_m,
+        }
+
+    @contextmanager
+    def inference_cache(self, *, enabled: bool = True):
+        """
+        Temporarily cache model-only likelihood terms for repeated inference.
+
+        Use this around large eval-only loops:
+
+            model.eval()
+            with torch.no_grad(), model.inference_cache():
+                r = model.responsibilities(x)
+        """
+        if not enabled:
+            yield self
+            return
+
+        old_cache = self._inference_cache
+        self._inference_cache = self._build_inference_cache()
+        try:
+            yield self
+        finally:
+            self._inference_cache = old_cache
+
+    def _cached_log_prob_components(self, x: torch.Tensor) -> torch.Tensor:
+        cache = self._inference_cache
+        if cache is None:
+            raise RuntimeError("MFA inference cache is not active")
+
+        B, D = x.shape
+        if D != self.D:
+            raise ValueError(f"expected input dim {self.D}, got {D}")
+
+        _dev = x.device.type
+        _amp_enabled = self.use_amp and _dev in ("cuda",)
+        K, q = self.K, self.q
+
+        with torch.autocast(device_type=_dev, dtype=torch.bfloat16, enabled=_amp_enabled):
+            if cache["shared_psi"]:
+                x_quad = torch.matmul(x ** 2, cache["psi_inv"][0])
+                quad_Psi = x_quad[:, None]
+            else:
+                quad_Psi = torch.einsum("bd,kd->bk", x ** 2, cache["psi_inv"])
+            quad_Psi = (
+                quad_Psi
+                - 2.0 * torch.matmul(x, cache["mu_pinv_t"])
+                + cache["mu_quad"][None, :]
+            )
+
+            WT_Pinv_x = torch.matmul(x, cache["pinvw_flat"]).reshape(B, K, q)
+            v = WT_Pinv_x - cache["wt_pinv_mu"][None, :, :]
+
+        v = v.float()
+        quad_Psi = quad_Psi.float()
+        low_rank = (torch.einsum("bkq,kqr->bkr", v, cache["Minv"]) * v).sum(dim=-1)
+        quad = quad_Psi - low_rank
+        return -0.5 * (self._two_pi_logD + cache["logdet_c"][None, :] + quad)
 
     def _core(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -191,16 +292,24 @@ class MFA(nn.Module):
         return ll, Ez, Sz, L, v, psi
 
     def responsibilities(self, x: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
-        ll, *_ = self._core(x)
+        if self._inference_cache is None:
+            ll, *_ = self._core(x)
+        else:
+            ll = self._cached_log_prob_components(x)
         log_pi = F.log_softmax(self.pi_logits, dim=0)[None, :]
         return F.softmax((ll + log_pi) / float(tau), dim=1)
 
     def log_prob_components(self, x: torch.Tensor) -> torch.Tensor:
-        ll, *_ = self._core(x)
-        return ll
+        if self._inference_cache is None:
+            ll, *_ = self._core(x)
+            return ll
+        return self._cached_log_prob_components(x)
 
     def log_prob(self, x: torch.Tensor) -> torch.Tensor:
-        ll, *_ = self._core(x)
+        if self._inference_cache is None:
+            ll, *_ = self._core(x)
+        else:
+            ll = self._cached_log_prob_components(x)
         log_pi = F.log_softmax(self.pi_logits, dim=0)  # (K,)
         return torch.logsumexp(ll + log_pi[None, :], dim=1)
 

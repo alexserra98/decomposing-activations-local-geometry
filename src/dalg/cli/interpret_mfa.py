@@ -161,10 +161,9 @@ def build_topk_index(
     shard_dir: str,
     layer: int,
     *,
-    topk: int = 100,
     batch_size: int = 8192,
     device: str = "cuda",
-    max_samples: Optional[int] = None,
+    max_samples: Optional[int] = 100,
 ) -> Dict[str, Any]:
     """
     Build top-k index from precomputed MFA cluster assignments.
@@ -172,85 +171,49 @@ def build_topk_index(
     """
     OUT = Path(experiment_result_path) 
 
-    dims_data = torch.load(OUT / "intrinsic_dims.pt", weights_only=False)
+    assign_data = torch.load(OUT / "mfa_model_assignments.pt", weights_only=False)
 
-    cluster_sizes  = dims_data["cluster_sizes"]    # (K,)
-    mask = ~(cluster_sizes < 1000)
-    assignments = dims_data["assignments"]
-    peakdness_assignments = dims_data["peakedness"]["top1_minus_top2"]
+    cluster_sizes  = assign_data["cluster_sizes"]    # (K,)
+    # mask = ~(cluster_sizes < 1000)
+    assignments = assign_data["assignments"]       # (N,) long with values in [0, K-1]
+    peakdness_assignments = assign_data["peakedness"]["top1_minus_top2"] # (N,)
+    top1 = assign_data["top1"]  # (N,)
     shard_dir: Path = Path(shard_dir)
     cfg = json.loads((shard_dir / "config.json").read_text())
     drop_prefix = int(cfg.get("drop_prefix", 32))
     window = int(cfg["window"])
-    per_row = window - drop_prefix
-
-    mfa = load_mfa(mfa_path, map_location="cpu").to(device).eval()
-    K, D = mfa.K, mfa.D
+    model_cfg = json.loads((shard_dir / "model_config.json").read_text())
+    K, D = model_cfg["K"], model_cfg["D"]
     print(f"MFA: K={K} D={D} q={mfa.q}")
-
-    neg_inf = torch.finfo(torch.float32).min
-    g_resp = torch.full((K, topk), neg_inf, device=device)
-    g_row  = torch.zeros((K, topk), dtype=torch.long, device=device)
-    g_pos  = torch.zeros((K, topk), dtype=torch.long, device=device)
-    g_tok  = torch.zeros((K, topk), dtype=torch.long, device=device)
-
-    shard_paths = sorted((shard_dir / f"layer{layer:02d}").glob("shard_*.pt"))
-    print(f"Scanning {len(shard_paths)} shards for layer {layer}")
-
-    meta_dir = shard_dir / "meta"
-    tok_dir  = shard_dir / "tokens"
-
-    for shard_path in tqdm(shard_paths, desc="shards"):
-        shard_i = int(shard_path.stem.split("_")[1])
-        meta = json.loads((meta_dir / f"shard_{shard_i:05d}.json").read_text())
-        row_indices = torch.tensor(meta["row_indices"], dtype=torch.long, device=device)
-
-        acts = torch.load(shard_path, mmap=True, weights_only=True)             # (R, W, D) fp16
-        toks = torch.load(tok_dir / f"shard_{shard_i:05d}.pt",
-                          mmap=True, weights_only=True)                          # (R, W) int32
-        R = toks.shape[0]
-
-        T = toks[:, drop_prefix:].reshape(-1).long()        # (N,)
-        N = T.shape[0]
-
-        # Shard-local running top-K. Keeping this per-shard caps peak memory
-        # to O(K * (topk + batch_size)) regardless of shard size.
-        s_resp = torch.full((K, topk), neg_inf, device=device)
-        s_idx  = torch.zeros((K, topk), dtype=torch.long, device=device)
+    #TODO: controlla che ci siano tutti, senza drop prefix
+    per_cluster_topk_index = {}
+    for k in range(K):
+        cluster_mask = (assignments == k)
+        tok_pos_in_row = top1[cluster_mask] % window
+        cluster_mask &= (tok_pos_in_row >= drop_prefix)  # Ensure we have activations for these tokens
+        if max_samples is not None:
+            topk_mask = torch.zeros_like(cluster_mask)
+            topk_indices = torch.topk(peakdness_assignments[cluster_mask]["top1_minus_top2"], 
+                                      k=min(max_samples, cluster_mask.sum().item())).indices
+            topk_mask[cluster_mask.nonzero()[topk_indices]] = True
+            cluster_mask &= topk_mask
 
         
-
-        # Decode flat shard-local idx → (row_in_shard, tok_pos_in_window, token_id)
-        row_in_shard = s_idx // per_row                      # (K, topk)
-        tok_in_slice = s_idx %  per_row
-        tok_pos      = tok_in_slice + drop_prefix
-        global_row   = row_indices.gather(0, row_in_shard.reshape(-1)).reshape(K, topk)
-        token_id     = T.to(device).gather(0, s_idx.reshape(-1)).reshape(K, topk)
-
-        # Merge shard top-K into global top-K.
-        cat_resp = torch.cat([g_resp, s_resp],     dim=1)
-        cat_row  = torch.cat([g_row,  global_row], dim=1)
-        cat_pos  = torch.cat([g_pos,  tok_pos],    dim=1)
-        cat_tok  = torch.cat([g_tok,  token_id],   dim=1)
-        g_resp, sel = cat_resp.topk(topk, dim=1)
-        g_row = cat_row.gather(1, sel)
-        g_pos = cat_pos.gather(1, sel)
-        g_tok = cat_tok.gather(1, sel)
-
-        del acts, toks, X, T
-
+        per_cluster_topk_index[k] = {
+            cluster_mask.nonzero().cpu(),  # Indices of samples in this cluster
+        }
+        # Store the top-k information for this cluster
+        print(f"Cluster {k}: {cluster_mask.sum().item()} samples selected")
     return {
-        "K": K, "topk": topk, "layer": layer,
-        "drop_prefix": drop_prefix, "window": window,
-        "resp":       g_resp.cpu(),
-        "global_row": g_row.cpu(),
-        "tok_pos":    g_pos.cpu(),
-        "token_id":   g_tok.cpu(),
+         "K": K, "max_samples": max_samples, "layer": layer,
+         "per_cluster_topk_index": per_cluster_topk_index,
     }
+    
 # ── Phase 2: build context snippets from the windows dataset ────────────
 
 def build_cluster_snippets(
     index: Dict[str, Any],
+    metaindex_path: str,
     windows_dataset_path: str,
     tokenizer_name: str,
     *,
@@ -267,14 +230,13 @@ def build_cluster_snippets(
     ds = load_from_disk(windows_dataset_path)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
+    meta_index = json.loads(Path(metaindex_path).read_text())
+
     K_total = int(index["K"])
     K = min(K_total, max_clusters) if max_clusters else K_total
     if K < K_total:
         print(f"[debug] limiting interpretation to first {K}/{K_total} clusters")
-    topk = int(index["topk"])
-    n = min(topk, max_examples) if max_examples else topk
-    window = int(index["window"])
-
+    window = int(meta_index["window"][])
     rows = index["global_row"][:K, :n]     # (K, n)
     poses = index["tok_pos"][:K, :n]
 

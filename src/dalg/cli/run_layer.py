@@ -386,7 +386,7 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel as DDP
     from dalg.data.shard_activations import (
-        ShardActivationDataset, load_meta_index,
+        ShardActivationBatchDataset, load_meta_index,
         stratified_split, per_subset_counts,
     )
 
@@ -460,28 +460,28 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         }
         (out_dir / "val_indices.json").write_text(json.dumps(split_info, indent=2))
 
-    train_ds = ShardActivationDataset(
+    train_ds = ShardActivationBatchDataset(
         shard_dir, layer=args.layer, row_subset=train_pos,
+        batch_size=args.batch_size,
         drop_prefix=drop_prefix, shuffle_shards=True,
         shuffle_within_shard=True, seed=(args.seed or 0) + rank,
     )
 
     nw = args.num_workers
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, num_workers=nw,
+        train_ds, batch_size=None, num_workers=nw,
         pin_memory=(device != "cpu"),
         persistent_workers=(nw > 0),
-        drop_last=True,
     )
 
-    # Force every rank to break at the same step count. With an IterableDataset
-    # and num_workers>1, each worker emits its own partial last batch and the
-    # per-worker token splits change each epoch (shuffle_shards=True), so total
-    # batches per rank can differ by 1–2 → DDP collective hang at end of epoch.
-    # sum_w floor(T_w / B) ≥ floor(T / B) − (nw − 1), so this lower bound is
-    # always reachable on every rank.
-    per_rank_tokens = len(train_pos) * per_row_tokens
-    steps_per_epoch = per_rank_tokens // args.batch_size - max(0, nw - 1)
+    # Force every rank to break at the same step count. The batch dataset yields
+    # shard-local batches, so exact batch counts can differ slightly by rank.
+    # Use the minimum local batch count so DDP ranks stay aligned.
+    steps_per_epoch = len(train_ds)
+    if use_ddp:
+        steps_t = torch.tensor([steps_per_epoch], device=device, dtype=torch.long)
+        dist.all_reduce(steps_t, op=dist.ReduceOp.MIN)
+        steps_per_epoch = int(steps_t.item())
 
     # Val set: materialize once on rank 0 only. By default kept on pinned CPU
     # memory and streamed chunk-by-chunk during eval (cheap on GPU RAM).
@@ -493,19 +493,20 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         where = f"{device} memory" if on_gpu else "pinned CPU memory"
         log(f"[val] streaming {len(val_pos):,} rows into {where}...")
         _t0 = _time.time()
-        val_ds = ShardActivationDataset(
+        val_ds = ShardActivationBatchDataset(
             shard_dir, layer=args.layer, row_subset=val_pos,
+            batch_size=args.batch_size,
             drop_prefix=drop_prefix, shuffle_shards=False,
             shuffle_within_shard=False, seed=(args.seed or 0),
             dtype=torch.float16,
         )
         val_prefetch = DataLoader(
-            val_ds, batch_size=args.batch_size,
-            num_workers=max(1, nw // 2),
+            val_ds, batch_size=None,
+            num_workers=max(1, nw // 2) if nw > 0 else 0,
             pin_memory=(device != "cpu" and not on_gpu),
         )
         val_chunks = []
-        for xb, _ in val_prefetch:
+        for xb in val_prefetch:
             if on_gpu:
                 xb = xb.to(device, non_blocking=True)
             val_chunks.append(xb)
@@ -530,13 +531,14 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
     # Centroids: rank 0 fits (using full train stream) if missing, then all ranks load.
     centroids_path = out_dir / "centroids.pt"
     if is_main and not centroids_path.exists():
-        full_train_ds = ShardActivationDataset(
+        full_train_ds = ShardActivationBatchDataset(
             shard_dir, layer=args.layer, row_subset=train_pos_full,
+            batch_size=args.batch_size,
             drop_prefix=drop_prefix, shuffle_shards=True,
             shuffle_within_shard=True, seed=(args.seed or 0),
         )
         full_train_loader = DataLoader(
-            full_train_ds, batch_size=args.batch_size, num_workers=nw,
+            full_train_ds, batch_size=None, num_workers=nw,
             pin_memory=(device != "cpu"),
         )
         knn = ReservoirKMeans(
@@ -632,7 +634,7 @@ def cmd_intrinsic_dim(args):
       (B) sharded    --shard-dir from `extract-windows`, with --layer.
     """
     from dalg.analysis.cluster_intrinsic_dim import (
-        compute_intrinsic_dims, compute_intrinsic_dims_from_loader,
+        compute_intrinsic_dims, compute_intrinsic_dims_from_shards,
     )
     from pathlib import Path # why do we need to reimport??
     data_dir = args.data_dir
@@ -649,33 +651,10 @@ def cmd_intrinsic_dim(args):
     if args.shard_dir is not None:
         if args.layer is None:
             raise SystemExit("intrinsic-dim: --layer is required with --shard-dir")
-        from pathlib import Path
-        from dalg.data.shard_activations import (
-            ShardActivationDataset, load_meta_index,
-        )
-
-        shard_dir = Path(args.shard_dir)
-        extract_cfg = json.loads((shard_dir / "config.json").read_text())
-        drop_prefix = int(extract_cfg.get("drop_prefix", 32))
-        meta_index = load_meta_index(shard_dir)
-        positions = list(range(len(meta_index)))
-        print(f"shard_dir={shard_dir}  layer={args.layer}  rows={len(positions):,}")
-
-        ds = ShardActivationDataset(
-            shard_dir, layer=args.layer, row_subset=positions,
-            drop_prefix=drop_prefix,
-            shuffle_shards=False, shuffle_within_shard=False,
-            seed=(args.seed or 0),
-            dtype=torch.float32,
-        )
-        loader = DataLoader(
-            ds, batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            pin_memory=(args.device == "cuda"),
-            persistent_workers=(args.num_workers > 0),
-        )
-        results = compute_intrinsic_dims_from_loader(
-            model_path, loader,
+        results = compute_intrinsic_dims_from_shards(
+            model_path, Path(args.shard_dir),
+            layer=args.layer,
+            assignments_path=args.assignments_path,
             device=args.device,
             variance_threshold=args.variance_threshold,
             min_population=args.min_population,
@@ -690,6 +669,7 @@ def cmd_intrinsic_dim(args):
         tok_path = Path(os.path.join(act_dir, "tokens.pt"))
         results = compute_intrinsic_dims(
             model_path, act_path, tok_path,
+            assignments_path=args.assignments_path,
             device=args.device,
             batch_size=args.batch_size,
             variance_threshold=args.variance_threshold,
@@ -854,8 +834,9 @@ def build_parser():
                          "Set to 'cpu' to free the GPU for other jobs.")
     sp.add_argument("--pca-workers", type=int, default=1,
                     help="Parallel workers for the CPU PCA phase")
-    sp.add_argument("--num-workers", type=int, default=0,
-                    help="DataLoader workers for shard layout")
+    sp.add_argument("--assignments-path", default=None,
+                    help="Path to precomputed cluster assignments "
+                         "(default: <data-dir>/mfa_model_assignments.pt)")
     sp.add_argument("--out-dir", default=None,
                     help="Where to save intrinsic_dims.pt (default: same as --data-dir)")
     sp.add_argument("--variance-threshold", type=float, default=0.90)
@@ -893,6 +874,7 @@ def build_parser():
     sp.add_argument("--variance-threshold", type=float, default=0.90)
     sp.add_argument("--min-population", type=int, default=100)
     sp.add_argument("--max-samples-per-cluster", type=int, default=10000)
+    sp.add_argument("--assignments-path", default=None)
     sp.set_defaults(func=cmd_all)
 
     return p

@@ -30,7 +30,8 @@ def _cpu_state_dict(model):
 def _eval_nll(model, loader, device):
     model.eval()
     tot_nll, tot_n = 0.0, 0
-    for x, _ in loader:
+    for batch in loader:
+        x = batch[0] if isinstance(batch, (tuple, list)) else batch
         x = x.view(x.size(0), -1).to(device)
         nll = model.nll(x)                  # mean over batch
         B = x.size(0)

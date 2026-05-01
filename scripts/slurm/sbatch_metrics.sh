@@ -7,14 +7,13 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:A100:1
 #SBATCH --mem=160G
-#SBATCH --time=23:00:00
+#SBATCH --time=1-02:00:00
 #SBATCH --job-name=mfa_id_cluster
 ##SBATCH --begin=now+4hours
-#SBATCH --array=5
+#SBATCH --array=5,17
 #SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/experiments/mfa_metric_cluster_%A_%a.out
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
 K=8000
 LAYER=$SLURM_ARRAY_TASK_ID
 
@@ -28,7 +27,6 @@ uv run dalg-run-layer intrinsic-dim \
                                 --layer $LAYER\
                                 --out-dir "/u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/experiments/${K}_$(printf '%02d' "$LAYER")"\
                                 --device cuda\
-                                --num-workers 4\
                                 --max-samples-per-cluster 2000
 
 uv run dalg-run-layer overlap \
