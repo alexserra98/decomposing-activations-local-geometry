@@ -6,15 +6,15 @@
 #SBATCH --nodelist=dgx002
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:A100:1
-#SBATCH --mem=160G
+#SBATCH --mem=640G
 #SBATCH --time=1-02:00:00
 #SBATCH --job-name=mfa_id_cluster
 ##SBATCH --begin=now+4hours
-#SBATCH --array=5,17
+#SBATCH --array=17
 #SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/experiments/mfa_metric_cluster_%A_%a.out
 
 REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
-K=8000
+K=32000
 LAYER=$SLURM_ARRAY_TASK_ID
 
 mkdir -p "/u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/experiments/${K}_$(printf '%02d' "$LAYER")"
@@ -29,8 +29,8 @@ uv run dalg-run-layer intrinsic-dim \
                                 --device cuda\
                                 --max-samples-per-cluster 2000
 
-uv run dalg-run-layer overlap \
-                            --data-dir /orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations/layer$(printf '%02d' "$LAYER")_${K}_mfa/ \
-                            --out-dir /u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/experiments/${K}_$(printf '%02d' "$LAYER")
+# uv run dalg-run-layer overlap \
+#                             --data-dir /orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations/layer$(printf '%02d' "$LAYER")_${K}_mfa/ \
+#                             --out-dir /u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/experiments/${K}_$(printf '%02d' "$LAYER")
 
          
