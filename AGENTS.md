@@ -190,11 +190,48 @@ Useful locations:
 - job scripts: `scripts/slurm/`
 - job logs: `outputs/jobs/`
 - experiment artifacts: `outputs/experiments/`
+- scratch/cache symlink: `dalg-cache/`
+- scratch experiment symlink: `output/`
 
 Important script:
 - `scripts/slurm/sbatch_train_shards.sh`
 
 That script is the reference for distributed shard training and mirrors the real production training shape more than small local runs do.
+
+## Scratch Symlinks
+
+The repo has two top-level symlinks into scratch storage:
+- `dalg-cache/` -> `/orfeo/scratch/dssc/zenocosini/dalg-cache/`
+- `output/` -> `/orfeo/scratch/dssc/zenocosini/dalg-cache/output/`
+
+These point to large generated data. Treat them like scratch experiment state:
+- do not delete or overwrite large files there unless the user explicitly asks
+- prefer writing new large artifacts under these symlinks instead of home storage
+- use `output/` for analysis artifacts from recent runs; note that older docs may say `outputs/`
+
+Current `dalg-cache/` contents:
+- `pile_gemma2b_100M_windows/`: Hugging Face token-window dataset built from the Pile for Gemma 2B activation extraction.
+- `pile_gemma2b_100M_windows/shards/`: intermediate window shards from dataset construction.
+- `pile_gemma2b_100M_windows/merged/`: merged HF dataset with Arrow files plus `dataset_info.json` and `state.json`.
+- `pile_gemma2b_activations_debug/`: small debug activation extraction output.
+- `pile_gemma2b_activations_debug/layer05/`: debug layer 5 activation shard tensors.
+- `pile_gemma2b_activations_debug/layer17/`: debug layer 17 activation shard tensors.
+- `pile_gemma2b_activations_debug/tokens/`: debug token shard tensors aligned with activation shards.
+- `pile_gemma2b_activations_debug/meta/`: debug per-shard JSON metadata.
+- `pile_gemma2b_activations/`: main Gemma 2B activation cache and trained MFA run folders.
+- `pile_gemma2b_activations/layer05/`: main layer 5 activation shard tensors.
+- `pile_gemma2b_activations/layer17/`: main layer 17 activation shard tensors.
+- `pile_gemma2b_activations/tokens/`: token shard tensors aligned with the main activations.
+- `pile_gemma2b_activations/meta/`: per-shard JSON metadata for the main activations.
+- `pile_gemma2b_activations/layer*_????_mfa/` and `layer05_mfa_32000/`: MFA training outputs for specific layers and cluster counts; typical files include `config.json`, `centroids.pt`, `checkpoint.pt`, `mfa_model.pt`, `overlap.pt`, `val_indices.json`, and assignment tensors.
+- `output/`: nested output symlink target used for experiment analysis artifacts.
+- `pile_gemma2b_build.log`: build/extraction log for the Gemma 2B Pile cache.
+
+Current `output/` contents:
+- `output/experiments/`: analysis outputs such as `intrinsic_dims.pt`, `overlap.pt`, PCA plots, heatmaps, histograms, dendrograms, and cluster-size plots.
+- `output/experiments/1000_05/`, `1000_17/`, `8000_05/`, `8000_17/`, `32000_05/`, `32000_17/`: experiment folders named by cluster count and layer.
+- `output/experiments/*_backup/`: backup copies of earlier experiment analysis outputs.
+- `output/experiments/8000_05_assignments_only/`: assignments-only experiment output folder.
 
 ## Local Development / Debugging
 

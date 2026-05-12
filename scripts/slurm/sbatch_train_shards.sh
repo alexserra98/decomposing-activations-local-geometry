@@ -16,15 +16,14 @@
 #SBATCH --time=23:00:00
 #SBATCH --job-name=mfa_train_ddp
 #SBATCH --array=5,17
-#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/jobs/mfa_train_ddp_%A_%a.out
+#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/mfa_train_ddp_%A_%a.out
 
 # ── Config (edit to taste) ───────────────────────────────────────────────
-SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations}
+SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations}
 LAYER=$SLURM_ARRAY_TASK_ID
-OUT_DIR="$SHARD_DIR/layer$(printf '%02d' "$LAYER")_mfa"
 
-K=${K:-32000}
-RANK=${RANK:-10}
+K=${K:-1000}
+RANK=${RANK:-337}
 EPOCHS=${EPOCHS:-20}
 REFINE_EPOCHS=${REFINE_EPOCHS:-10}
 BATCH=${BATCH:-2048}
@@ -35,7 +34,7 @@ SPLIT_SEED=${SPLIT_SEED:-42}
 SEED=${SEED:-42}
 VAL_ON_GPU=${VAL_ON_GPU:-0}                # 1 = preload val tensor on GPU (faster eval, more GPU RAM)
 
-OUT_DIR="$SHARD_DIR/layer$(printf '%02d' "$LAYER")_$(printf "$K")_mfa"
+OUT_DIR="$SHARD_DIR/layer$(printf '%02d' "$LAYER")_$(printf "$K")_$(printf "$RANK")_mfa"
 
 POOL_FLAG=""
 if [[ -n "$POOL_SIZE" ]]; then

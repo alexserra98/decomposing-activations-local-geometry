@@ -21,16 +21,16 @@ mkdir -p "/u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/expe
 cd "$REPO_ROOT" || exit 1
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
-uv run dalg-run-layer intrinsic-dim \
-                                --data-dir /orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations/layer$(printf '%02d' "$LAYER")_${K}_mfa/\
-                                --shard-dir /orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations\
-                                --layer $LAYER\
-                                --out-dir "/u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/experiments/${K}_$(printf '%02d' "$LAYER")"\
-                                --device cuda\
-                                --max-samples-per-cluster 2000
+# uv run dalg-run-layer intrinsic-dim \
+#                                 --data-dir /orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations/layer$(printf '%02d' "$LAYER")_${K}_mfa/\
+#                                 --shard-dir /orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations\
+#                                 --layer $LAYER\
+#                                 --out-dir "/u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/experiments/${K}_$(printf '%02d' "$LAYER")"\
+#                                 --device cuda\
+#                                 --max-samples-per-cluster 2000
 
-# uv run dalg-run-layer overlap \
-#                             --data-dir /orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations/layer$(printf '%02d' "$LAYER")_${K}_mfa/ \
-#                             --out-dir /u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/experiments/${K}_$(printf '%02d' "$LAYER")
+uv run dalg-run-layer overlap \
+                            --data-dir /orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations/layer$(printf '%02d' "$LAYER")_${K}_mfa/ \
+                            --out-dir /u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/experiments/${K}_$(printf '%02d' "$LAYER")
 
          
