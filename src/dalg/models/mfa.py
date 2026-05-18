@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-import torch.distributed.nn.functional as dist_nn
 from typing import Optional, Tuple, Dict, Any, List
 from dataclasses import dataclass
 from pathlib import Path
@@ -385,12 +384,17 @@ def _distributed_logsumexp(local_values: torch.Tensor, dim: int) -> torch.Tensor
     if not (dist.is_available() and dist.is_initialized()):
         return torch.logsumexp(local_values, dim=dim)
 
-    local_max = local_values.max(dim=dim).values
-    global_max = dist_nn.all_reduce(local_max, op=dist.ReduceOp.MAX).detach()
+    local_max = local_values.max(dim=dim).values.detach()
+    global_max = local_max.clone()
+    dist.all_reduce(global_max, op=dist.ReduceOp.MAX)
     shifted = local_values - global_max.unsqueeze(dim)
     local_sum = shifted.exp().sum(dim=dim)
-    global_sum = dist_nn.all_reduce(local_sum, op=dist.ReduceOp.SUM)
-    return global_max + global_sum.clamp_min(torch.finfo(global_sum.dtype).tiny).log()
+    global_sum = local_sum.detach().clone()
+    dist.all_reduce(global_sum, op=dist.ReduceOp.SUM)
+    global_sum = global_sum.clamp_min(torch.finfo(global_sum.dtype).tiny)
+    # Forward value is the true distributed logsumexp. The zero-valued
+    # correction gives each rank only its local slice of the serial gradient.
+    return global_max + global_sum.log() + (local_sum - local_sum.detach()) / global_sum
 
 
 class ComponentShardedMFA(MFA):
@@ -457,8 +461,24 @@ class ComponentShardedMFA(MFA):
             ll, *_ = self._core(x)
         else:
             ll = self._cached_log_prob_components(x)
-        local_scores = ll + self.local_log_pi()[None, :]
-        return _distributed_logsumexp(local_scores, dim=1)
+        log_num = _distributed_logsumexp(ll + self.pi_logits[None, :], dim=1)
+        log_den = _distributed_logsumexp(self.pi_logits, dim=0)
+        return log_num - log_den
+
+    def sync_replicated_grads(self) -> None:
+        """
+        Sum gradients for parameters that are replicated across component shards.
+
+        With the default shared Psi, every rank has a copy of psi_rho but only
+        sees the likelihood terms for its local components. Summing the local
+        psi gradients recovers the serial full-K gradient.
+        """
+        if self.psi_per_component:
+            return
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        if self.psi_rho.grad is not None:
+            dist.all_reduce(self.psi_rho.grad, op=dist.ReduceOp.SUM)
 
 
 def save_component_shard(model: ComponentShardedMFA, path: str | Path) -> None:

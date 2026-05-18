@@ -141,6 +141,10 @@ def train_nll(
             loss = model(x)     # goes through DDP.forward → MFA.forward = nll
             loss.backward()
 
+            sync_replicated_grads = getattr(raw_model, "sync_replicated_grads", None)
+            if callable(sync_replicated_grads):
+                sync_replicated_grads()
+
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 

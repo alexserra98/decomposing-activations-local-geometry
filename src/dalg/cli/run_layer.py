@@ -647,7 +647,8 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
             "component_shard": component_shard,
         }
         (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
-        print(f"Model saved to {out_dir}/mfa_model.pt")
+        if not component_shard:
+            print(f"Model saved to {out_dir}/mfa_model.pt")
 
     if use_ddp:
         dist.barrier()
