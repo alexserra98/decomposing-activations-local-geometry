@@ -4,6 +4,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn
 from typing import Optional, Tuple, Dict, Any, List
 from dataclasses import dataclass
 from pathlib import Path
@@ -358,6 +360,129 @@ class MFA(nn.Module):
 
     def forward(self, x):
         return self.nll(x)
+
+
+def component_shard_bounds(K: int, rank: int, world_size: int) -> tuple[int, int]:
+    """Contiguous component range owned by one distributed rank."""
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    if not (0 <= rank < world_size):
+        raise ValueError("rank must be in [0, world_size)")
+    base = K // world_size
+    rem = K % world_size
+    start = rank * base + min(rank, rem)
+    end = start + base + (1 if rank < rem else 0)
+    return start, end
+
+
+def _distributed_logsumexp(local_values: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    logsumexp over a tensor dimension that is sharded across distributed ranks.
+
+    Every rank must call this with the same non-sharded dimensions. Gradients
+    flow into each rank's local values through the SUM all-reduce.
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return torch.logsumexp(local_values, dim=dim)
+
+    local_max = local_values.max(dim=dim).values
+    global_max = dist_nn.all_reduce(local_max, op=dist.ReduceOp.MAX).detach()
+    shifted = local_values - global_max.unsqueeze(dim)
+    local_sum = shifted.exp().sum(dim=dim)
+    global_sum = dist_nn.all_reduce(local_sum, op=dist.ReduceOp.SUM)
+    return global_max + global_sum.clamp_min(torch.finfo(global_sum.dtype).tiny).log()
+
+
+class ComponentShardedMFA(MFA):
+    """
+    MFA variant where each distributed rank owns a contiguous shard of components.
+
+    This is model-parallel over K, not data-parallel. All ranks must see the
+    same activation batch in the same order. Each rank computes likelihoods for
+    its local components, then the mixture log probability is assembled with a
+    distributed logsumexp over components.
+    """
+
+    def __init__(
+        self,
+        centroids: torch.Tensor,
+        *,
+        rank: int,
+        global_K: int,
+        component_start: int,
+        psi_init: float = 1.0,
+        psi_per_component: bool = False,
+        scale_init: float = 1.0,
+        eps_floor: float = 1e-5,
+        use_amp: bool = False,
+    ):
+        super().__init__(
+            centroids,
+            rank=rank,
+            psi_init=psi_init,
+            psi_per_component=psi_per_component,
+            scale_init=scale_init,
+            eps_floor=eps_floor,
+            use_amp=use_amp,
+        )
+        self.global_K = int(global_K)
+        self.component_start = int(component_start)
+        self.component_end = self.component_start + self.K
+
+    @classmethod
+    def from_global_centroids(
+        cls,
+        centroids: torch.Tensor,
+        *,
+        rank: int,
+        dist_rank: int,
+        world_size: int,
+        **kwargs,
+    ) -> "ComponentShardedMFA":
+        start, end = component_shard_bounds(centroids.shape[0], dist_rank, world_size)
+        return cls(
+            centroids[start:end].contiguous(),
+            rank=rank,
+            global_K=centroids.shape[0],
+            component_start=start,
+            **kwargs,
+        )
+
+    def local_log_pi(self) -> torch.Tensor:
+        log_z = _distributed_logsumexp(self.pi_logits, dim=0)
+        return self.pi_logits - log_z
+
+    def log_prob(self, x: torch.Tensor) -> torch.Tensor:
+        if self._inference_cache is None:
+            ll, *_ = self._core(x)
+        else:
+            ll = self._cached_log_prob_components(x)
+        local_scores = ll + self.local_log_pi()[None, :]
+        return _distributed_logsumexp(local_scores, dim=1)
+
+
+def save_component_shard(model: ComponentShardedMFA, path: str | Path) -> None:
+    """Save one rank's component shard."""
+    path = Path(path)
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "meta": {
+                "global_K": model.global_K,
+                "component_start": model.component_start,
+                "component_end": model.component_end,
+                "local_K": model.K,
+                "D": model.D,
+                "q": model.q,
+                "psi_per_component": model.psi_per_component,
+                "eps_floor": model._eps,
+                "dtype": str(model.mu.dtype),
+                "version": 1,
+                "format": "component_shard",
+            },
+        },
+        path,
+    )
 
 def save_mfa(model: MFA, path: str, *, extra: Optional[Dict[str, Any]] = None) -> None:
     """

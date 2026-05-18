@@ -73,6 +73,8 @@ def train_nll(
     log_interval=100,
     steps_per_epoch=None,
     ckpt_path=None,
+    broadcast_params=True,
+    track_best=True,
 ):
     """
     Train with NLL, keep the best (lowest) NLL model.
@@ -93,11 +95,11 @@ def train_nll(
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     best_metric = float("inf")
-    best_state  = _cpu_state_dict(raw_model) if is_main else None
+    best_state  = _cpu_state_dict(raw_model) if (is_main and track_best) else None
     best_epoch  = 0
     start_epoch = 1
 
-    if ckpt_path and is_main and os.path.exists(ckpt_path):
+    if ckpt_path and is_main and track_best and os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         raw_model.load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["optimizer"])
@@ -110,7 +112,7 @@ def train_nll(
               f"next={start_epoch:02d}/{epochs:02d}")
 
     # Sync params + resume metadata across ranks after the (possible) load.
-    if ddp_on:
+    if ddp_on and broadcast_params:
         for p in model.parameters():
             dist.broadcast(p.data, src=0)
         meta = torch.tensor([start_epoch, best_epoch, best_metric],
@@ -190,7 +192,10 @@ def train_nll(
             dist.broadcast(t, src=0)
             select_metric = float(t[0].item())
 
-        improved = (select_metric < best_metric) if not math.isnan(select_metric) else False
+        improved = (
+            track_best and (select_metric < best_metric)
+            if not math.isnan(select_metric) else False
+        )
         if improved:
             best_metric = select_metric
             if is_main:
@@ -207,7 +212,7 @@ def train_nll(
                 f"{'** best **' if improved else ''}"
             )
 
-        if ckpt_path and is_main:
+        if ckpt_path and is_main and track_best:
             _atomic_torch_save({
                 "epoch": ep,
                 "model": raw_model.state_dict(),
@@ -217,7 +222,7 @@ def train_nll(
                 "best_epoch": best_epoch,
             }, ckpt_path)
 
-    if is_main and best_state is not None:
+    if is_main and track_best and best_state is not None:
         raw_model.load_state_dict(best_state)
         print(f"Restored best model from epoch {best_epoch:02d} with metric={best_metric:.6f}")
 

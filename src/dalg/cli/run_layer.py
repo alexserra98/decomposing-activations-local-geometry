@@ -389,6 +389,7 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         ShardActivationBatchDataset, load_meta_index,
         stratified_split, per_subset_counts,
     )
+    from dalg.models.mfa import ComponentShardedMFA, save_component_shard
 
     # ── DDP env ─────────────────────────────────────────────────────────
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -396,6 +397,7 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     use_ddp    = world_size > 1
     is_main    = (rank == 0)
+    component_shard = bool(getattr(args, "component_shard", False))
 
     if use_ddp:
         if args.device != "cuda":
@@ -406,7 +408,8 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
         device = f"cuda:{local_rank}"
         if is_main:
-            print(f"[ddp] world_size={world_size} backend=nccl")
+            mode = "component-shard" if component_shard else "ddp"
+            print(f"[{mode}] world_size={world_size} backend=nccl")
     else:
         device = args.device
 
@@ -434,11 +437,15 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
     train_pos_full, val_pos = stratified_split(
         meta_index, val_frac=args.val_frac, seed=args.split_seed,
     )
-    # Partition train positions across ranks (val stays full on rank 0 only).
-    # Round-robin then trim to floor(N/world) so every rank has the same
-    # number of batches — otherwise DDP hangs when one rank finishes first.
-    n_per_rank = len(train_pos_full) // world_size
-    train_pos = train_pos_full[rank::world_size][:n_per_rank]
+    if component_shard:
+        # Model-parallel over components: every rank must see the same batches.
+        train_pos = train_pos_full
+    else:
+        # Partition train positions across ranks (val stays full on rank 0 only).
+        # Round-robin then trim to floor(N/world) so every rank has the same
+        # number of batches — otherwise DDP hangs when one rank finishes first.
+        n_per_rank = len(train_pos_full) // world_size
+        train_pos = train_pos_full[rank::world_size][:n_per_rank]
 
     train_counts = per_subset_counts(meta_index, train_pos_full)
     val_counts = per_subset_counts(meta_index, val_pos)
@@ -447,7 +454,10 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
     log(f"split: train rows={len(train_pos_full):,}  val rows={len(val_pos):,}")
     log(f"       train tokens≈{n_train_tok:,}  val tokens≈{n_val_tok:,}")
     if use_ddp:
-        log(f"       rank {rank}/{world_size} sees {len(train_pos):,} train rows")
+        if component_shard:
+            log(f"       each rank sees all {len(train_pos):,} train rows")
+        else:
+            log(f"       rank {rank}/{world_size} sees {len(train_pos):,} train rows")
 
     if is_main:
         split_info = {
@@ -457,6 +467,7 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
             "train_per_subset": train_counts, "val_per_subset": val_counts,
             "val_global_rows": [meta_index[p]["global_row"] for p in val_pos],
             "world_size": world_size,
+            "component_shard": component_shard,
         }
         (out_dir / "val_indices.json").write_text(json.dumps(split_info, indent=2))
 
@@ -464,7 +475,8 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         shard_dir, layer=args.layer, row_subset=train_pos,
         batch_size=args.batch_size,
         drop_prefix=drop_prefix, shuffle_shards=True,
-        shuffle_within_shard=True, seed=(args.seed or 0) + rank,
+        shuffle_within_shard=True,
+        seed=(args.seed or 0) if component_shard else (args.seed or 0) + rank,
     )
 
     nw = args.num_workers
@@ -488,7 +500,9 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
     # With --val-on-gpu the full tensor lives on `device` (faster eval, but
     # for a 32k-cluster model this can easily eat 15+ GB of GPU RAM).
     val_tensor = None
-    if is_main:
+    if is_main and component_shard:
+        log("[val] skipped in component-shard mode; using train NLL for selection.")
+    elif is_main:
         on_gpu = bool(args.val_on_gpu) and device != "cpu"
         where = f"{device} memory" if on_gpu else "pinned CPU memory"
         log(f"[val] streaming {len(val_pos):,} rows into {where}...")
@@ -510,12 +524,16 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
             if on_gpu:
                 xb = xb.to(device, non_blocking=True)
             val_chunks.append(xb)
-        val_tensor = torch.cat(val_chunks, dim=0).contiguous()
-        if not on_gpu and device != "cpu":
-            val_tensor = val_tensor.pin_memory()
+        if val_chunks:
+            val_tensor = torch.cat(val_chunks, dim=0).contiguous()
+            if not on_gpu and device != "cpu":
+                val_tensor = val_tensor.pin_memory()
         del val_chunks
-        log(f"[val] done: shape={tuple(val_tensor.shape)} dtype={val_tensor.dtype} "
-            f"on {val_tensor.device} in {_time.time() - _t0:.1f}s")
+        if val_tensor is None:
+            log(f"[val] skipped: empty validation split in {_time.time() - _t0:.1f}s")
+        else:
+            log(f"[val] done: shape={tuple(val_tensor.shape)} dtype={val_tensor.dtype} "
+                f"on {val_tensor.device} in {_time.time() - _t0:.1f}s")
 
     max_pool = args.max_pool_size or 2_000_000
     if args.pool_size is not None and args.pool_size > 0:
@@ -562,11 +580,23 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
             f"delete {centroids_path} to recompute."
         )
 
-    model = MFA(centroids=centroids, rank=args.rank).to(device)
+    if component_shard:
+        model = ComponentShardedMFA.from_global_centroids(
+            centroids,
+            rank=args.rank,
+            dist_rank=rank,
+            world_size=world_size,
+        ).to(device)
+        log(
+            f"Component sharding: rank {rank}/{world_size} owns "
+            f"[{model.component_start}, {model.component_end})"
+        )
+    else:
+        model = MFA(centroids=centroids, rank=args.rank).to(device)
     if args.compile:
         log("Compiling model with torch.compile...")
         model = torch.compile(model)
-    if use_ddp:
+    if use_ddp and not component_shard:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     train_nll(
@@ -574,15 +604,34 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         val_tensor=val_tensor,
         epochs=args.epochs, lr=args.lr,
         grad_clip=args.grad_clip,
-        save_path=str(out_dir / "mfa_model.pt") if is_main else None,
-        save_func=save_mfa if is_main else None,
-        ckpt_path=str(out_dir / "checkpoint.pt"),
+        save_path=None if component_shard else str(out_dir / "mfa_model.pt") if is_main else None,
+        save_func=None if component_shard else save_mfa if is_main else None,
+        ckpt_path=None if component_shard else str(out_dir / "checkpoint.pt"),
         steps_per_epoch=steps_per_epoch,
+        broadcast_params=not component_shard,
+        track_best=not component_shard,
     )
 
     raw_model = model.module if hasattr(model, "module") else model
     raw_model = raw_model._orig_mod if hasattr(raw_model, "_orig_mod") else raw_model
-    if is_main:
+    if component_shard:
+        shard_path = out_dir / f"mfa_model_rank{rank:04d}.pt"
+        save_component_shard(raw_model, shard_path)
+        if use_ddp:
+            dist.barrier()
+        if is_main:
+            manifest = {
+                "format": "component_sharded_mfa",
+                "global_K": args.K,
+                "rank": args.rank,
+                "world_size": world_size,
+                "shards": [
+                    f"mfa_model_rank{r:04d}.pt" for r in range(world_size)
+                ],
+            }
+            (out_dir / "mfa_model_shards.json").write_text(json.dumps(manifest, indent=2))
+            print(f"Component-sharded model shards saved to {out_dir}")
+    elif is_main:
         save_mfa(raw_model, str(out_dir / "mfa_model.pt"))
 
     if is_main:
@@ -595,6 +644,7 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
             "pool_size": pool_size, "refine_epochs": args.refine_epochs,
             "batch_size": args.batch_size,
             "world_size": world_size,
+            "component_shard": component_shard,
         }
         (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
         print(f"Model saved to {out_dir}/mfa_model.pt")
@@ -803,6 +853,10 @@ def build_parser():
     sp.add_argument("--max-pool-size", type=int, default=2_000_000,
                     help="Upper bound on heuristic pool size to avoid GPU OOM "
                          "(default 2M ≈ 16GB; ignored if --pool-size is set explicitly)")
+    sp.add_argument("--component-shard", action="store_true",
+                    help="Experimental: shard MFA components across distributed ranks "
+                         "instead of using data-parallel DDP. All ranks see the same "
+                         "batches and each rank owns a contiguous slice of K.")
     sp.add_argument("--compile", action="store_true", help="Use torch.compile")
     sp.set_defaults(func=cmd_train)
 
