@@ -599,6 +599,21 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
     if use_ddp and not component_shard:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
+    ckpt_path = str(out_dir / f"checkpoint_rank{rank:04d}.pt") if component_shard else str(out_dir / "checkpoint.pt")
+    if component_shard and is_main:
+        ckpt_manifest = {
+            "format": "component_sharded_checkpoint",
+            "global_K": args.K,
+            "rank": args.rank,
+            "world_size": world_size,
+            "checkpoints": [
+                f"checkpoint_rank{r:04d}.pt" for r in range(world_size)
+            ],
+        }
+        (out_dir / "checkpoint_shards.json").write_text(json.dumps(ckpt_manifest, indent=2))
+    if use_ddp:
+        dist.barrier()
+
     train_nll(
         model, train_loader,
         val_tensor=val_tensor,
@@ -606,10 +621,11 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         grad_clip=args.grad_clip,
         save_path=None if component_shard else str(out_dir / "mfa_model.pt") if is_main else None,
         save_func=None if component_shard else save_mfa if is_main else None,
-        ckpt_path=None if component_shard else str(out_dir / "checkpoint.pt"),
+        ckpt_path=ckpt_path,
         steps_per_epoch=steps_per_epoch,
         broadcast_params=not component_shard,
         track_best=not component_shard,
+        checkpoint_all_ranks=component_shard,
     )
 
     raw_model = model.module if hasattr(model, "module") else model

@@ -59,6 +59,22 @@ def _atomic_torch_save(obj, path):
     os.replace(tmp, path)
 
 
+def _rng_state(device):
+    state = {"torch": torch.random.get_rng_state()}
+    if torch.cuda.is_available() and torch.device(device).type == "cuda":
+        state["cuda"] = torch.cuda.get_rng_state(device)
+    return state
+
+
+def _restore_rng_state(state, device):
+    if not state:
+        return
+    if "torch" in state:
+        torch.random.set_rng_state(state["torch"].cpu())
+    if "cuda" in state and torch.cuda.is_available() and torch.device(device).type == "cuda":
+        torch.cuda.set_rng_state(state["cuda"].cpu(), device)
+
+
 def train_nll(
     model,
     loader,
@@ -75,6 +91,7 @@ def train_nll(
     ckpt_path=None,
     broadcast_params=True,
     track_best=True,
+    checkpoint_all_ranks=False,
 ):
     """
     Train with NLL, keep the best (lowest) NLL model.
@@ -99,17 +116,27 @@ def train_nll(
     best_epoch  = 0
     start_epoch = 1
 
-    if ckpt_path and is_main and track_best and os.path.exists(ckpt_path):
+    load_ckpt = bool(ckpt_path) and os.path.exists(ckpt_path) and (
+        is_main or checkpoint_all_ranks or ddp_on
+    )
+    if load_ckpt:
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         raw_model.load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["optimizer"])
-        best_metric = ckpt["best_metric"]
-        best_state  = ckpt["best_state"]
-        best_epoch  = ckpt["best_epoch"]
+        if track_best:
+            best_metric = ckpt["best_metric"]
+            best_state  = ckpt["best_state"] if is_main else None
+            best_epoch  = ckpt["best_epoch"]
         start_epoch = ckpt["epoch"] + 1
-        print(f"[ckpt] resumed from epoch {ckpt['epoch']:02d}  "
-              f"best_metric={best_metric:.6f}  best_epoch={best_epoch:02d}  "
-              f"next={start_epoch:02d}/{epochs:02d}")
+        _restore_rng_state(ckpt.get("rng_state"), device)
+        if is_main:
+            if track_best:
+                print(f"[ckpt] resumed from epoch {ckpt['epoch']:02d}  "
+                      f"best_metric={best_metric:.6f}  best_epoch={best_epoch:02d}  "
+                      f"next={start_epoch:02d}/{epochs:02d}")
+            else:
+                print(f"[ckpt] resumed from epoch {ckpt['epoch']:02d}  "
+                      f"next={start_epoch:02d}/{epochs:02d}")
 
     # Sync params + resume metadata across ranks after the (possible) load.
     if ddp_on and broadcast_params:
@@ -121,6 +148,16 @@ def train_nll(
         start_epoch = int(meta[0].item())
         best_epoch = int(meta[1].item())
         best_metric = float(meta[2].item())
+    elif ddp_on:
+        starts = torch.tensor([start_epoch, start_epoch], device=device, dtype=torch.long)
+        dist.all_reduce(starts[:1], op=dist.ReduceOp.MIN)
+        dist.all_reduce(starts[1:], op=dist.ReduceOp.MAX)
+        if int(starts[0].item()) != int(starts[1].item()):
+            raise RuntimeError(
+                "checkpoint epoch mismatch across ranks: "
+                f"min next epoch={int(starts[0].item())}, "
+                f"max next epoch={int(starts[1].item())}"
+            )
 
     for ep in range(start_epoch, epochs + 1):
         model.train()
@@ -216,7 +253,7 @@ def train_nll(
                 f"{'** best **' if improved else ''}"
             )
 
-        if ckpt_path and is_main and track_best:
+        if ckpt_path and (is_main or checkpoint_all_ranks):
             _atomic_torch_save({
                 "epoch": ep,
                 "model": raw_model.state_dict(),
@@ -224,6 +261,7 @@ def train_nll(
                 "best_metric": best_metric,
                 "best_state": best_state,
                 "best_epoch": best_epoch,
+                "rng_state": _rng_state(device),
             }, ckpt_path)
 
     if is_main and track_best and best_state is not None:
