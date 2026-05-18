@@ -22,11 +22,13 @@
 SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations}
 LAYER=$SLURM_ARRAY_TASK_ID
 
-K=${K:-1000}
-RANK=${RANK:-337}
+K=${K:-8000}
+RANK=${RANK:-160}
+#337
 EPOCHS=${EPOCHS:-20}
 REFINE_EPOCHS=${REFINE_EPOCHS:-10}
-BATCH=${BATCH:-2048}
+BATCH=${BATCH:-64}
+# 2048
 NUM_WORKERS=${NUM_WORKERS:-2}
 POOL_SIZE=${POOL_SIZE:-}                   # default heuristic if empty
 VAL_FRAC=${VAL_FRAC:-0.05}

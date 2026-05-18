@@ -60,3 +60,7 @@ Thumbs.db
 # AI
 .codex
 CLAUDE.md
+
+# SYMLINKS
+dalg-cache
+output
