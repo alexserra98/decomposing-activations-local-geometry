@@ -294,9 +294,10 @@ def cmd_train(args):
     from dalg.models.mfa import MFA, save_mfa
     from dalg.models.train import train_nll
 
-    use_shards = getattr(args, "shard_dir", None) is not None
-    data_dir_set = getattr(args, "data_dir", None) is not None
-    if use_shards == data_dir_set:
+    use_shards = args.shard_dir is not None
+    if args.shard_dir is not None and args.data_dir is not None:
+        raise SystemExit("train: --shard-dir and --data-dir are mutually exclusive")
+    if args.shard_dir is None and args.data_dir is None:
         raise SystemExit("train: pass exactly one of --shard-dir or --data-dir")
     if use_shards:
         if args.layer is None:
@@ -349,7 +350,7 @@ def cmd_train(args):
     print(f"Centroids: {centroids.shape}")
 
     # Train MFA
-    model = MFA(centroids=centroids, rank=args.rank).to(args.device)
+    model = MFA(centroids=centroids, rank=args.rank, use_amp=getattr(args, "use_amp", False)).to(args.device)
 
     if args.compile:
         print("Compiling model with torch.compile...")
@@ -378,8 +379,107 @@ def cmd_train(args):
     print(f"Model saved to {data_dir}/mfa_model.pt")
 
 
+def _materialize_val_tensor(
+    shard_dir,
+    val_pos,
+    *,
+    layer: int,
+    batch_size: int,
+    drop_prefix: int,
+    val_on_gpu: bool,
+    seed: int,
+    num_workers: int,
+    device: str,
+) -> "torch.Tensor | None":
+    """Stream val rows into a (pinned) CPU tensor or onto `device`. Returns None if empty.
+
+    Only call this on rank 0.
+    """
+    import time
+    from dalg.data.shard_activations import ShardActivationBatchDataset
+
+    on_gpu = val_on_gpu and device != "cpu"
+    where = f"{device} memory" if on_gpu else "pinned CPU memory"
+    print(f"[val] streaming {len(val_pos):,} rows into {where}...")
+    t0 = time.time()
+
+    val_ds = ShardActivationBatchDataset(
+        shard_dir, layer=layer, row_subset=val_pos,
+        batch_size=batch_size,
+        drop_prefix=drop_prefix, shuffle_shards=False,
+        shuffle_within_shard=False, seed=seed,
+        dtype=torch.float16,
+    )
+    val_prefetch = DataLoader(
+        val_ds, batch_size=None,
+        num_workers=max(1, num_workers // 2) if num_workers > 0 else 0,
+        pin_memory=(device != "cpu" and not on_gpu),
+    )
+    chunks = []
+    for xb in val_prefetch:
+        if on_gpu:
+            xb = xb.to(device, non_blocking=True)
+        chunks.append(xb)
+
+    if not chunks:
+        print(f"[val] skipped: empty validation split in {time.time() - t0:.1f}s")
+        return None
+
+    val_tensor = torch.cat(chunks, dim=0).contiguous()
+    if not on_gpu and device != "cpu":
+        val_tensor = val_tensor.pin_memory()
+    print(f"[val] done: shape={tuple(val_tensor.shape)} dtype={val_tensor.dtype} "
+          f"on {val_tensor.device} in {time.time() - t0:.1f}s")
+    return val_tensor
+
+
+def _fit_and_save_centroids(
+    shard_dir,
+    train_pos_full,
+    out_dir: "Path",
+    *,
+    K: int,
+    layer: int,
+    batch_size: int,
+    drop_prefix: int,
+    pool_size: int,
+    vocab_size: int,
+    proj_dim: int,
+    refine_epochs: int,
+    seed: "int | None",
+    num_workers: int,
+    device: str,
+) -> None:
+    """Fit ReservoirKMeans on the full train stream and save centroids.pt.
+
+    Only call this on rank 0 when centroids.pt does not already exist.
+    """
+    from dalg.init.projected_knn import ReservoirKMeans
+    from dalg.data.shard_activations import ShardActivationBatchDataset
+
+    full_train_ds = ShardActivationBatchDataset(
+        shard_dir, layer=layer, row_subset=train_pos_full,
+        batch_size=batch_size,
+        drop_prefix=drop_prefix, shuffle_shards=True,
+        shuffle_within_shard=True, seed=(seed or 0),
+    )
+    full_train_loader = DataLoader(
+        full_train_ds, batch_size=None, num_workers=num_workers,
+        pin_memory=(device != "cpu"),
+    )
+    knn = ReservoirKMeans(
+        n_clusters=K, pool_size=pool_size,
+        vocab_size=vocab_size, device=device,
+        proj_dim=proj_dim, seed=seed,
+    )
+    centroids = knn.fit(full_train_loader, token_loader=None, refine_epochs=refine_epochs)
+    torch.save(centroids.cpu(), out_dir / "centroids.pt")
+    print(f"Centroids: {tuple(centroids.shape)} saved to {out_dir / 'centroids.pt'}")
+
+
 def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
     """Shard-aware training path (branch B of cmd_train). DDP-aware via torchrun."""
+    import itertools
     from pathlib import Path
     from datetime import timedelta
     import time as _time
@@ -390,6 +490,40 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         stratified_split, per_subset_counts,
     )
     from dalg.models.mfa import ComponentShardedMFA, save_component_shard
+
+    class _ComponentShardLoader:
+        """Rank 0 loads batches; all others receive via broadcast.
+
+        In component-shard mode every rank would otherwise read the same shard
+        files independently. This cuts disk I/O by world_size: only rank 0 runs
+        the underlying DataLoader.
+        """
+        def __init__(self, loader, steps, _rank, _world_size, _device):
+            self.loader = loader
+            self.steps = steps
+            self.rank = _rank
+            self.world_size = _world_size
+            self.device = _device
+
+        def __len__(self):
+            return self.steps
+
+        def __iter__(self):
+            shape = torch.zeros(2, dtype=torch.long, device=self.device)
+            if self.rank == 0:
+                for batch in itertools.islice(self.loader, self.steps):
+                    batch = batch.to(self.device)
+                    shape[0], shape[1] = batch.shape
+                    dist.broadcast(shape, src=0)
+                    dist.broadcast(batch.contiguous(), src=0)
+                    yield batch
+            else:
+                for _ in range(self.steps):
+                    dist.broadcast(shape, src=0)
+                    batch = torch.empty(int(shape[0]), int(shape[1]),
+                                        dtype=torch.float32, device=self.device)
+                    dist.broadcast(batch, src=0)
+                    yield batch
 
     # ── DDP env ─────────────────────────────────────────────────────────
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -412,6 +546,9 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
             print(f"[{mode}] world_size={world_size} backend=nccl")
     else:
         device = args.device
+
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
 
     def log(msg):
         if is_main:
@@ -484,6 +621,7 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         train_ds, batch_size=None, num_workers=nw,
         pin_memory=(device != "cpu"),
         persistent_workers=(nw > 0),
+        prefetch_factor=(4 if nw > 0 else None),
     )
 
     # Force every rank to break at the same step count. The batch dataset yields
@@ -495,45 +633,23 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         dist.all_reduce(steps_t, op=dist.ReduceOp.MIN)
         steps_per_epoch = int(steps_t.item())
 
-    # Val set: materialize once on rank 0 only. By default kept on pinned CPU
-    # memory and streamed chunk-by-chunk during eval (cheap on GPU RAM).
-    # With --val-on-gpu the full tensor lives on `device` (faster eval, but
-    # for a 32k-cluster model this can easily eat 15+ GB of GPU RAM).
+    if component_shard and world_size > 1:
+        train_loader = _ComponentShardLoader(
+            train_loader, steps_per_epoch, rank, world_size, device
+        )
+
+    # Val set: materialize once on rank 0. Skipped in component-shard mode
+    # (best epoch is selected by train NLL instead).
     val_tensor = None
     if is_main and component_shard:
-        log("[val] skipped in component-shard mode; using train NLL for selection.")
+        log("[val] skipped in component-shard mode; best epoch selected by train NLL.")
     elif is_main:
-        on_gpu = bool(args.val_on_gpu) and device != "cpu"
-        where = f"{device} memory" if on_gpu else "pinned CPU memory"
-        log(f"[val] streaming {len(val_pos):,} rows into {where}...")
-        _t0 = _time.time()
-        val_ds = ShardActivationBatchDataset(
-            shard_dir, layer=args.layer, row_subset=val_pos,
-            batch_size=args.batch_size,
-            drop_prefix=drop_prefix, shuffle_shards=False,
-            shuffle_within_shard=False, seed=(args.seed or 0),
-            dtype=torch.float16,
+        val_tensor = _materialize_val_tensor(
+            shard_dir, val_pos,
+            layer=args.layer, batch_size=args.batch_size,
+            drop_prefix=drop_prefix, val_on_gpu=bool(args.val_on_gpu),
+            seed=(args.seed or 0), num_workers=nw, device=device,
         )
-        val_prefetch = DataLoader(
-            val_ds, batch_size=None,
-            num_workers=max(1, nw // 2) if nw > 0 else 0,
-            pin_memory=(device != "cpu" and not on_gpu),
-        )
-        val_chunks = []
-        for xb in val_prefetch:
-            if on_gpu:
-                xb = xb.to(device, non_blocking=True)
-            val_chunks.append(xb)
-        if val_chunks:
-            val_tensor = torch.cat(val_chunks, dim=0).contiguous()
-            if not on_gpu and device != "cpu":
-                val_tensor = val_tensor.pin_memory()
-        del val_chunks
-        if val_tensor is None:
-            log(f"[val] skipped: empty validation split in {_time.time() - _t0:.1f}s")
-        else:
-            log(f"[val] done: shape={tuple(val_tensor.shape)} dtype={val_tensor.dtype} "
-                f"on {val_tensor.device} in {_time.time() - _t0:.1f}s")
 
     max_pool = args.max_pool_size or 2_000_000
     if args.pool_size is not None and args.pool_size > 0:
@@ -549,26 +665,14 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
     # Centroids: rank 0 fits (using full train stream) if missing, then all ranks load.
     centroids_path = out_dir / "centroids.pt"
     if is_main and not centroids_path.exists():
-        full_train_ds = ShardActivationBatchDataset(
-            shard_dir, layer=args.layer, row_subset=train_pos_full,
-            batch_size=args.batch_size,
-            drop_prefix=drop_prefix, shuffle_shards=True,
-            shuffle_within_shard=True, seed=(args.seed or 0),
+        _fit_and_save_centroids(
+            shard_dir, train_pos_full, out_dir,
+            K=args.K, layer=args.layer, batch_size=args.batch_size,
+            drop_prefix=drop_prefix, pool_size=pool_size,
+            vocab_size=args.vocab_size, proj_dim=args.proj_dim,
+            refine_epochs=args.refine_epochs, seed=args.seed,
+            num_workers=nw, device=device,
         )
-        full_train_loader = DataLoader(
-            full_train_ds, batch_size=None, num_workers=nw,
-            pin_memory=(device != "cpu"),
-        )
-        knn = ReservoirKMeans(
-            n_clusters=args.K, pool_size=pool_size,
-            vocab_size=args.vocab_size, device=device,
-            proj_dim=args.proj_dim, seed=args.seed,
-        )
-        centroids = knn.fit(
-            full_train_loader, token_loader=None, refine_epochs=args.refine_epochs,
-        )
-        torch.save(centroids.cpu(), centroids_path)
-        log(f"Centroids: {tuple(centroids.shape)} saved to {centroids_path}")
     if use_ddp:
         dist.barrier()  # non-main ranks wait for centroids.pt
 
@@ -586,13 +690,14 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
             rank=args.rank,
             dist_rank=rank,
             world_size=world_size,
+            use_amp=getattr(args, "use_amp", False),
         ).to(device)
         log(
             f"Component sharding: rank {rank}/{world_size} owns "
             f"[{model.component_start}, {model.component_end})"
         )
     else:
-        model = MFA(centroids=centroids, rank=args.rank).to(device)
+        model = MFA(centroids=centroids, rank=args.rank, use_amp=getattr(args, "use_amp", False)).to(device)
     if args.compile:
         log("Compiling model with torch.compile...")
         model = torch.compile(model)
@@ -624,7 +729,7 @@ def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
         ckpt_path=ckpt_path,
         steps_per_epoch=steps_per_epoch,
         broadcast_params=not component_shard,
-        track_best=not component_shard,
+        track_best=True,
         checkpoint_all_ranks=component_shard,
     )
 
@@ -874,6 +979,9 @@ def build_parser():
                     help="Experimental: shard MFA components across distributed ranks "
                          "instead of using data-parallel DDP. All ranks see the same "
                          "batches and each rank owns a contiguous slice of K.")
+    sp.add_argument("--use-amp", action="store_true",
+                    help="Enable bfloat16 AMP for the heavy einsums in _core "
+                         "(Cholesky and loss stay float32; no GradScaler needed).")
     sp.add_argument("--compile", action="store_true", help="Use torch.compile")
     sp.set_defaults(func=cmd_train)
 

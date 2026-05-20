@@ -556,7 +556,7 @@ class ReservoirKMeans:
                 tol        = self.tol,
                 seed       = self.seed,
                 device     = self.device,
-                dtype      = torch.float32 if self.metric == "euclidean" else torch.float32,
+                dtype      = torch.float32,
             )
             centroids = km.fit(pool)
 

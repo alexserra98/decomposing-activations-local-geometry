@@ -12,8 +12,8 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH --time=6:00:00
-#SBATCH --output=outputs/jobs/mfa-layer-%a.out
-#SBATCH --error=outputs/jobs/mfa-layer-%a.err
+#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/mfa-layer-%a.out
+#SBATCH --error=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/mfa-layer-%a.err
 
 # ── Configuration (edit these) ──────────────────────────────────────────
 
@@ -32,7 +32,7 @@ SEED=42
 LAYER=$SLURM_ARRAY_TASK_ID
 OUT_DIR="${BASE_DIR}/layer_$(printf '%02d' $LAYER)"
 
-mkdir -p outputs/jobs
+mkdir -p /u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs
 
 echo "=== Layer $LAYER === $(date) ==="
 echo "Output: $OUT_DIR"

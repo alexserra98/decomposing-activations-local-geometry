@@ -57,7 +57,7 @@ MFA_DIR="$SHARD_DIR/layer${LAYER_TAG}_${K}_mfa"
 ASSIGNMENTS_PATH="$MFA_DIR/mfa_model_assignments.pt"
 OUT_DIR="$REPO_ROOT/output/experiments/${K}_${LAYER_TAG}/cluster_labels"
 
-mkdir -p "$REPO_ROOT/outputs/jobs" "$OUT_DIR"
+mkdir -p "$REPO_ROOT/logs/jobs" "$OUT_DIR"
 cd "$REPO_ROOT" || exit 1
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 

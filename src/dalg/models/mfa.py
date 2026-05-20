@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import torch
 import torch.nn as nn
@@ -392,8 +393,10 @@ def _distributed_logsumexp(local_values: torch.Tensor, dim: int) -> torch.Tensor
     global_sum = local_sum.detach().clone()
     dist.all_reduce(global_sum, op=dist.ReduceOp.SUM)
     global_sum = global_sum.clamp_min(torch.finfo(global_sum.dtype).tiny)
-    # Forward value is the true distributed logsumexp. The zero-valued
-    # correction gives each rank only its local slice of the serial gradient.
+    # The correction term is zero in the forward pass (subtracts a detached copy),
+    # but carries gradient: d/d x_i = exp(x_i - global_max) / global_sum = softmax(x_i).
+    # global_sum is detached so each rank's gradient depends only on its own local
+    # values — no cross-rank implicit gradient coupling.
     return global_max + global_sum.log() + (local_sum - local_sum.detach()) / global_sum
 
 
@@ -540,6 +543,14 @@ def load_mfa(
     dtype: Optional[torch.dtype] = None,
     strict: bool = True,
 ) -> MFA:
+    path = Path(path)
+    if not path.exists():
+        shards_json = path.parent / "mfa_model_shards.json"
+        if shards_json.exists():
+            return load_component_shards(
+                shards_json, map_location=map_location, device=device, dtype=dtype
+            )
+        raise FileNotFoundError(path)
     ckpt = torch.load(path, map_location=map_location)
 
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
@@ -586,6 +597,65 @@ def load_mfa(
         model = model.to(dtype=dtype)
 
     return model
+
+
+def load_component_shards(
+    path: str | Path,
+    *,
+    map_location: Optional[str | torch.device] = None,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> MFA:
+    """Assemble a full MFA from per-rank component-shard files.
+
+    Accepts either the directory containing mfa_model_shards.json or the
+    manifest path directly.
+    """
+    path = Path(path)
+    manifest_path = (path / "mfa_model_shards.json") if path.is_dir() else path
+    manifest = json.loads(manifest_path.read_text())
+    base_dir = manifest_path.parent
+
+    per_component_keys = ["mu", "dir_raw", "scale_rho", "pi_logits", "_rot_T", "_rot_inv_Tt"]
+    shard_states: List[Dict[str, torch.Tensor]] = []
+    first_meta: Dict[str, Any] = {}
+
+    for fname in manifest["shards"]:
+        ckpt = torch.load(base_dir / fname, map_location=map_location, weights_only=True)
+        shard_states.append(ckpt["state_dict"])
+        if not first_meta:
+            first_meta = ckpt.get("meta", {})
+
+    state: Dict[str, torch.Tensor] = {}
+    for k in per_component_keys:
+        if k in shard_states[0]:
+            state[k] = torch.cat([s[k] for s in shard_states], dim=0)
+
+    # psi_rho: shared (D,) when psi_per_component=False, per-component (K_local, D) otherwise
+    if "psi_rho" not in state:
+        psi_rho_0 = shard_states[0]["psi_rho"]
+        if psi_rho_0.ndim == 2:
+            state["psi_rho"] = torch.cat([s["psi_rho"] for s in shard_states], dim=0)
+        else:
+            state["psi_rho"] = psi_rho_0  # replicated; all ranks identical
+
+    global_K = manifest["global_K"]
+    D = first_meta["D"]
+    q = first_meta["q"]
+    psi_per_component = bool(first_meta.get("psi_per_component", False))
+    eps_floor = float(first_meta.get("eps_floor", 1e-8))
+
+    centroids = torch.zeros(global_K, D, dtype=state["mu"].dtype)
+    model = MFA(centroids=centroids, rank=q,
+                psi_per_component=psi_per_component, eps_floor=eps_floor)
+    model.load_state_dict(state, strict=True)
+
+    if device is not None:
+        model = model.to(device)
+    if dtype is not None:
+        model = model.to(dtype=dtype)
+    return model
+
 
 @dataclass
 class EncodedBatch:

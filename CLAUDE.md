@@ -113,6 +113,8 @@ Contains `train_nll`, the main optimizer loop.
 Important detail:
 - it is DDP-aware
 - only rank 0 handles some logging / checkpointing decisions
+- it also supports component-sharded training checkpoints, where every rank
+  saves and resumes its own model/optimizer shard
 
 ### `src/dalg/init/projected_knn.py`
 
@@ -204,6 +206,12 @@ The repo has two top-level symlinks into scratch storage:
 - `dalg-cache/` -> `/orfeo/scratch/dssc/zenocosini/dalg-cache/`
 - `output/` -> `/orfeo/scratch/dssc/zenocosini/dalg-cache/output/`
 
+Some scratch paths may also appear through older direct aliases such as
+`/orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations` or
+`/orfeo/scratch/dssc/zenocosini/pile_gemma2b_100M_windows/merged`. When a
+scratch path looks missing, check the symlink target and the `dalg-cache/...`
+form before assuming data was deleted.
+
 These point to large generated data. Treat them like scratch experiment state:
 - do not delete or overwrite large files there unless the user explicitly asks
 - prefer writing new large artifacts under these symlinks instead of home storage
@@ -276,6 +284,95 @@ Important details:
 - other ranks wait and then load the saved centroids
 - many debugging issues appear only in this path, not in single-process training
 
+There are now two distributed shard-training modes:
+
+1. **DDP / data-parallel mode**
+   - This is the default behavior.
+   - It is launched by `scripts/slurm/sbatch_train_shards.sh`.
+   - It does **not** pass `--component-shard`.
+   - Every rank owns a full copy of the MFA model.
+   - Training rows are partitioned across ranks.
+   - Increasing GPUs increases data parallelism, but it does not reduce
+     per-GPU model memory.
+   - This mode still saves the usual full-model files such as
+     `mfa_model.pt` and `checkpoint.pt`.
+
+2. **Component-sharded / model-parallel mode**
+   - This is experimental and is enabled with `--component-shard`.
+   - The Slurm entrypoint is `scripts/slurm/sbatch_train_component_shards.sh`.
+   - Each rank owns a contiguous slice of the MFA components `K`.
+     For example, with `K=8000` and 4 ranks, each rank owns about 2000
+     components.
+   - Every rank must see the same activation batches in the same order.
+     This is **not** data parallelism.
+   - Increasing GPUs reduces per-rank component memory instead of increasing
+     the effective data batch.
+   - `BATCH` is the logical batch each component shard sees. It should not be
+     multiplied by world size when reasoning about the effective batch.
+   - Validation is currently skipped in component-shard mode. Use
+     `VAL_FRAC=0.0` in Slurm scripts unless a future agent implements
+     distributed validation.
+   - `load_mfa` can assemble final component-sharded saves from
+     `mfa_model_shards.json`. It also supports the historical pattern of
+     passing `<run_dir>/mfa_model.pt` when that file is absent but
+     `<run_dir>/mfa_model_shards.json` exists. This assembles a full MFA in
+     memory, so it can still be too large for some downstream analysis jobs.
+
+Important component-sharded implementation details:
+- `ComponentShardedMFA` lives in `src/dalg/models/mfa.py`.
+- Component ownership is assigned by `component_shard_bounds(K, rank, world_size)`.
+- The mixture likelihood is assembled with a distributed logsumexp over the
+  component dimension. Be careful with autograd here: every rank participates
+  in the same logical loss, so a naive autograd-aware all-reduce can
+  double-count gradients.
+- The shared diagonal noise parameter `psi_rho` is replicated when
+  `psi_per_component=False` (the default). Its gradient must be summed across
+  ranks before `optimizer.step()`. This is handled by
+  `ComponentShardedMFA.sync_replicated_grads()` and called from `train_nll`.
+- Component-local parameters such as `mu`, `dir_raw`, `scale_rho`, and local
+  `pi_logits` should not be DDP-wrapped or all-reduced.
+
+Component-sharded checkpointing:
+- Do **not** gather and save one full model checkpoint on rank 0 for large
+  runs. For `K=8000`, `D=2048`, `q=160`, the full `dir_raw` tensor alone is
+  about 10 GiB in fp32, before Adam state.
+- Component-sharded training saves per-rank checkpoints:
+  - `checkpoint_rank0000.pt`
+  - `checkpoint_rank0001.pt`
+  - ...
+  - `checkpoint_shards.json`
+- Each rank checkpoint contains that rank's local model shard, local optimizer
+  state, epoch, and RNG state.
+- Resume assumes the same world size and rank-to-component mapping. If you
+  change the number of GPUs, expect shape mismatches or invalid optimizer
+  state unless explicit repartitioning support has been added.
+- Final component-sharded model saves are also per-rank:
+  - `mfa_model_rank0000.pt`
+  - `mfa_model_rank0001.pt`
+  - ...
+  - `mfa_model_shards.json`
+- A component-sharded run usually does not have a single `mfa_model.pt`.
+  `load_mfa` now supports sharded model manifests, so point tools at the
+  sharded model path/manifest instead of assuming `mfa_model.pt` exists.
+
+Testing component-sharded changes:
+- Use `tests/component_sharded_mfa_equivalence.py` for a small serial-vs-sharded
+  equivalence check. It builds a full serial MFA and a two-rank sharded MFA
+  from identical weights, trains both on the same batches, gathers the shards,
+  and compares parameters.
+- A useful local CPU command is:
+
+```bash
+PYTHONPATH=src python -m torch.distributed.run --standalone --nproc_per_node=2 \
+  tests/component_sharded_mfa_equivalence.py --device cpu --optimizer adam --steps 4
+```
+
+- For CUDA, run the same script under a two-GPU Slurm allocation with
+  `--device cuda`.
+- Also test the actual CLI path with a tiny synthetic shard dataset before
+  launching a large job, because the CLI path covers centroid loading,
+  checkpoint manifests, and final per-rank shard saves.
+
 ### Outputs
 
 Generated outputs should generally go under:
@@ -310,6 +407,12 @@ When adding new analysis code:
 
 When adding new runnable workflows:
 - prefer package entrypoints over ad hoc top-level scripts
+
+## TODO
+
+- Make model-loading CLI arguments more explicit for full vs sharded MFA runs,
+  e.g. avoid implying every run has a literal `mfa_model.pt` when
+  component-sharded outputs are loaded through `mfa_model_shards.json`.
 
 ## Things To Avoid
 
