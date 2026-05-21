@@ -1,24 +1,23 @@
 #!/bin/bash
-# ── Single knob: edit the --gres line to change #GPUs / GPU type ─────────
+# ── Single full-model shard training job ─────────────────────────────────
 # Examples:
-#     #SBATCH --gres=gpu:H100:2      (2× H100)
-#     #SBATCH --gres=gpu:A100:4      (4× A100)
-# NPROC is auto-derived from SLURM_GPUS_ON_NODE below — no other edits needed.
-# Rule of thumb: keep --cpus-per-task ≈ 8×GPUs and --mem ≈ 80G×GPUs.
+#     #SBATCH --gres=gpu:H100:1
+#     #SBATCH --gres=gpu:A100:1
 #SBATCH --partition=H100
 ##SBATCH --nodelist=dgx003 
 #SBATCH --account=LADE
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
-#SBATCH --gres=gpu:H100:2
-#SBATCH --mem=160G
+#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:H100:1
+#SBATCH --mem=80G
 #SBATCH --time=23:00:00
-#SBATCH --job-name=mfa_train_ddp
+#SBATCH --job-name=mfa_train_shards
 #SBATCH --array=5,17
-#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/mfa_train_ddp_%A_%a.out
+#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/mfa_train_shards_%A_%a.out
 
 # ── Config (edit to taste) ───────────────────────────────────────────────
+
 SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations}
 LAYER=$SLURM_ARRAY_TASK_ID
 
@@ -62,24 +61,22 @@ mkdir -p "$REPO_ROOT/logs/jobs"
 cd "$REPO_ROOT" || exit 1
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
-# Auto-derive from the --gres allocation; env override still wins.
-NPROC=${NPROC:-${SLURM_GPUS_ON_NODE:-2}}
-
 echo "=== $(date) === job $SLURM_JOB_ID.$SLURM_ARRAY_TASK_ID on $(hostname) ==="
 echo "repo_root: $REPO_ROOT"
 echo "shard_dir: $SHARD_DIR   layer: $LAYER   out_dir: $OUT_DIR"
-echo "K=$K  rank=$RANK  epochs=$EPOCHS  refine=$REFINE_EPOCHS  batch=$BATCH  use_amp=$USE_AMP num_workers=$NUM_WORKERS  nproc=$NPROC"
+echo "K=$K  rank=$RANK  epochs=$EPOCHS  refine=$REFINE_EPOCHS  batch=$BATCH  use_amp=$USE_AMP num_workers=$NUM_WORKERS"
+echo "training_mode=vanilla"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
-# ── Run (DDP via torchrun) ───────────────────────────────────────────────
-uv run python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node="$NPROC" \
-    -m dalg.cli.run_layer train \
+# ── Run ─────────────────────────────────────────────────────────────────
+uv run python -m dalg.cli.run_training \
     --shard-dir "$SHARD_DIR" --layer "$LAYER" --out-dir "$OUT_DIR" \
     --K "$K" --rank "$RANK" --epochs "$EPOCHS" \
     --refine-epochs "$REFINE_EPOCHS" \
     --batch-size "$BATCH" --num-workers "$NUM_WORKERS" \
     --val-frac "$VAL_FRAC" --split-seed "$SPLIT_SEED" \
     --device cuda --seed "$SEED" \
+    --training-mode vanilla \
     $POOL_FLAG $VAL_ON_GPU_FLAG $AMP_FLAG
 
 echo "=== $(date) === done ==="

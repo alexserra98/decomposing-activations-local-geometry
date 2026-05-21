@@ -530,7 +530,7 @@ def compute_intrinsic_dims_from_shards(
     if drop_prefix is None:
         drop_prefix = int(extract_cfg.get("drop_prefix", 32))
 
-    meta_index = load_meta_index(shard_dir)
+    meta_index = load_meta_index(shard_dir, layer=layer)
     assignments, sizes, peakedness, K = _load_assignments(assignments_path)
     mfa = load_mfa(model_path, map_location="cpu")
     if int(mfa.K) != K:

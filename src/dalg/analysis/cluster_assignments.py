@@ -100,7 +100,7 @@ def main() -> None:
     from torch.utils.data import DataLoader
 
     from dalg.data.shard_activations import (
-        ShardActivationBatchDataset,
+        ActivationBatchDataset,
         load_meta_index,
     )
 
@@ -109,7 +109,6 @@ def main() -> None:
     parser.add_argument("--shard-dir", type=Path, required=True, help="Directory produced by extract-windows")
     parser.add_argument("--layer", type=int, required=True, help="Layer index to stream from shard-dir")
     parser.add_argument("--batch-size", "--batch_size", dest="batch_size", type=int, default=1024)
-    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--drop-prefix", type=int, default=None)
@@ -130,11 +129,11 @@ def main() -> None:
     if drop_prefix is None:
         drop_prefix = int(extract_cfg.get("drop_prefix", 32))
 
-    meta_index = load_meta_index(shard_dir)
+    meta_index = load_meta_index(shard_dir, layer=args.layer)
     positions = list(range(len(meta_index)))
     print(f"shard_dir={shard_dir}  layer={args.layer}  rows={len(positions):,}")
 
-    ds = ShardActivationBatchDataset(
+    ds = ActivationBatchDataset(
         shard_dir,
         layer=args.layer,
         row_subset=positions,
@@ -148,9 +147,8 @@ def main() -> None:
     loader = DataLoader(
         ds,
         batch_size=None,
-        num_workers=args.num_workers,
+        num_workers=0,
         pin_memory=(device.type == "cuda"),
-        persistent_workers=(args.num_workers > 0),
     )
 
     sizes, assignments, max_responsibilities, peakedness = compute_assignments(

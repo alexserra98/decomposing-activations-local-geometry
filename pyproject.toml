@@ -15,10 +15,12 @@ dependencies = [
     "openai>=2.33.0",
     "scipy>=1.17.1",
     "streamlit>=1.45.0",
+    "wandb>=0.17",
 ]
 
 [project.scripts]
 dalg-run-layer = "dalg.cli.run_layer:main"
+dalg-run-training = "dalg.cli.run_training:main"
 dalg-interpret-mfa = "dalg.cli.interpret_mfa:main"
 dalg-label-mfa-clusters = "dalg.cli.label_mfa_clusters:main"
 dalg-cluster-overlap = "dalg.analysis.cluster_overlap:main"

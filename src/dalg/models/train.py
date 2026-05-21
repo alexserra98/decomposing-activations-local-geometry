@@ -2,10 +2,17 @@ import os
 import sys
 import math
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
-from dalg.models.mfa import save_mfa
 from tqdm import tqdm
+
+try:
+    import wandb as _wandb
+except ImportError:
+    _wandb = None
+
+
+def _wandb_active() -> bool:
+    return _wandb is not None and getattr(_wandb, "run", None) is not None
 
 # tqdm refresh cadence: fast in a real terminal, slow when stderr is a
 # non-interactive sink (e.g. SLURM log files) — otherwise tqdm emits one
@@ -15,11 +22,14 @@ _TQDM_MININTERVAL = 0.5 if _LOG_TTY else 30.0
 _TQDM_MAXINTERVAL = 10.0 if _LOG_TTY else 60.0
 
 
-def _ddp_state():
+def _distributed_state():
     on = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if on else 0
-    world = dist.get_world_size() if on else 1
-    return on, rank, world
+    return on, rank
+
+
+def _unwrap_model(model):
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
 
 
 def _cpu_state_dict(model):
@@ -89,35 +99,46 @@ def train_nll(
     log_interval=100,
     steps_per_epoch=None,
     ckpt_path=None,
-    broadcast_params=True,
     track_best=True,
     checkpoint_all_ranks=False,
 ):
     """
     Train with NLL, keep the best (lowest) NLL model.
 
-    DDP-aware: if `torch.distributed` is initialized, all ranks participate
-    in forward/backward (grads are all-reduced by DDP), but only rank 0 runs
-    validation, tracks best-state, writes the model/checkpoint and prints.
+    Validation can be supplied two ways, with `val_tensor` taking priority:
+    - `val_tensor`: a single pre-materialized tensor holding all validation
+      rows (typically built once on rank 0, parked on GPU or in pinned CPU
+      memory). Eval iterates contiguous chunks of it, so there is no shard
+      I/O or worker startup per epoch. This is the fast path used by the
+      shard-training CLI when the val set fits in memory.
+    - `val_loader`: a regular DataLoader over the val set, re-streamed from
+      disk each epoch. Fallback for val sets too large to materialize.
+    If both are None, the best-model metric falls back to training NLL.
+
+    Distributed-aware for component-sharded MFA: when `torch.distributed` is
+    initialized, all ranks run the same batches. Rank 0 chooses the metric and
+    broadcasts that decision, while every rank can checkpoint/restore its own
+    component shard.
 
     If `ckpt_path` is given, a full training checkpoint (model + optimizer +
     epoch + best state) is written atomically after every epoch. On startup,
     if that file exists it is loaded and training resumes from the next epoch.
     """
-    ddp_on, rank, world = _ddp_state()
+    dist_on, rank = _distributed_state()
     is_main = (rank == 0)
 
-    raw_model = model.module if hasattr(model, "module") else model
+    raw_model = _unwrap_model(model)
     device = next(model.parameters()).device
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    keep_best_on_this_rank = track_best and (is_main or checkpoint_all_ranks)
 
     best_metric = float("inf")
-    best_state  = _cpu_state_dict(raw_model) if (is_main and track_best) else None
+    best_state  = _cpu_state_dict(raw_model) if keep_best_on_this_rank else None
     best_epoch  = 0
     start_epoch = 1
 
     load_ckpt = bool(ckpt_path) and os.path.exists(ckpt_path) and (
-        is_main or checkpoint_all_ranks or ddp_on
+        is_main or checkpoint_all_ranks
     )
     if load_ckpt:
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -125,7 +146,7 @@ def train_nll(
         opt.load_state_dict(ckpt["optimizer"])
         if track_best:
             best_metric = ckpt["best_metric"]
-            best_state  = ckpt["best_state"] if is_main else None
+            best_state  = ckpt["best_state"] if keep_best_on_this_rank else None
             best_epoch  = ckpt["best_epoch"]
         start_epoch = ckpt["epoch"] + 1
         _restore_rng_state(ckpt.get("rng_state"), device)
@@ -138,17 +159,7 @@ def train_nll(
                 print(f"[ckpt] resumed from epoch {ckpt['epoch']:02d}  "
                       f"next={start_epoch:02d}/{epochs:02d}")
 
-    # Sync params + resume metadata across ranks after the (possible) load.
-    if ddp_on and broadcast_params:
-        for p in model.parameters():
-            dist.broadcast(p.data, src=0)
-        meta = torch.tensor([start_epoch, best_epoch, best_metric],
-                            device=device, dtype=torch.float64)
-        dist.broadcast(meta, src=0)
-        start_epoch = int(meta[0].item())
-        best_epoch = int(meta[1].item())
-        best_metric = float(meta[2].item())
-    elif ddp_on:
+    if dist_on:
         starts = torch.tensor([start_epoch, start_epoch], device=device, dtype=torch.long)
         dist.all_reduce(starts[:1], op=dist.ReduceOp.MIN)
         dist.all_reduce(starts[1:], op=dist.ReduceOp.MAX)
@@ -158,6 +169,9 @@ def train_nll(
                 f"min next epoch={int(starts[0].item())}, "
                 f"max next epoch={int(starts[1].item())}"
             )
+
+    global_step = (start_epoch - 1) * (steps_per_epoch or 0)
+    wandb_on = is_main and _wandb_active()
 
     for ep in range(start_epoch, epochs + 1):
         model.train()
@@ -175,7 +189,7 @@ def train_nll(
             x = batch[0] if isinstance(batch, (tuple, list)) else batch
             x = x.view(x.size(0), -1).to(device)
             opt.zero_grad(set_to_none=True)
-            loss = model(x)     # goes through DDP.forward → MFA.forward = nll
+            loss = model(x)
             loss.backward()
 
             sync_replicated_grads = getattr(raw_model, "sync_replicated_grads", None)
@@ -188,8 +202,16 @@ def train_nll(
             opt.step()
 
             B = x.size(0)
-            total_nll += float(loss.item()) * B
+            loss_val = float(loss.item())
+            total_nll += loss_val * B
             total_n   += B
+            global_step += 1
+
+            if wandb_on:
+                _wandb.log(
+                    {"train/loss": loss_val, "epoch": ep},
+                    step=global_step,
+                )
 
             if is_main and (batch_idx % log_interval) == 0:
                 avg_so_far = total_nll / max(1, total_n)
@@ -201,14 +223,6 @@ def train_nll(
                 break
 
             del x, loss
-
-        # Aggregate train NLL across ranks for reporting.
-        if ddp_on:
-            t = torch.tensor([total_nll, float(total_n)],
-                             device=device, dtype=torch.float64)
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            total_nll = float(t[0].item())
-            total_n   = int(t[1].item())
 
         avg_train_nll = total_nll / total_n if total_n else float("nan")
 
@@ -227,8 +241,7 @@ def train_nll(
             val_nll = float("nan")
             select_metric = float("nan")
 
-        # Broadcast the selection metric so all ranks agree on the decision.
-        if ddp_on:
+        if dist_on:
             t = torch.tensor([select_metric], device=device, dtype=torch.float64)
             dist.broadcast(t, src=0)
             select_metric = float(t[0].item())
@@ -239,9 +252,10 @@ def train_nll(
         )
         if improved:
             best_metric = select_metric
-            if is_main:
+            if keep_best_on_this_rank:
                 best_state  = _cpu_state_dict(raw_model)
                 best_epoch  = ep
+            if is_main:
                 if save_path and save_func:
                     save_func(raw_model, save_path)
 
@@ -251,6 +265,18 @@ def train_nll(
                 f"train NLL={avg_train_nll:.6f}  "
                 f"val NLL={val_nll:.6f} "
                 f"{'** best **' if improved else ''}"
+            )
+
+        if wandb_on:
+            _wandb.log(
+                {
+                    "epoch": ep,
+                    "train/epoch_nll": avg_train_nll,
+                    "val/nll": val_nll,
+                    "best/metric": best_metric,
+                    "best/epoch": best_epoch,
+                },
+                step=global_step,
             )
 
         if ckpt_path and (is_main or checkpoint_all_ranks):
@@ -264,8 +290,9 @@ def train_nll(
                 "rng_state": _rng_state(device),
             }, ckpt_path)
 
-    if is_main and track_best and best_state is not None:
+    if keep_best_on_this_rank and best_state is not None:
         raw_model.load_state_dict(best_state)
-        print(f"Restored best model from epoch {best_epoch:02d} with metric={best_metric:.6f}")
+        if is_main:
+            print(f"Restored best model from epoch {best_epoch:02d} with metric={best_metric:.6f}")
 
     return dict(best_epoch=best_epoch, best_metric=best_metric)

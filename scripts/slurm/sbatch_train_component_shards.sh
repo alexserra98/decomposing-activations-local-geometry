@@ -1,7 +1,7 @@
 #!/bin/bash
 # Train MFA with components sharded across GPUs.
 #
-# This is model-parallel over K, not data-parallel DDP:
+# This is model-parallel over K:
 # every rank sees the same activation batches, and each rank owns a slice of
 # the MFA components. Increasing #GPUs reduces per-GPU component memory.
 #
@@ -71,19 +71,19 @@ echo "=== $(date) === job $SLURM_JOB_ID.$SLURM_ARRAY_TASK_ID on $(hostname) ==="
 echo "repo_root: $REPO_ROOT"
 echo "shard_dir: $SHARD_DIR   layer: $LAYER   out_dir: $OUT_DIR"
 echo "K=$K  rank=$RANK  epochs=$EPOCHS  refine=$REFINE_EPOCHS  batch=$BATCH  num_workers=$NUM_WORKERS  nproc=$NPROC"
-echo "component_shard=1  val_frac=$VAL_FRAC  compile=$COMPILE  use_amp=$USE_AMP  centroids_from=$CENTROIDS_FROM"
+echo "training_mode=component_shard  val_frac=$VAL_FRAC  compile=$COMPILE  use_amp=$USE_AMP  centroids_from=$CENTROIDS_FROM"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 # ── Run (component-sharded MFA via torchrun) ─────────────────────────────
 uv run python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node="$NPROC" \
-    -m dalg.cli.run_layer train \
+    -m dalg.cli.run_training \
     --shard-dir "$SHARD_DIR" --layer "$LAYER" --out-dir "$OUT_DIR" \
     --K "$K" --rank "$RANK" --epochs "$EPOCHS" \
     --refine-epochs "$REFINE_EPOCHS" \
     --batch-size "$BATCH" --num-workers "$NUM_WORKERS" \
     --val-frac "$VAL_FRAC" --split-seed "$SPLIT_SEED" \
     --device cuda --seed "$SEED" \
-    --component-shard \
+    --training-mode component_shard \
     $POOL_FLAG $COMPILE_FLAG $AMP_FLAG
 
 echo "=== $(date) === done ==="

@@ -664,7 +664,7 @@ def label_mfa_clusters(
     if meta_index is None:
         from dalg.data.shard_activations import load_meta_index
 
-        meta_index = load_meta_index(config["shard_dir"])
+        meta_index = load_meta_index(config["shard_dir"], layer=config.get("layer"))
     coordinates = map_positions_to_token_coordinates(
         top_index["positions"],
         meta_index,

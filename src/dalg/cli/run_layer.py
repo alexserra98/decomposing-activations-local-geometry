@@ -3,7 +3,6 @@ CLI experiment runner for MFA pipeline.
 
 Subcommands:
     extract       Extract activations for a single layer and save to disk.
-    train         Train MFA on pre-extracted activations.
     intrinsic-dim Compute intrinsic dimensionality per cluster.
     overlap       Compute pairwise overlap metrics between components.
     all           Run extract + train + intrinsic-dim + overlap in sequence.
@@ -16,7 +15,7 @@ Example usage:
         --max-tokens 250000 --device cuda
 
     # Step 2: train (can re-run with different K without re-extracting)
-    dalg-run-layer train \
+    dalg-run-training \
         --data-dir results/gpt2-small/layer_04 \
         --K 500 --rank 10 --epochs 10 --device cuda
 
@@ -33,7 +32,6 @@ from pathlib import Path
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import torch
-from torch.utils.data import DataLoader, TensorDataset
 
 
 # ── Subcommand implementations ──────────────────────────────────────────
@@ -282,498 +280,20 @@ def cmd_extract_windows(args):
     log(f"done in {fmt_eta(time.time() - total_t0)}")
 
 
-def cmd_train(args):
-    """Initialize centroids and train MFA on pre-extracted activations.
-
-    Two input layouts supported:
-      (A) monolithic --data-dir containing activations.pt/tokens.pt/freq.pt,
-      (B) sharded    --shard-dir from `extract-windows`, with --layer and an
-          automatic stratified-by-subset train/val split.
-    """
-    from dalg.init.projected_knn import ReservoirKMeans
-    from dalg.models.mfa import MFA, save_mfa
-    from dalg.models.train import train_nll
-
-    use_shards = args.shard_dir is not None
-    if args.shard_dir is not None and args.data_dir is not None:
-        raise SystemExit("train: --shard-dir and --data-dir are mutually exclusive")
-    if args.shard_dir is None and args.data_dir is None:
-        raise SystemExit("train: pass exactly one of --shard-dir or --data-dir")
-    if use_shards:
-        if args.layer is None:
-            raise SystemExit("train: --layer is required with --shard-dir")
-        _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll)
-        return
-
-    data_dir = args.data_dir
-    X = torch.load(os.path.join(data_dir, "activations.pt"), weights_only=True)
-    tok = torch.load(os.path.join(data_dir, "tokens.pt"), weights_only=True)
-    print(f"Loaded activations: {X.shape}")
-
-    # Load config to get vocab_size if available
-    config_path = os.path.join(data_dir, "config.json")
-    config = {}
-    if os.path.exists(config_path):
-        with open(config_path) as f:
-            config = json.load(f)
-
-    full_ds = TensorDataset(X, tok)
-    loader = DataLoader(full_ds, batch_size=args.batch_size, shuffle=True, pin_memory=True)
-
-    # Try loading freq for weighted sampling
-    freq_path = os.path.join(data_dir, "freq.pt")
-    token_loader = None
-    if os.path.exists(freq_path):
-        token_loader = DataLoader(TensorDataset(tok), batch_size=args.batch_size)
-
-    # Initialization
-    max_pool = getattr(args, "max_pool_size", None) or 2_000_000
-    if args.pool_size is not None and args.pool_size > 0:
-        pool_size = int(args.pool_size)
-    else:
-        pool_size = min(max(args.K * 2, len(full_ds) // 5), max_pool)
-    pool_size = min(pool_size, len(full_ds))
-    print(f"Reservoir pool_size: {pool_size:,} (dataset={len(full_ds):,})")
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-
-    knn = ReservoirKMeans(
-        n_clusters=args.K,
-        pool_size=pool_size,
-        vocab_size=args.vocab_size,
-        device=args.device,
-        proj_dim=args.proj_dim,
-        seed=args.seed,
-    )
-    centroids = knn.fit(loader, token_loader=token_loader, refine_epochs=args.refine_epochs)
-    torch.save(centroids.cpu(), os.path.join(data_dir, "centroids.pt"))
-    print(f"Centroids: {centroids.shape}")
-
-    # Train MFA
-    model = MFA(centroids=centroids, rank=args.rank, use_amp=getattr(args, "use_amp", False)).to(args.device)
-
-    if args.compile:
-        print("Compiling model with torch.compile...")
-        model = torch.compile(model)
-
-    train_nll(
-        model, loader,
-        epochs=args.epochs, lr=args.lr,
-        grad_clip=args.grad_clip,
-        save_path=os.path.join(data_dir, "mfa_model.pt"),
-        save_func=save_mfa,
-    )
-
-    # Save final model (unwrap compiled model if needed)
-    raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-    save_mfa(raw_model, os.path.join(data_dir, "mfa_model.pt"))
-
-    # Update config
-    config.update({
-        "K": args.K, "rank": args.rank,
-        "epochs": args.epochs, "lr": args.lr,
-    })
-    with open(os.path.join(data_dir, "config.json"), "w") as f:
-        json.dump(config, f, indent=2)
-
-    print(f"Model saved to {data_dir}/mfa_model.pt")
-
-
-def _materialize_val_tensor(
-    shard_dir,
-    val_pos,
-    *,
-    layer: int,
-    batch_size: int,
-    drop_prefix: int,
-    val_on_gpu: bool,
-    seed: int,
-    num_workers: int,
-    device: str,
-) -> "torch.Tensor | None":
-    """Stream val rows into a (pinned) CPU tensor or onto `device`. Returns None if empty.
-
-    Only call this on rank 0.
-    """
-    import time
-    from dalg.data.shard_activations import ShardActivationBatchDataset
-
-    on_gpu = val_on_gpu and device != "cpu"
-    where = f"{device} memory" if on_gpu else "pinned CPU memory"
-    print(f"[val] streaming {len(val_pos):,} rows into {where}...")
-    t0 = time.time()
-
-    val_ds = ShardActivationBatchDataset(
-        shard_dir, layer=layer, row_subset=val_pos,
-        batch_size=batch_size,
-        drop_prefix=drop_prefix, shuffle_shards=False,
-        shuffle_within_shard=False, seed=seed,
-        dtype=torch.float16,
-    )
-    val_prefetch = DataLoader(
-        val_ds, batch_size=None,
-        num_workers=max(1, num_workers // 2) if num_workers > 0 else 0,
-        pin_memory=(device != "cpu" and not on_gpu),
-    )
-    chunks = []
-    for xb in val_prefetch:
-        if on_gpu:
-            xb = xb.to(device, non_blocking=True)
-        chunks.append(xb)
-
-    if not chunks:
-        print(f"[val] skipped: empty validation split in {time.time() - t0:.1f}s")
-        return None
-
-    val_tensor = torch.cat(chunks, dim=0).contiguous()
-    if not on_gpu and device != "cpu":
-        val_tensor = val_tensor.pin_memory()
-    print(f"[val] done: shape={tuple(val_tensor.shape)} dtype={val_tensor.dtype} "
-          f"on {val_tensor.device} in {time.time() - t0:.1f}s")
-    return val_tensor
-
-
-def _fit_and_save_centroids(
-    shard_dir,
-    train_pos_full,
-    out_dir: "Path",
-    *,
-    K: int,
-    layer: int,
-    batch_size: int,
-    drop_prefix: int,
-    pool_size: int,
-    vocab_size: int,
-    proj_dim: int,
-    refine_epochs: int,
-    seed: "int | None",
-    num_workers: int,
-    device: str,
-) -> None:
-    """Fit ReservoirKMeans on the full train stream and save centroids.pt.
-
-    Only call this on rank 0 when centroids.pt does not already exist.
-    """
-    from dalg.init.projected_knn import ReservoirKMeans
-    from dalg.data.shard_activations import ShardActivationBatchDataset
-
-    full_train_ds = ShardActivationBatchDataset(
-        shard_dir, layer=layer, row_subset=train_pos_full,
-        batch_size=batch_size,
-        drop_prefix=drop_prefix, shuffle_shards=True,
-        shuffle_within_shard=True, seed=(seed or 0),
-    )
-    full_train_loader = DataLoader(
-        full_train_ds, batch_size=None, num_workers=num_workers,
-        pin_memory=(device != "cpu"),
-    )
-    knn = ReservoirKMeans(
-        n_clusters=K, pool_size=pool_size,
-        vocab_size=vocab_size, device=device,
-        proj_dim=proj_dim, seed=seed,
-    )
-    centroids = knn.fit(full_train_loader, token_loader=None, refine_epochs=refine_epochs)
-    torch.save(centroids.cpu(), out_dir / "centroids.pt")
-    print(f"Centroids: {tuple(centroids.shape)} saved to {out_dir / 'centroids.pt'}")
-
-
-def _train_from_shards(args, ReservoirKMeans, MFA, save_mfa, train_nll):
-    """Shard-aware training path (branch B of cmd_train). DDP-aware via torchrun."""
-    import itertools
-    from pathlib import Path
-    from datetime import timedelta
-    import time as _time
-    import torch.distributed as dist
-    from torch.nn.parallel import DistributedDataParallel as DDP
-    from dalg.data.shard_activations import (
-        ShardActivationBatchDataset, load_meta_index,
-        stratified_split, per_subset_counts,
-    )
-    from dalg.models.mfa import ComponentShardedMFA, save_component_shard
-
-    class _ComponentShardLoader:
-        """Rank 0 loads batches; all others receive via broadcast.
-
-        In component-shard mode every rank would otherwise read the same shard
-        files independently. This cuts disk I/O by world_size: only rank 0 runs
-        the underlying DataLoader.
-        """
-        def __init__(self, loader, steps, _rank, _world_size, _device):
-            self.loader = loader
-            self.steps = steps
-            self.rank = _rank
-            self.world_size = _world_size
-            self.device = _device
-
-        def __len__(self):
-            return self.steps
-
-        def __iter__(self):
-            shape = torch.zeros(2, dtype=torch.long, device=self.device)
-            if self.rank == 0:
-                for batch in itertools.islice(self.loader, self.steps):
-                    batch = batch.to(self.device)
-                    shape[0], shape[1] = batch.shape
-                    dist.broadcast(shape, src=0)
-                    dist.broadcast(batch.contiguous(), src=0)
-                    yield batch
-            else:
-                for _ in range(self.steps):
-                    dist.broadcast(shape, src=0)
-                    batch = torch.empty(int(shape[0]), int(shape[1]),
-                                        dtype=torch.float32, device=self.device)
-                    dist.broadcast(batch, src=0)
-                    yield batch
-
-    # ── DDP env ─────────────────────────────────────────────────────────
+def validate_args(args) -> None:
+    """Validate cross-argument constraints once, before running a command."""
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-    rank       = int(os.environ.get("RANK", 0))
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    use_ddp    = world_size > 1
-    is_main    = (rank == 0)
-    component_shard = bool(getattr(args, "component_shard", False))
 
-    if use_ddp:
-        if args.device != "cuda":
-            raise SystemExit("DDP requires --device cuda")
-        torch.cuda.set_device(local_rank)
-        # Val streaming on rank 0 can take ~10 min while rank 1 waits at a
-        # barrier; default NCCL timeout (10 min) isn't enough.
-        dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
-        device = f"cuda:{local_rank}"
-        if is_main:
-            mode = "component-shard" if component_shard else "ddp"
-            print(f"[{mode}] world_size={world_size} backend=nccl")
-    else:
-        device = args.device
+    if args.command == "all":
+        if world_size > 1:
+            raise SystemExit("all: distributed training is not supported by this combined command")
+        args.training_mode = "vanilla"
 
-    if torch.cuda.is_available():
-        torch.set_float32_matmul_precision("high")
-
-    def log(msg):
-        if is_main:
-            print(msg)
-
-    shard_dir = Path(args.shard_dir)
-    extract_cfg = json.loads((shard_dir / "config.json").read_text())
-    window = int(extract_cfg["window"])
-    d_model = int(extract_cfg["d_model"])
-    drop_prefix = int(extract_cfg.get("drop_prefix", 32))
-    per_row_tokens = window - drop_prefix
-
-    out_dir = Path(args.out_dir or (shard_dir / f"layer{args.layer:02d}_{args.K}_mfa"))
-    if is_main:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    if use_ddp:
-        dist.barrier()
-
-    log(f"shard_dir={shard_dir}  layer={args.layer}  out_dir={out_dir}")
-    log(f"window={window}  d_model={d_model}  drop_prefix={drop_prefix}")
-
-    meta_index = load_meta_index(shard_dir)
-    train_pos_full, val_pos = stratified_split(
-        meta_index, val_frac=args.val_frac, seed=args.split_seed,
-    )
-    if component_shard:
-        # Model-parallel over components: every rank must see the same batches.
-        train_pos = train_pos_full
-    else:
-        # Partition train positions across ranks (val stays full on rank 0 only).
-        # Round-robin then trim to floor(N/world) so every rank has the same
-        # number of batches — otherwise DDP hangs when one rank finishes first.
-        n_per_rank = len(train_pos_full) // world_size
-        train_pos = train_pos_full[rank::world_size][:n_per_rank]
-
-    train_counts = per_subset_counts(meta_index, train_pos_full)
-    val_counts = per_subset_counts(meta_index, val_pos)
-    n_train_tok = len(train_pos_full) * per_row_tokens
-    n_val_tok = len(val_pos) * per_row_tokens
-    log(f"split: train rows={len(train_pos_full):,}  val rows={len(val_pos):,}")
-    log(f"       train tokens≈{n_train_tok:,}  val tokens≈{n_val_tok:,}")
-    if use_ddp:
-        if component_shard:
-            log(f"       each rank sees all {len(train_pos):,} train rows")
-        else:
-            log(f"       rank {rank}/{world_size} sees {len(train_pos):,} train rows")
-
-    if is_main:
-        split_info = {
-            "seed": args.split_seed, "val_frac": args.val_frac,
-            "per_row_tokens": per_row_tokens,
-            "train_rows": len(train_pos_full), "val_rows": len(val_pos),
-            "train_per_subset": train_counts, "val_per_subset": val_counts,
-            "val_global_rows": [meta_index[p]["global_row"] for p in val_pos],
-            "world_size": world_size,
-            "component_shard": component_shard,
-        }
-        (out_dir / "val_indices.json").write_text(json.dumps(split_info, indent=2))
-
-    train_ds = ShardActivationBatchDataset(
-        shard_dir, layer=args.layer, row_subset=train_pos,
-        batch_size=args.batch_size,
-        drop_prefix=drop_prefix, shuffle_shards=True,
-        shuffle_within_shard=True,
-        seed=(args.seed or 0) if component_shard else (args.seed or 0) + rank,
-    )
-
-    nw = args.num_workers
-    train_loader = DataLoader(
-        train_ds, batch_size=None, num_workers=nw,
-        pin_memory=(device != "cpu"),
-        persistent_workers=(nw > 0),
-        prefetch_factor=(4 if nw > 0 else None),
-    )
-
-    # Force every rank to break at the same step count. The batch dataset yields
-    # shard-local batches, so exact batch counts can differ slightly by rank.
-    # Use the minimum local batch count so DDP ranks stay aligned.
-    steps_per_epoch = len(train_ds)
-    if use_ddp:
-        steps_t = torch.tensor([steps_per_epoch], device=device, dtype=torch.long)
-        dist.all_reduce(steps_t, op=dist.ReduceOp.MIN)
-        steps_per_epoch = int(steps_t.item())
-
-    if component_shard and world_size > 1:
-        train_loader = _ComponentShardLoader(
-            train_loader, steps_per_epoch, rank, world_size, device
-        )
-
-    # Val set: materialize once on rank 0. Skipped in component-shard mode
-    # (best epoch is selected by train NLL instead).
-    val_tensor = None
-    if is_main and component_shard:
-        log("[val] skipped in component-shard mode; best epoch selected by train NLL.")
-    elif is_main:
-        val_tensor = _materialize_val_tensor(
-            shard_dir, val_pos,
-            layer=args.layer, batch_size=args.batch_size,
-            drop_prefix=drop_prefix, val_on_gpu=bool(args.val_on_gpu),
-            seed=(args.seed or 0), num_workers=nw, device=device,
-        )
-
-    max_pool = args.max_pool_size or 2_000_000
-    if args.pool_size is not None and args.pool_size > 0:
-        pool_size = int(args.pool_size)
-    else:
-        pool_size = min(max(args.K * 2, n_train_tok // 5), max_pool)
-    pool_size = min(pool_size, n_train_tok)
-    log(f"Reservoir pool_size: {pool_size:,} (n_train_tokens={n_train_tok:,})")
-
-    if args.seed is not None:
-        torch.manual_seed(args.seed + rank)
-
-    # Centroids: rank 0 fits (using full train stream) if missing, then all ranks load.
-    centroids_path = out_dir / "centroids.pt"
-    if is_main and not centroids_path.exists():
-        _fit_and_save_centroids(
-            shard_dir, train_pos_full, out_dir,
-            K=args.K, layer=args.layer, batch_size=args.batch_size,
-            drop_prefix=drop_prefix, pool_size=pool_size,
-            vocab_size=args.vocab_size, proj_dim=args.proj_dim,
-            refine_epochs=args.refine_epochs, seed=args.seed,
-            num_workers=nw, device=device,
-        )
-    if use_ddp:
-        dist.barrier()  # non-main ranks wait for centroids.pt
-
-    centroids = torch.load(centroids_path, map_location=device, weights_only=True)
-    log(f"Loaded centroids from {centroids_path}: {tuple(centroids.shape)}")
-    if centroids.shape[0] != args.K:
-        raise SystemExit(
-            f"Cached centroids K={centroids.shape[0]} != --K {args.K}; "
-            f"delete {centroids_path} to recompute."
-        )
-
-    if component_shard:
-        model = ComponentShardedMFA.from_global_centroids(
-            centroids,
-            rank=args.rank,
-            dist_rank=rank,
-            world_size=world_size,
-            use_amp=getattr(args, "use_amp", False),
-        ).to(device)
-        log(
-            f"Component sharding: rank {rank}/{world_size} owns "
-            f"[{model.component_start}, {model.component_end})"
-        )
-    else:
-        model = MFA(centroids=centroids, rank=args.rank, use_amp=getattr(args, "use_amp", False)).to(device)
-    if args.compile:
-        log("Compiling model with torch.compile...")
-        model = torch.compile(model)
-    if use_ddp and not component_shard:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-
-    ckpt_path = str(out_dir / f"checkpoint_rank{rank:04d}.pt") if component_shard else str(out_dir / "checkpoint.pt")
-    if component_shard and is_main:
-        ckpt_manifest = {
-            "format": "component_sharded_checkpoint",
-            "global_K": args.K,
-            "rank": args.rank,
-            "world_size": world_size,
-            "checkpoints": [
-                f"checkpoint_rank{r:04d}.pt" for r in range(world_size)
-            ],
-        }
-        (out_dir / "checkpoint_shards.json").write_text(json.dumps(ckpt_manifest, indent=2))
-    if use_ddp:
-        dist.barrier()
-
-    train_nll(
-        model, train_loader,
-        val_tensor=val_tensor,
-        epochs=args.epochs, lr=args.lr,
-        grad_clip=args.grad_clip,
-        save_path=None if component_shard else str(out_dir / "mfa_model.pt") if is_main else None,
-        save_func=None if component_shard else save_mfa if is_main else None,
-        ckpt_path=ckpt_path,
-        steps_per_epoch=steps_per_epoch,
-        broadcast_params=not component_shard,
-        track_best=True,
-        checkpoint_all_ranks=component_shard,
-    )
-
-    raw_model = model.module if hasattr(model, "module") else model
-    raw_model = raw_model._orig_mod if hasattr(raw_model, "_orig_mod") else raw_model
-    if component_shard:
-        shard_path = out_dir / f"mfa_model_rank{rank:04d}.pt"
-        save_component_shard(raw_model, shard_path)
-        if use_ddp:
-            dist.barrier()
-        if is_main:
-            manifest = {
-                "format": "component_sharded_mfa",
-                "global_K": args.K,
-                "rank": args.rank,
-                "world_size": world_size,
-                "shards": [
-                    f"mfa_model_rank{r:04d}.pt" for r in range(world_size)
-                ],
-            }
-            (out_dir / "mfa_model_shards.json").write_text(json.dumps(manifest, indent=2))
-            print(f"Component-sharded model shards saved to {out_dir}")
-    elif is_main:
-        save_mfa(raw_model, str(out_dir / "mfa_model.pt"))
-
-    if is_main:
-        cfg = {
-            "shard_dir": str(shard_dir), "layer": args.layer,
-            "window": window, "d_model": d_model, "drop_prefix": drop_prefix,
-            "K": args.K, "rank": args.rank,
-            "epochs": args.epochs, "lr": args.lr,
-            "val_frac": args.val_frac, "split_seed": args.split_seed,
-            "pool_size": pool_size, "refine_epochs": args.refine_epochs,
-            "batch_size": args.batch_size,
-            "world_size": world_size,
-            "component_shard": component_shard,
-        }
-        (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
-        if not component_shard:
-            print(f"Model saved to {out_dir}/mfa_model.pt")
-
-    if use_ddp:
-        dist.barrier()
-        dist.destroy_process_group()
+    elif args.command == "intrinsic-dim":
+        if args.shard_dir is not None and args.act_dir is not None:
+            raise SystemExit("intrinsic-dim: --shard-dir and --act-dir are mutually exclusive")
+        if args.shard_dir is not None and args.layer is None:
+            raise SystemExit("intrinsic-dim: --layer is required with --shard-dir")
 
 
 def cmd_overlap(args):
@@ -821,8 +341,6 @@ def cmd_intrinsic_dim(args):
     os.makedirs(out_dir, exist_ok=True)
 
     if args.shard_dir is not None:
-        if args.layer is None:
-            raise SystemExit("intrinsic-dim: --layer is required with --shard-dir")
         results = compute_intrinsic_dims_from_shards(
             model_path, Path(args.shard_dir),
             layer=args.layer,
@@ -870,6 +388,7 @@ def cmd_all(args):
     print("\n" + "=" * 60)
     print("STEP 2: Train MFA")
     print("=" * 60)
+    from dalg.cli.run_training import cmd_train
     cmd_train(args)
 
     print("\n" + "=" * 60)
@@ -939,51 +458,6 @@ def build_parser():
                     help="Smoke test: tiny shards/batches, only --limit rows")
     sp.add_argument("--limit", type=int, default=64)
     sp.set_defaults(func=cmd_extract_windows)
-
-    # -- train --
-    sp = sub.add_parser("train", help="Train MFA on pre-extracted activations")
-    add_common(sp)
-    sp.add_argument("--data-dir", default=None,
-                    help="Directory with monolithic activations.pt/tokens.pt (legacy layout)")
-    sp.add_argument("--shard-dir", default=None,
-                    help="Shard extraction dir from `extract-windows` (new layout)")
-    sp.add_argument("--layer", type=int, default=None,
-                    help="Layer to train on (required with --shard-dir)")
-    sp.add_argument("--out-dir", default=None,
-                    help="Where to save centroids/model (default: <shard-dir>/layer{L:02d}_mfa)")
-    sp.add_argument("--val-frac", type=float, default=0.05,
-                    help="Stratified-by-subset val fraction (shard layout only)")
-    sp.add_argument("--split-seed", type=int, default=42,
-                    help="Seed for the stratified split")
-    sp.add_argument("--val-on-gpu", action="store_true",
-                    help="Preload the full val tensor onto the GPU (faster eval, "
-                         "but uses GPU RAM). Default: keep on pinned CPU and stream "
-                         "chunks during eval.")
-    sp.add_argument("--num-workers", type=int, default=2,
-                    help="DataLoader workers (shard layout only)")
-    sp.add_argument("--K", type=int, required=True, help="Number of components")
-    sp.add_argument("--rank", type=int, default=10, help="MFA rank (q)")
-    sp.add_argument("--epochs", type=int, default=10)
-    sp.add_argument("--lr", type=float, default=1e-3)
-    sp.add_argument("--grad-clip", type=float, default=None)
-    sp.add_argument("--proj-dim", type=int, default=32, help="Projection dim for KMeans init")
-    sp.add_argument("--refine-epochs", type=int, default=25, help="Lloyd refinement epochs")
-    sp.add_argument("--vocab-size", type=int, default=50257, help="Vocabulary size for weighted sampling")
-    sp.add_argument("--pool-size", type=int, default=None,
-                    help="Reservoir pool size for kmeans init "
-                         "(default = max(K*2, N/5); set e.g. 4000000 for a 4M cap)")
-    sp.add_argument("--max-pool-size", type=int, default=2_000_000,
-                    help="Upper bound on heuristic pool size to avoid GPU OOM "
-                         "(default 2M ≈ 16GB; ignored if --pool-size is set explicitly)")
-    sp.add_argument("--component-shard", action="store_true",
-                    help="Experimental: shard MFA components across distributed ranks "
-                         "instead of using data-parallel DDP. All ranks see the same "
-                         "batches and each rank owns a contiguous slice of K.")
-    sp.add_argument("--use-amp", action="store_true",
-                    help="Enable bfloat16 AMP for the heavy einsums in _core "
-                         "(Cholesky and loss stay float32; no GradScaler needed).")
-    sp.add_argument("--compile", action="store_true", help="Use torch.compile")
-    sp.set_defaults(func=cmd_train)
 
     # -- overlap --
     sp = sub.add_parser("overlap", help="Compute pairwise overlap metrics")
@@ -1062,6 +536,7 @@ def build_parser():
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    validate_args(args)
     args.func(args)
 
 
