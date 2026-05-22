@@ -1,9 +1,8 @@
 import os
-import sys
 import math
+import time
 import torch
 import torch.distributed as dist
-from tqdm import tqdm
 
 try:
     import wandb as _wandb
@@ -14,12 +13,18 @@ except ImportError:
 def _wandb_active() -> bool:
     return _wandb is not None and getattr(_wandb, "run", None) is not None
 
-# tqdm refresh cadence: fast in a real terminal, slow when stderr is a
-# non-interactive sink (e.g. SLURM log files) — otherwise tqdm emits one
-# line per refresh and the log balloons.
-_LOG_TTY = sys.stderr.isatty()
-_TQDM_MININTERVAL = 0.5 if _LOG_TTY else 30.0
-_TQDM_MAXINTERVAL = 10.0 if _LOG_TTY else 60.0
+
+def _fmt_eta(seconds: float) -> str:
+    if not math.isfinite(seconds) or seconds < 0:
+        return "?"
+    s = int(seconds)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
 
 
 def _distributed_state():
@@ -101,6 +106,7 @@ def train_nll(
     ckpt_path=None,
     track_best=True,
     checkpoint_all_ranks=False,
+    max_steps=None,
 ):
     """
     Train with NLL, keep the best (lowest) NLL model.
@@ -173,19 +179,22 @@ def train_nll(
     global_step = (start_epoch - 1) * (steps_per_epoch or 0)
     wandb_on = is_main and _wandb_active()
 
+    def log(msg: str) -> None:
+        if is_main:
+            print(msg, flush=True)
+
     for ep in range(start_epoch, epochs + 1):
         model.train()
         total_nll, total_n = 0.0, 0
 
-        iterable = enumerate(loader, 1)
-        pbar = tqdm(
-            iterable, total=steps_per_epoch,
-            disable=not is_main,
-            mininterval=_TQDM_MININTERVAL,
-            maxinterval=_TQDM_MAXINTERVAL,
-        )
+        ep_start = time.time()
+        win_start = ep_start
+        win_loss_sum = 0.0
+        win_n = 0
+        total_str = str(steps_per_epoch) if steps_per_epoch else "?"
+        log(f"[epoch {ep:02d}/{epochs:02d}] start — {total_str} steps")
 
-        for batch_idx, batch in pbar:
+        for batch_idx, batch in enumerate(loader, 1):
             x = batch[0] if isinstance(batch, (tuple, list)) else batch
             x = x.view(x.size(0), -1).to(device)
             opt.zero_grad(set_to_none=True)
@@ -205,6 +214,8 @@ def train_nll(
             loss_val = float(loss.item())
             total_nll += loss_val * B
             total_n   += B
+            win_loss_sum += loss_val * B
+            win_n += B
             global_step += 1
 
             if wandb_on:
@@ -214,17 +225,37 @@ def train_nll(
                 )
 
             if is_main and (batch_idx % log_interval) == 0:
-                avg_so_far = total_nll / max(1, total_n)
-                pbar.set_description(
-                    f"Epoch {ep:02d} | Step {batch_idx:06d} Train NLL={avg_so_far:.6f}"
-                )
+                now = time.time()
+                win_dt = max(now - win_start, 1e-6)
+                steps_per_sec = log_interval / win_dt
+                window_nll = win_loss_sum / max(1, win_n)
+                if steps_per_epoch is not None:
+                    remaining = steps_per_epoch - batch_idx
+                    eta = remaining / steps_per_sec if steps_per_sec > 0 else float("inf")
+                    pct = 100.0 * batch_idx / steps_per_epoch
+                    log(
+                        f"  ep {ep:02d} step {batch_idx:>6d}/{steps_per_epoch} "
+                        f"({pct:5.1f}%) | nll={window_nll:.4f} | "
+                        f"{steps_per_sec:5.2f} it/s | eta {_fmt_eta(eta)}"
+                    )
+                else:
+                    log(
+                        f"  ep {ep:02d} step {batch_idx:>6d} | "
+                        f"nll={window_nll:.4f} | {steps_per_sec:5.2f} it/s"
+                    )
+                win_start = now
+                win_loss_sum = 0.0
+                win_n = 0
 
             if steps_per_epoch is not None and batch_idx >= steps_per_epoch:
+                break
+            if max_steps is not None and global_step >= max_steps:
                 break
 
             del x, loss
 
         avg_train_nll = total_nll / total_n if total_n else float("nan")
+        epoch_time = time.time() - ep_start
 
         # Validation: run only on rank 0 (others provide a placeholder).
         if is_main:
@@ -260,11 +291,12 @@ def train_nll(
                     save_func(raw_model, save_path)
 
         if is_main:
-            print(
-                f"[epoch {ep:02d}] "
-                f"train NLL={avg_train_nll:.6f}  "
-                f"val NLL={val_nll:.6f} "
-                f"{'** best **' if improved else ''}"
+            val_str = f"{val_nll:.6f}" if not math.isnan(val_nll) else "n/a"
+            tag = " ** best **" if improved else ""
+            log(
+                f"[epoch {ep:02d}/{epochs:02d}] done in {_fmt_eta(epoch_time)} | "
+                f"train_nll={avg_train_nll:.6f} | val_nll={val_str} | "
+                f"best_nll={best_metric:.6f} @ ep{best_epoch:02d}{tag}"
             )
 
         if wandb_on:
@@ -289,6 +321,10 @@ def train_nll(
                 "best_epoch": best_epoch,
                 "rng_state": _rng_state(device),
             }, ckpt_path)
+
+        if max_steps is not None and global_step >= max_steps:
+            log(f"[max-steps] reached global_step={global_step} >= max_steps={max_steps}; stopping early.")
+            break
 
     if keep_best_on_this_rank and best_state is not None:
         raw_model.load_state_dict(best_state)

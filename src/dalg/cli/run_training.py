@@ -467,6 +467,7 @@ def cmd_train(args):
         ckpt_path=str(out_dir / "checkpoint.pt"),
         steps_per_epoch=steps_per_epoch,
         track_best=True,
+        max_steps=args.max_steps,
     )
 
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -497,8 +498,12 @@ def cmd_train_component_shard(args):
     is_main = rank == 0
 
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
     device = f"cuda:{local_rank}"
+    dist.init_process_group(
+        backend="nccl",
+        timeout=timedelta(minutes=60),
+        device_id=torch.device(device),
+    )
     torch.set_float32_matmul_precision("high")
     if is_main:
         print(f"[component_shard] world_size={world_size} backend=nccl")
@@ -589,6 +594,7 @@ def cmd_train_component_shard(args):
         steps_per_epoch=steps_per_epoch,
         track_best=True,
         checkpoint_all_ranks=True,
+        max_steps=args.max_steps,
     )
 
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -691,6 +697,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--K", type=int, required=True, help="Number of components")
     p.add_argument("--rank", type=int, default=10, help="MFA rank (q)")
     p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="Hard cap on total optimizer steps; if reached, training stops early. "
+                        "Useful for bisect/smoke runs.")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--grad-clip", type=float, default=None)
     p.add_argument("--proj-dim", type=int, default=32)

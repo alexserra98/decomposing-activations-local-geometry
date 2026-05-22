@@ -11,7 +11,7 @@ We’ve uploaded an **end-to-end tutorial** that walks through the core MFA work
 
 The repository uses a standard `src/` layout: reusable library code lives in
 `src/dalg/`, runnable workflows are exposed as CLI entrypoints such as
-`dalg-run-layer` and `dalg-interpret-mfa`, and generated artifacts live under
+`dalg-run-extraction`, `dalg-run-training`, `dalg-run-metrics`, and `dalg-interpret-mfa`, and generated artifacts live under
 `outputs/`.
 
 **Coming soon:** additional code to **recreate the paper experiments**, along with **released trained MFAs** for **Llama-3.1-8B** and **Gemma-2-2B**.

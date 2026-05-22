@@ -9,36 +9,38 @@
 #     #SBATCH --gres=gpu:H100:2      (2 component shards)
 #     #SBATCH --gres=gpu:H100:4      (4 component shards)
 # Rule of thumb: keep --cpus-per-task around 8xGPUs and --mem around 80GxGPUs.
-#SBATCH --partition=DGX
+#SBATCH --partition=H100
 ##SBATCH --nodelist=dgx003
 #SBATCH --account=LADE
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=24
-#SBATCH --gres=gpu:A100:8
+#SBATCH --gres=gpu:H100:2
 #SBATCH --mem=160G
 #SBATCH --time=23:00:00
 #SBATCH --job-name=mfa_train_component_shards
-#SBATCH --begin=now+8hours
-#SBATCH --array=17
-#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/mfa_train_component_shards_%A_%a.out
+##SBATCH --begin=now+8hours
+#SBATCH --array=5
+##SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/mfa_train_component_shards_%A_%a.out
+#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/amp_1_compile_1_rank_300.out
 
 # ── Config (override with sbatch --export=ALL,KEY=value) ─────────────────
 SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations}
 LAYER=$SLURM_ARRAY_TASK_ID
 
 K=${K:-1000}
-RANK=${RANK:-337}
-EPOCHS=${EPOCHS:-20}
+RANK=${RANK:-300}
+EPOCHS=${EPOCHS:-3}
 REFINE_EPOCHS=${REFINE_EPOCHS:-10}
 BATCH=${BATCH:-8192}
 NUM_WORKERS=${NUM_WORKERS:-4}
 POOL_SIZE=${POOL_SIZE:-}
-VAL_FRAC=${VAL_FRAC:-0.05}                  # validation is skipped in component-shard mode
+VAL_FRAC=${VAL_FRAC:-0.008}                  # validation is skipped in component-shard mode
 SPLIT_SEED=${SPLIT_SEED:-42}
 SEED=${SEED:-42}
 COMPILE=${COMPILE:-1}                        # torch.compile on by default; set COMPILE=0 to disable
 USE_AMP=${USE_AMP:-1}                        # bfloat16 AMP for heavy einsums; set USE_AMP=1 to enable
+MAX_STEPS=${MAX_STEPS:-1000}                     # optional hard step cap for smoke/bisect runs
 
 LAYER_TAG="layer$(printf '%02d' "$LAYER")"
 OUT_DIR=${OUT_DIR:-"$SHARD_DIR/${LAYER_TAG}_${K}_${RANK}_component_sharded_mfa"}
@@ -50,6 +52,8 @@ COMPILE_FLAG=""
 [[ "$COMPILE" -eq 1 ]] && COMPILE_FLAG="--compile"
 AMP_FLAG=""
 [[ "$USE_AMP" -eq 1 ]] && AMP_FLAG="--use-amp"
+MAX_STEPS_FLAG=""
+[[ -n "$MAX_STEPS" ]] && MAX_STEPS_FLAG="--max-steps $MAX_STEPS"
 
 # ── Env ──────────────────────────────────────────────────────────────────
 REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
@@ -84,6 +88,7 @@ uv run python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=
     --val-frac "$VAL_FRAC" --split-seed "$SPLIT_SEED" \
     --device cuda --seed "$SEED" \
     --training-mode component_shard \
-    $POOL_FLAG $COMPILE_FLAG $AMP_FLAG
+    --wandb --wandb-project dalg-mfa --wandb-name "smoketest_L5_K1000_q337_$(date +%H%M%S)" \
+    $POOL_FLAG $COMPILE_FLAG $AMP_FLAG $MAX_STEPS_FLAG
 
 echo "=== $(date) === done ==="

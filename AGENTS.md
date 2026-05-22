@@ -60,37 +60,40 @@ Important top-level files:
 ## Main Entry Points
 
 Preferred CLI entrypoints are defined in `pyproject.toml`:
-- `dalg-run-layer`
+- `dalg-run-extraction`
 - `dalg-run-training`
+- `dalg-run-metrics`
 - `dalg-interpret-mfa`
 - `dalg-label-mfa-clusters`
 - `dalg-cluster-overlap`
 - `dalg-cluster-intrinsic-dim`
 - `dalg-build-pile-windows`
 
-The two most important ones are:
-- `dalg-run-layer` — extraction and analysis pipeline.
+The three most important ones are:
+- `dalg-run-extraction` — activation extraction into on-disk shards.
 - `dalg-run-training` — MFA training (vanilla single-process, or component-sharded model-parallel).
+- `dalg-run-metrics` — cluster-level metrics (overlap, intrinsic dim) on a trained MFA.
 
-`dalg-run-layer` lives in `src/dalg/cli/run_layer.py` and orchestrates the
-non-training workflow with subcommands:
-- `extract`
-- `extract-windows`
+`dalg-run-extraction` lives in `src/dalg/cli/run_extraction.py` and is a flat
+single-command CLI: it reads a pre-tokenized HF windows dataset and writes
+per-layer activation shards (resume-safe).
+
+`dalg-run-metrics` lives in `src/dalg/cli/run_metrics.py` and has two
+subcommands:
 - `overlap`
 - `intrinsic-dim`
-- `all` (calls extract → training → overlap → intrinsic-dim in sequence;
-  the training step delegates to `cmd_train` from `run_training.py`)
 
 `dalg-run-training` lives in `src/dalg/cli/run_training.py` and is a single
 command selected by `--training-mode {vanilla, component_shard}`. The dataset
 is always a directory of pre-extracted activation shards produced by
-`extract-windows`, passed via `--shard-dir`. The older monolithic
+`dalg-run-extraction`, passed via `--shard-dir`. The older monolithic
 `activations.pt` / `tokens.pt` path and the previous `--training-mode ddp`
 data-parallel mode have been removed; if you need data parallelism, run more
 than one job rather than reintroducing DDP here.
 
-When in doubt, start from `src/dalg/cli/run_layer.py` for extraction/analysis
-and `src/dalg/cli/run_training.py` for training.
+When in doubt, start from `src/dalg/cli/run_extraction.py` for extraction,
+`src/dalg/cli/run_metrics.py` for analysis, and
+`src/dalg/cli/run_training.py` for training.
 
 ## Core Code Map
 
@@ -199,7 +202,7 @@ High-level idea:
 ### `src/dalg/data/shard_activations.py`
 
 Very important for large runs. This is the streaming layer for pre-extracted
-activation shards produced by `extract-windows`.
+activation shards produced by `dalg-run-extraction`.
 
 Expected on-disk layout (`<root>` is `--shard-dir`):
 
@@ -279,9 +282,9 @@ Typical flow:
 For large-scale work, the usual research path is:
 
 1. build token windows dataset (`dalg-build-pile-windows`)
-2. extract activations into shards (`dalg-run-layer extract-windows`)
+2. extract activations into shards (`dalg-run-extraction`)
 3. train MFA from shards (`dalg-run-training --shard-dir ...`)
-4. analyze overlaps / intrinsic dimension / assignments (`dalg-run-layer`
+4. analyze overlaps / intrinsic dimension / assignments (`dalg-run-metrics`
    subcommands, or the standalone `dalg-cluster-*` entrypoints)
 5. interpret regions (`dalg-interpret-mfa`, then optionally
    `dalg-label-mfa-clusters`)

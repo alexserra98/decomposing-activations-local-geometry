@@ -36,7 +36,7 @@ export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 #   --device cuda --num-workers 4
 
 # # Step 2: intrinsic dimensionality per cluster
-# uv run dalg-run-layer intrinsic-dim \
+# uv run dalg-run-metrics intrinsic-dim \
 #   --data-dir "$DATA_DIR" \
 #   --shard-dir "$SHARD_DIR" \
 #   --layer "$LAYER" \
@@ -46,7 +46,7 @@ export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 # Step 3: pairwise component overlap
 # batch_pairs=512: peak GPU ≈ 10 GB (7 W-type tensors × 512 × D × q × 4 bytes)
 # default 4096 OOMs because W-chunk (4096, 2048, 337) alone exceeds H100 memory
-uv run dalg-run-layer overlap \
+uv run dalg-run-metrics overlap \
   --data-dir "$DATA_DIR" \
   --out-dir "$OUT_DIR" \
   --device cuda --batch-pairs 512

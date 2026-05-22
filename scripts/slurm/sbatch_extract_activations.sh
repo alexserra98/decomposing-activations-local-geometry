@@ -36,7 +36,7 @@ echo "layers: $LAYERS  dtype: $DTYPE  batch: $BATCH  shard: $SHARD"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 # ── Run ──────────────────────────────────────────────────────────────────
-uv run dalg-run-layer extract-windows \
+uv run dalg-run-extraction \
     --dataset "$DATASET" \
     --out-dir "$OUT_DIR" \
     --model "$MODEL" \

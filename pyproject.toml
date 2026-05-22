@@ -19,7 +19,8 @@ dependencies = [
 ]
 
 [project.scripts]
-dalg-run-layer = "dalg.cli.run_layer:main"
+dalg-run-extraction = "dalg.cli.run_extraction:main"
+dalg-run-metrics = "dalg.cli.run_metrics:main"
 dalg-run-training = "dalg.cli.run_training:main"
 dalg-interpret-mfa = "dalg.cli.interpret_mfa:main"
 dalg-label-mfa-clusters = "dalg.cli.label_mfa_clusters:main"
