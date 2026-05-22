@@ -15,6 +15,7 @@ from .vae import (
     adapt_activation_batch,
     build_lightning_vae,
     build_prior,
+    load_vae,
     save_vae,
 )
 
@@ -34,6 +35,7 @@ __all__ = [
     "build_lightning_vae",
     "build_prior",
     "load_mfa",
+    "load_vae",
     "save_mfa",
     "save_vae",
 ]

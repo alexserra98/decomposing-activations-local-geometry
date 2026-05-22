@@ -279,12 +279,16 @@ class VAE(nn.Module):
         super().__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
+        self.enc_hidden_dims = tuple(int(d) for d in enc_hidden_dims)
+        self.dec_hidden_dims = tuple(int(d) for d in dec_hidden_dims)
+        self.dropout = float(dropout)
+        self.layer_norm = bool(layer_norm)
         self.beta = float(beta)
         self.normalizer = normalizer
         self.encoder = MLPGaussianEncoder(
             input_dim=input_dim,
             latent_dim=latent_dim,
-            hidden_dims=enc_hidden_dims,
+            hidden_dims=self.enc_hidden_dims,
             dropout=dropout,
             layer_norm=layer_norm,
             normalizer=normalizer,
@@ -292,7 +296,7 @@ class VAE(nn.Module):
         self.decoder = MLPDecoder(
             latent_dim=latent_dim,
             output_dim=input_dim,
-            hidden_dims=dec_hidden_dims,
+            hidden_dims=self.dec_hidden_dims,
             dropout=dropout,
             layer_norm=layer_norm,
         )
@@ -341,6 +345,14 @@ class VAE(nn.Module):
             "kl_loss": kl_loss,
             "beta": torch.tensor(self.beta, device=x.device),
         }
+
+    def responsibilities(self, x: torch.Tensor) -> torch.Tensor:
+        """Assign inputs to prior components using the encoder posterior mean."""
+        mu, _logvar = self.encode(x)
+        prior_resp = getattr(self.prior, "responsibilities", None)
+        if callable(prior_resp):
+            return prior_resp(mu)
+        return torch.ones((x.shape[0], 1), dtype=mu.dtype, device=mu.device)
 
 
 def ActivationVAELightning(
@@ -490,8 +502,125 @@ def save_vae(model: VAE, path: str | Path) -> None:
             "state_dict": model.state_dict(),
             "input_dim": model.input_dim,
             "latent_dim": model.latent_dim,
+            "enc_hidden_dims": list(model.enc_hidden_dims),
+            "dec_hidden_dims": list(model.dec_hidden_dims),
+            "dropout": model.dropout,
+            "layer_norm": model.layer_norm,
             "beta": model.beta,
             "prior": prior_config,
         },
         path,
     )
+
+
+def _linear_out_features(state: dict[str, torch.Tensor], prefix: str) -> tuple[int, ...]:
+    linears: list[tuple[int, int]] = []
+    for key, value in state.items():
+        if not (key.startswith(prefix) and key.endswith(".weight") and value.ndim == 2):
+            continue
+        parts = key[len(prefix):].split(".")
+        if not parts or not parts[0].isdigit():
+            continue
+        linears.append((int(parts[0]), int(value.shape[0])))
+    linears.sort()
+    if len(linears) <= 1:
+        return ()
+    return tuple(out_features for _idx, out_features in linears[:-1])
+
+
+def _load_adjacent_config(path: Path) -> dict:
+    config_path = path.parent / "config.json"
+    if not config_path.exists():
+        return {}
+    import json
+
+    return json.loads(config_path.read_text())
+
+
+def load_vae(
+    path: str | Path,
+    *,
+    map_location: str | torch.device | None = None,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+    strict: bool = True,
+) -> VAE:
+    """Load a VAE saved by ``save_vae`` or a VAE training checkpoint."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    payload = torch.load(path, map_location=map_location, weights_only=False)
+    if isinstance(payload, dict) and "state_dict" in payload:
+        state = payload["state_dict"]
+    elif isinstance(payload, dict) and "model" in payload:
+        state = payload["model"]
+    elif isinstance(payload, dict):
+        state = payload
+    else:
+        raise ValueError(f"Unsupported VAE checkpoint format at {path}")
+
+    run_config = _load_adjacent_config(path)
+    input_dim = int(payload.get("input_dim", run_config.get("d_model", state["encoder.backbone.0.weight"].shape[1])))
+    latent_dim = int(payload.get("latent_dim", run_config.get("latent_dim", state["encoder.mu.weight"].shape[0])))
+    enc_hidden_dims = tuple(payload.get(
+        "enc_hidden_dims",
+        run_config.get("enc_hidden_dims", _linear_out_features(state, "encoder.backbone.")),
+    ))
+    dec_hidden_dims = tuple(payload.get(
+        "dec_hidden_dims",
+        run_config.get("dec_hidden_dims", _linear_out_features(state, "decoder.net.")),
+    ))
+    dropout = float(payload.get("dropout", run_config.get("dropout", 0.0)))
+    layer_norm = bool(payload.get(
+        "layer_norm",
+        run_config.get(
+            "layer_norm",
+            any(
+                key.startswith(("encoder.backbone.", "decoder.net."))
+                and key.endswith(".weight")
+                and value.ndim == 1
+                for key, value in state.items()
+            ),
+        ),
+    ))
+    beta = float(payload.get("beta", run_config.get("beta", 1.0)))
+
+    prior_cfg = payload.get("prior") or {}
+    prior_name = prior_cfg.get("name", run_config.get("prior", "standard"))
+    prior_components = int(prior_cfg.get(
+        "n_components",
+        run_config.get("prior_components", 100),
+    ))
+    prior = build_prior(
+        prior_name,
+        latent_dim,
+        prior_components,
+        input_dim=input_dim,
+    )
+
+    normalizer = None
+    if "normalizer.mean" in state and "normalizer.std" in state:
+        normalizer = FeatureStandardizer(
+            state["normalizer.mean"],
+            state["normalizer.std"],
+        )
+
+    model = VAE(
+        input_dim=input_dim,
+        latent_dim=latent_dim,
+        enc_hidden_dims=enc_hidden_dims,
+        dec_hidden_dims=dec_hidden_dims,
+        prior=prior,
+        dropout=dropout,
+        layer_norm=layer_norm,
+        beta=beta,
+        normalizer=normalizer,
+    )
+    model.load_state_dict(state, strict=strict)
+
+    if device is not None:
+        model = model.to(device)
+    if dtype is not None:
+        model = model.to(dtype=dtype)
+    return model
