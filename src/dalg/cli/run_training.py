@@ -60,9 +60,12 @@ def _resolve_activation_data(args, *, log) -> dict:
     n_train_tokens = len(train_pos_full) * per_row_tokens
 
     out_dir_arg = getattr(args, "out_dir", None)
-    out_dir = Path(out_dir_arg) if out_dir_arg else (
-        shard_dir / f"layer{args.layer:02d}_{args.K}_mfa"
-    )
+    if out_dir_arg:
+        out_dir = Path(out_dir_arg)
+    elif getattr(args, "training_mode", "vanilla") == "vae":
+        out_dir = shard_dir / f"layer{args.layer:02d}_vae"
+    else:
+        out_dir = shard_dir / f"layer{args.layer:02d}_{args.K}_mfa"
 
     log(f"shard_dir={shard_dir}  layer={args.layer}  out_dir={out_dir}")
     log(f"window={window}  d_model={d_model}  drop_prefix={drop_prefix}")
@@ -89,6 +92,17 @@ def _resolve_activation_data(args, *, log) -> dict:
 
 def _loader_num_workers(args) -> int:
     return max(0, int(getattr(args, "num_workers", 0)))
+
+
+def _parse_dims(value: str | None, *, default: tuple[int, ...]) -> tuple[int, ...]:
+    if value is None:
+        return default
+    dims = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    if not dims:
+        return default
+    if any(dim <= 0 for dim in dims):
+        raise SystemExit(f"hidden dimensions must be positive, got {dims}")
+    return dims
 
 
 def _build_data_loader(dataset, args, *, device: str):
@@ -386,6 +400,43 @@ def _write_run_config(
     (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
 
 
+def _write_vae_run_config(
+    data: dict,
+    out_dir: Path,
+    *,
+    args,
+) -> None:
+    """Persist VAE training settings next to the saved model."""
+    cfg = {
+        "training_mode": "vae",
+        "world_size": 1,
+        "shard_dir": str(data["shard_dir"]),
+        "layer": args.layer,
+        "window": data["window"],
+        "d_model": data["d_model"],
+        "drop_prefix": data["drop_prefix"],
+        "val_frac": data["val_frac"],
+        "split_seed": data["split_seed"],
+        "epochs": args.epochs,
+        "max_steps": args.max_steps,
+        "lr": args.lr,
+        "weight_decay": args.vae_weight_decay,
+        "grad_clip": args.grad_clip,
+        "batch_size": args.batch_size,
+        "num_workers": _loader_num_workers(args),
+        "latent_dim": args.vae_latent_dim,
+        "enc_hidden_dims": list(_parse_dims(args.vae_enc_hidden_dims, default=(1024, 512))),
+        "dec_hidden_dims": list(_parse_dims(args.vae_dec_hidden_dims, default=(512, 1024))),
+        "prior": args.vae_prior,
+        "prior_components": args.vae_prior_components,
+        "beta": args.vae_beta,
+        "beta_warmup_steps": args.vae_beta_warmup_steps,
+        "dropout": args.vae_dropout,
+        "layer_norm": args.vae_layer_norm,
+    }
+    (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+
+
 def _maybe_init_wandb(args, data: dict, *, training_mode: str, world_size: int, is_main: bool):
     """Initialize a W&B run on rank 0 only. Returns the run, or None.
 
@@ -397,8 +448,8 @@ def _maybe_init_wandb(args, data: dict, *, training_mode: str, world_size: int, 
     import wandb
 
     run_config = {
-        "K": args.K,
-        "rank": args.rank,
+        "K": getattr(args, "K", None),
+        "rank": getattr(args, "rank", None),
         "epochs": args.epochs,
         "lr": args.lr,
         "batch_size": args.batch_size,
@@ -413,6 +464,15 @@ def _maybe_init_wandb(args, data: dict, *, training_mode: str, world_size: int, 
         "n_train_tokens": data["n_train_tokens"],
         "val_frac": data["val_frac"],
     }
+    if training_mode == "vae":
+        run_config.update({
+            "latent_dim": args.vae_latent_dim,
+            "prior": args.vae_prior,
+            "prior_components": args.vae_prior_components,
+            "beta": args.vae_beta,
+            "beta_warmup_steps": args.vae_beta_warmup_steps,
+            "weight_decay": args.vae_weight_decay,
+        })
     return wandb.init(
         project=args.wandb_project,
         name=args.wandb_name,
@@ -506,6 +566,89 @@ def cmd_train(args):
         world_size=1,
     )
     print(f"Model saved to {out_dir}/mfa_model.pt")
+    _finish_wandb(wandb_run)
+
+
+def cmd_train_vae(args):
+    """Single-process VAE training on activation shards."""
+    from dalg.models.train import train_vae
+    from dalg.models.vae import VAE, build_prior, save_vae
+
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+
+    data = _resolve_activation_data(args, log=print)
+    out_dir = data["out_dir"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    wandb_run = _maybe_init_wandb(
+        args, data, training_mode="vae", world_size=1, is_main=True,
+    )
+
+    train_loader, steps_per_epoch, _ = _build_train_loader(
+        data,
+        args,
+        device=args.device,
+    )
+    val_tensor = _build_val_tensor_for_main(
+        data,
+        args,
+        device=args.device,
+    )
+    _write_split_info(
+        data,
+        out_dir,
+        args=args,
+        training_mode="vae",
+        world_size=1,
+    )
+
+    enc_hidden_dims = _parse_dims(args.vae_enc_hidden_dims, default=(1024, 512))
+    dec_hidden_dims = _parse_dims(args.vae_dec_hidden_dims, default=(512, 1024))
+    prior = build_prior(
+        args.vae_prior,
+        args.vae_latent_dim,
+        args.vae_prior_components,
+        input_dim=data["d_model"],
+    )
+    model = VAE(
+        input_dim=data["d_model"],
+        latent_dim=args.vae_latent_dim,
+        enc_hidden_dims=enc_hidden_dims,
+        dec_hidden_dims=dec_hidden_dims,
+        prior=prior,
+        dropout=args.vae_dropout,
+        layer_norm=args.vae_layer_norm,
+        beta=args.vae_beta,
+    ).to(args.device)
+    if getattr(args, "compile", False):
+        print("Compiling VAE with torch.compile...")
+        model = torch.compile(model)
+
+    train_vae(
+        model,
+        train_loader,
+        val_tensor=val_tensor,
+        epochs=args.epochs,
+        lr=args.lr,
+        weight_decay=args.vae_weight_decay,
+        grad_clip=args.grad_clip,
+        save_path=str(out_dir / "vae_model.pt"),
+        save_func=save_vae,
+        ckpt_path=str(out_dir / "checkpoint.pt"),
+        steps_per_epoch=steps_per_epoch,
+        track_best=True,
+        max_steps=args.max_steps,
+        beta_warmup_steps=args.vae_beta_warmup_steps,
+        log_interval=args.log_interval,
+    )
+
+    raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    save_vae(raw_model, str(out_dir / "vae_model.pt"))
+    _write_vae_run_config(data, out_dir, args=args)
+    print(f"VAE saved to {out_dir}/vae_model.pt")
     _finish_wandb(wandb_run)
 
 
@@ -701,11 +844,15 @@ def validate_args(args) -> None:
         raise SystemExit("train: --layer is required")
 
     mode = args.training_mode
+    if mode in {"vanilla", "component_shard"} and args.K is None:
+        raise SystemExit(f"train: --K is required for --training-mode {mode}")
     if mode == "vanilla" and world_size > 1:
         raise SystemExit(
             "train: --training-mode vanilla was requested under torchrun; "
             "run a single process or use --training-mode component_shard"
         )
+    if mode == "vae" and world_size > 1:
+        raise SystemExit("train: --training-mode vae currently supports a single process")
     if mode == "component_shard":
         if world_size <= 1:
             raise SystemExit(f"train: --training-mode {mode} requires torchrun with WORLD_SIZE>1")
@@ -725,7 +872,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--val-frac", type=float, default=0.05)
     p.add_argument("--split-seed", type=int, default=42)
     p.add_argument("--val-on-gpu", action="store_true")
-    p.add_argument("--K", type=int, required=True, help="Number of components")
+    p.add_argument("--K", type=int, default=None, help="Number of MFA components")
     p.add_argument("--rank", type=int, default=10, help="MFA rank (q)")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--max-steps", type=int, default=None,
@@ -733,6 +880,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "Useful for bisect/smoke runs.")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--grad-clip", type=float, default=None)
+    p.add_argument("--log-interval", type=int, default=100)
     p.add_argument("--proj-dim", type=int, default=32)
     p.add_argument("--refine-epochs", type=int, default=25)
     p.add_argument("--vocab-size", type=int, default=50257)
@@ -741,8 +889,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--training-mode",
         default="vanilla",
-        choices=["vanilla", "component_shard"],
+        choices=["vanilla", "component_shard", "vae"],
     )
+    p.add_argument("--vae-latent-dim", type=int, default=64)
+    p.add_argument("--vae-enc-hidden-dims", default="1024,512")
+    p.add_argument("--vae-dec-hidden-dims", default="512,1024")
+    p.add_argument("--vae-prior", choices=["standard", "mog", "vamp"], default="standard")
+    p.add_argument("--vae-prior-components", type=int, default=100)
+    p.add_argument("--vae-beta", type=float, default=1.0)
+    p.add_argument("--vae-beta-warmup-steps", type=int, default=0)
+    p.add_argument("--vae-weight-decay", type=float, default=1e-4)
+    p.add_argument("--vae-dropout", type=float, default=0.0)
+    p.add_argument("--vae-layer-norm", action="store_true")
     p.add_argument("--compile", action="store_true")
     p.add_argument("--wandb", action="store_true", help="Log training to Weights & Biases (rank 0 only)")
     p.add_argument("--wandb-project", default=None, help="W&B project name")
@@ -753,6 +911,7 @@ def build_parser() -> argparse.ArgumentParser:
 _DISPATCH = {
     "vanilla": cmd_train,
     "component_shard": cmd_train_component_shard,
+    "vae": cmd_train_vae,
 }
 
 
