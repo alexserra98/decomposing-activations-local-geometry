@@ -14,11 +14,16 @@ dependencies = [
     "huggingface-hub>=0.34.0,<1.0",
     "openai>=2.33.0",
     "scipy>=1.17.1",
+    "streamlit>=1.45.0",
+    "wandb>=0.17",
 ]
 
 [project.scripts]
-dalg-run-layer = "dalg.cli.run_layer:main"
+dalg-run-extraction = "dalg.cli.run_extraction:main"
+dalg-run-metrics = "dalg.cli.run_metrics:main"
+dalg-run-training = "dalg.cli.run_training:main"
 dalg-interpret-mfa = "dalg.cli.interpret_mfa:main"
+dalg-label-mfa-clusters = "dalg.cli.label_mfa_clusters:main"
 dalg-cluster-overlap = "dalg.analysis.cluster_overlap:main"
 dalg-cluster-intrinsic-dim = "dalg.analysis.cluster_intrinsic_dim:main"
 dalg-build-pile-windows = "dalg.data.build_pile_windows:main"

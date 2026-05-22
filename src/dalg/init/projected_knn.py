@@ -6,6 +6,14 @@ import torch.nn.functional as F
 
 # optional weighted sampling for better coverage -- not used by default
 
+def _unpack_batch(batch):
+    if isinstance(batch, (tuple, list)):
+        x = batch[0]
+        tok = batch[1] if len(batch) > 1 else None
+        return x, tok
+    return batch, None
+
+
 class WeightedReservoirSampler:
     def __init__(self, m: int, weights: Optional[torch.Tensor] = None, device=None, dtype=None):
         self.m = m
@@ -18,9 +26,10 @@ class WeightedReservoirSampler:
         pool, keys = None, None
         filled = 0
 
-        for x, tok in loader:
+        for batch in loader:
+            x, tok = _unpack_batch(batch)
             x = x.to(self.device, dtype=self.dtype)
-            if isinstance(tok, torch.Tensor):
+            if tok is not None and isinstance(tok, torch.Tensor):
                 tok = tok.to(self.device)
 
             if pool is None:
@@ -32,6 +41,8 @@ class WeightedReservoirSampler:
             if self.w is None:
                 k = u
             else:
+                if tok is None:
+                    raise ValueError("Weighted sampling needs token ids, but the loader yielded activations only.")
                 w_i = self.w[tok].float()
                 k = u.pow(1.0 / torch.clamp(w_i, min=1e-12))
 
@@ -346,7 +357,8 @@ def lloyd_refine_projected(
         sums = torch.zeros((k, D), device=device, dtype=torch.float32)
         counts = torch.zeros((k,), device=device, dtype=torch.float32)
 
-        for x, _ in loader:
+        for batch in loader:
+            x, _tok = _unpack_batch(batch)
             x_full = x.to(device=device, dtype=torch.float32)
             x_proj = (x_full @ R).to(dtype=x_dtype)
 
@@ -450,7 +462,8 @@ class ReservoirKMeans:
             sums   = torch.zeros_like(C, dtype=torch.float32)
             counts = torch.zeros(C.size(0), device=device, dtype=torch.float32)
 
-            for x, _ in loader:
+            for batch in loader:
+                x, _tok = _unpack_batch(batch)
                 xb = x.to(device, dtype=dtype if metric == "cosine" else torch.float32)
                 if metric == "cosine":
                     xb = F.normalize(xb, p=2, dim=1)
@@ -543,7 +556,7 @@ class ReservoirKMeans:
                 tol        = self.tol,
                 seed       = self.seed,
                 device     = self.device,
-                dtype      = torch.float32 if self.metric == "euclidean" else torch.float32,
+                dtype      = torch.float32,
             )
             centroids = km.fit(pool)
 
@@ -566,5 +579,4 @@ class ReservoirKMeans:
             )
 
         return centroids
-
 

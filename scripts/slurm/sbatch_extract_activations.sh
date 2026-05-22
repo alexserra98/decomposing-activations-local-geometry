@@ -7,7 +7,7 @@
 #SBATCH --mem=50G
 #SBATCH --time=6:00:00
 #SBATCH --job-name=gemma_extract
-#SBATCH --output=outputs/jobs/gemma_extract_%j.out
+#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/gemma_extract_%j.out
 
 # ── Config (edit to taste) ───────────────────────────────────────────────
 DATASET="/orfeo/scratch/dssc/zenocosini/pile_gemma2b_100M_windows/merged"
@@ -27,7 +27,7 @@ if [[ "${DEBUG:-0}" == "1" ]]; then
 fi
 
 # ── Env ──────────────────────────────────────────────────────────────────
-mkdir -p outputs/jobs
+mkdir -p /u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs
 cd "$SLURM_SUBMIT_DIR" || exit 1
 
 echo "=== $(date) === job $SLURM_JOB_ID on $(hostname) ==="
@@ -36,7 +36,7 @@ echo "layers: $LAYERS  dtype: $DTYPE  batch: $BATCH  shard: $SHARD"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 # ── Run ──────────────────────────────────────────────────────────────────
-uv run dalg-run-layer extract-windows \
+uv run dalg-run-extraction \
     --dataset "$DATASET" \
     --out-dir "$OUT_DIR" \
     --model "$MODEL" \

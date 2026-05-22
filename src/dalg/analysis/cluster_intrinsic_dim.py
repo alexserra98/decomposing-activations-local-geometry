@@ -1,21 +1,9 @@
-# %% [markdown]
-# # Cluster Intrinsic Dimensionality
-#
-# Streaming pass over activations:
-#   1. Hard-assign each point via argmax of MFA responsibilities.
-#   2. Accumulate per-cluster peakedness metrics.
-#   3. Keep at most `max_samples` activations per cluster via streaming
-#      reservoir sampling.
-# Then run PCA / SVD on the sampled activations for each cluster and define the
-# intrinsic dimension as the smallest number of principal directions whose
-# cumulative explained variance exceeds `variance_threshold`.
-
-# %%
 import os
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import argparse
 import concurrent.futures as _futures
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,18 +12,149 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-from dalg.analysis.cluster_assignments import PEAKEDNESS_METRICS
 from dalg.models.mfa import load_mfa
 
 
-# Slow tqdm refreshes when stderr is a non-interactive sink (e.g. SLURM
-# logs); otherwise tqdm emits a full line per refresh and the log balloons.
+# Slow tqdm refreshes when stderr is a non-interactive sink (e.g. SLURM logs).
 _LOG_TTY = sys.stderr.isatty()
 _TQDM_MININTERVAL = 0.5 if _LOG_TTY else 30.0
 _TQDM_MAXINTERVAL = 10.0 if _LOG_TTY else 60.0
 
 
 IntrinsicDimResults = dict[str, Any]
+
+
+def _dtype_from_name(name: str) -> torch.dtype:
+    if name == "float16":
+        return torch.float16
+    if name == "bfloat16":
+        return torch.bfloat16
+    if name == "float32":
+        return torch.float32
+    raise ValueError(f"Unsupported dtype: {name}")
+
+
+def _default_assignments_path(model_path: Path) -> Path:
+    return model_path.parent / f"{model_path.stem}_assignments.pt"
+
+
+def _loader_len(loader: Any) -> int | None:
+    try:
+        return len(loader)
+    except TypeError:
+        return None
+
+
+def _batch_x(batch: Any) -> torch.Tensor:
+    return batch[0] if isinstance(batch, (list, tuple)) else batch
+
+
+def _build_shard_row_pairs(meta_index: list[dict]) -> dict[int, list[tuple[int, int]]]:
+    by_shard: dict[int, list[tuple[int, int]]] = {}
+    for row in meta_index:
+        shard = int(row["shard"])
+        by_shard.setdefault(shard, []).append(
+            (int(row["row_in_shard"]), int(row["global_row"]))
+        )
+    for pairs in by_shard.values():
+        pairs.sort()
+    return by_shard
+
+
+def _sample_positions_to_shard_requests(
+    sample_positions: torch.Tensor,
+    sample_clusters: torch.Tensor,
+    meta_index: list[dict],
+    *,
+    window: int,
+    drop_prefix: int,
+    num_expected_items: int,
+) -> dict[int, dict[str, list[int]]]:
+    """Map canonical assignment positions to shard-local row/token coordinates."""
+    tokens_per_row = int(window) - int(drop_prefix)
+    if tokens_per_row <= 0:
+        raise ValueError(f"drop_prefix={drop_prefix} must be smaller than window={window}")
+
+    shard_row_pairs = _build_shard_row_pairs(meta_index)
+    requests: dict[int, dict[str, list[int]]] = {}
+    cursor = 0
+    stream_offset = 0
+    total_selected = int(sample_positions.numel())
+
+    for shard_i in tqdm(
+        sorted(shard_row_pairs),
+        desc="mapping samples to shards",
+        mininterval=_TQDM_MININTERVAL,
+        maxinterval=_TQDM_MAXINTERVAL,
+    ):
+        pairs = shard_row_pairs[shard_i]
+        next_offset = stream_offset + len(pairs) * tokens_per_row
+        right = int(torch.searchsorted(sample_positions, next_offset, right=False).item())
+
+        if right > cursor:
+            positions = sample_positions[cursor:right]
+            clusters = sample_clusters[cursor:right]
+            shard_flat = (positions - stream_offset).long()
+            row_offsets = torch.div(shard_flat, tokens_per_row, rounding_mode="floor")
+            tok_pos = drop_prefix + (shard_flat % tokens_per_row)
+
+            req = requests.setdefault(shard_i, {"rows": [], "tok_pos": [], "clusters": []})
+            for row_offset, tok, cluster in zip(row_offsets.tolist(), tok_pos.tolist(), clusters.tolist()):
+                row_in_shard, _global_row = pairs[int(row_offset)]
+                req["rows"].append(int(row_in_shard))
+                req["tok_pos"].append(int(tok))
+                req["clusters"].append(int(cluster))
+
+            cursor = right
+
+        stream_offset = next_offset
+
+    if stream_offset != num_expected_items:
+        raise ValueError(
+            f"Reconstructed stream length ({stream_offset:,}) does not match assignments "
+            f"length ({num_expected_items:,}). Check drop_prefix and shard metadata."
+        )
+    if cursor != total_selected:
+        raise ValueError(
+            f"Mapped {cursor:,}/{total_selected:,} sampled positions. "
+            "The reconstructed stream ended before all sampled positions were seen."
+        )
+
+    return requests
+
+
+def _collect_sampled_shard_activations(
+    shard_dir: Path,
+    layer: int,
+    requests: dict[int, dict[str, list[int]]],
+    *,
+    K: int,
+    store_dtype: torch.dtype,
+) -> list[torch.Tensor | None]:
+    chunks: list[list[torch.Tensor]] = [[] for _ in range(K)]
+
+    for shard_i in tqdm(
+        sorted(requests),
+        desc="loading sampled shards",
+        mininterval=_TQDM_MININTERVAL,
+        maxinterval=_TQDM_MAXINTERVAL,
+    ):
+        req = requests[shard_i]
+        rows = torch.tensor(req["rows"], dtype=torch.long)
+        tok_pos = torch.tensor(req["tok_pos"], dtype=torch.long)
+        clusters = torch.tensor(req["clusters"], dtype=torch.long)
+
+        shard_path = shard_dir / f"layer{layer:02d}" / f"shard_{shard_i:05d}.pt"
+        acts = torch.load(shard_path, mmap=True, weights_only=True)
+        x_selected = acts[rows, tok_pos].to(store_dtype).cpu()
+
+        for k in torch.unique(clusters).tolist():
+            mask = clusters == int(k)
+            chunks[int(k)].append(x_selected[mask].contiguous())
+
+        del acts, x_selected
+
+    return [torch.cat(parts, dim=0) if parts else None for parts in chunks]
 
 
 def intrinsic_dim_pca(
@@ -69,34 +188,159 @@ def intrinsic_dim_pca(
     return dim, var
 
 
-def _update_reservoir(
-    buffer: torch.Tensor | None,
-    priorities: torch.Tensor | None,
-    chunk: torch.Tensor,
+def _load_assignments(assignments_path: Path) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], int]:
+    data = torch.load(assignments_path, map_location="cpu", weights_only=True)
+    if "assignments" not in data or "cluster_sizes" not in data:
+        raise ValueError(
+            f"{assignments_path} must contain at least 'assignments' and 'cluster_sizes'."
+        )
+
+    assignments = data["assignments"].long().cpu()
+    sizes = data["cluster_sizes"].long().cpu()
+    peakedness = data.get("peakedness", {})
+    K = int(data.get("K", sizes.numel()))
+
+    if sizes.numel() != K:
+        raise ValueError(f"K={K}, but cluster_sizes has shape {tuple(sizes.shape)}")
+    if assignments.numel() != int(sizes.sum().item()):
+        print(
+            "Warning: assignments length does not match cluster_sizes.sum(); "
+            "using assignments to choose samples and saved cluster_sizes for reporting."
+        )
+
+    return assignments, sizes, peakedness, K
+
+
+def _choose_sample_positions(
+    assignments: torch.Tensor,
+    sizes: torch.Tensor,
     *,
+    K: int,
     max_samples: int,
-    generator: torch.Generator,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    min_population: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Priority-sampling reservoir update.
+    Uniformly sample up to `max_samples` stream positions per cluster.
 
-    Each item gets a random priority in (0, 1). Keeping the top `max_samples`
-    priorities yields a uniform sample without replacement over the full stream.
+    The output positions are sorted by stream order. `sample_clusters[i]` is the
+    cluster id for `sample_positions[i]`.
     """
-    chunk_priorities = torch.rand(chunk.shape[0], generator=generator)
+    if max_samples <= 0:
+        raise ValueError("max_samples must be positive")
 
-    if buffer is None or priorities is None:
-        merged_buffer = chunk
-        merged_priorities = chunk_priorities
-    else:
-        merged_buffer = torch.cat([buffer, chunk], dim=0)
-        merged_priorities = torch.cat([priorities, chunk_priorities], dim=0)
+    counts = torch.bincount(assignments, minlength=K).long()
+    order = torch.argsort(assignments)
+    offsets = torch.zeros(K + 1, dtype=torch.long)
+    offsets[1:] = counts.cumsum(0)
 
-    if merged_buffer.shape[0] <= max_samples:
-        return merged_buffer, merged_priorities
+    sample_sizes = torch.zeros(K, dtype=torch.long)
+    position_chunks: list[torch.Tensor] = []
+    cluster_chunks: list[torch.Tensor] = []
+    rng = torch.Generator()
+    rng.manual_seed(int(seed))
 
-    keep_priorities, keep_idx = torch.topk(merged_priorities, k=max_samples, sorted=False)
-    return merged_buffer[keep_idx], keep_priorities
+    for k in tqdm(
+        range(K),
+        desc="sampling assignment positions",
+        mininterval=_TQDM_MININTERVAL,
+        maxinterval=_TQDM_MAXINTERVAL,
+    ):
+        n = int(counts[k].item())
+        if n < min_population or n < 2:
+            continue
+
+        start = int(offsets[k].item())
+        end = int(offsets[k + 1].item())
+        cluster_positions = order[start:end]
+
+        if n > max_samples:
+            keep = torch.randperm(n, generator=rng)[:max_samples]
+            cluster_positions = cluster_positions[keep]
+
+        sample_sizes[k] = int(cluster_positions.numel())
+        position_chunks.append(cluster_positions)
+        cluster_chunks.append(
+            torch.full((cluster_positions.numel(),), k, dtype=torch.long)
+        )
+
+    if not position_chunks:
+        return (
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.long),
+            sample_sizes,
+        )
+
+    sample_positions = torch.cat(position_chunks).long()
+    sample_clusters = torch.cat(cluster_chunks).long()
+    by_stream_order = torch.argsort(sample_positions)
+    return sample_positions[by_stream_order], sample_clusters[by_stream_order], sample_sizes
+
+
+def _collect_sampled_activations(
+    loader: Any,
+    sample_positions: torch.Tensor,
+    sample_clusters: torch.Tensor,
+    *,
+    K: int,
+    num_expected_items: int,
+    store_dtype: torch.dtype,
+) -> list[torch.Tensor | None]:
+    """Stream activations once and collect only the sampled assignment positions."""
+    chunks: list[list[torch.Tensor]] = [[] for _ in range(K)]
+    cursor = 0
+    stream_offset = 0
+    total_selected = int(sample_positions.numel())
+
+    if total_selected == 0:
+        return [None for _ in range(K)]
+
+    progress = tqdm(
+        loader,
+        total=_loader_len(loader),
+        desc="collecting sampled activations",
+        mininterval=_TQDM_MININTERVAL,
+        maxinterval=_TQDM_MAXINTERVAL,
+    )
+    for batch in progress:
+        x = _batch_x(batch)
+        batch_size = int(x.shape[0])
+        next_offset = stream_offset + batch_size
+
+        right = int(torch.searchsorted(sample_positions, next_offset, right=False).item())
+        if right > cursor:
+            positions = sample_positions[cursor:right]
+            rel = (positions - stream_offset).long()
+            x_selected = x.detach().cpu().index_select(0, rel).to(store_dtype)
+            c_selected = sample_clusters[cursor:right]
+
+            for k in torch.unique(c_selected).tolist():
+                mask = c_selected == int(k)
+                chunks[int(k)].append(x_selected[mask].contiguous())
+
+            cursor = right
+
+        stream_offset = next_offset
+        if cursor >= total_selected:
+            # Keep consuming only if the caller needs length validation.
+            pass
+
+    if stream_offset != num_expected_items:
+        raise ValueError(
+            f"Activation stream length ({stream_offset:,}) does not match assignments "
+            f"length ({num_expected_items:,}). Make sure batch size, num workers, "
+            "drop_prefix, layer, and shard ordering match the assignment run."
+        )
+    if cursor != total_selected:
+        raise ValueError(
+            f"Collected {cursor:,}/{total_selected:,} sampled activations. "
+            "The activation stream ended before all sampled positions were seen."
+        )
+
+    buffers: list[torch.Tensor | None] = []
+    for parts in chunks:
+        buffers.append(torch.cat(parts, dim=0) if parts else None)
+    return buffers
 
 
 def _run_cluster_pca(
@@ -108,13 +352,6 @@ def _run_cluster_pca(
     pca_device: str | torch.device | None,
     pca_workers: int,
 ) -> tuple[torch.Tensor, list[torch.Tensor], int]:
-    """
-    Run the per-cluster PCA stage.
-
-    CPU PCA can benefit from thread-level parallelism because each cluster is
-    independent. For GPU PCA we stay sequential to avoid fighting over one
-    device with many concurrent SVD calls.
-    """
     K = len(buffers)
     dims = torch.zeros(K, dtype=torch.long)
     cluster_variances: list[torch.Tensor] = [torch.zeros(0) for _ in range(K)]
@@ -171,9 +408,10 @@ def _run_cluster_pca(
     return dims, cluster_variances, num_skipped
 
 
-def compute_intrinsic_dims_from_loader(
+def compute_intrinsic_dims_from_assignments(
     model_path: Path,
     loader: Any,
+    assignments_path: Path | None = None,
     *,
     device: str | torch.device = "cpu",
     variance_threshold: float = 0.90,
@@ -181,79 +419,52 @@ def compute_intrinsic_dims_from_loader(
     max_samples: int = 10_000,
     store_dtype: torch.dtype = torch.float16,
     pca_device: str | torch.device | None = None,
-    pca_workers: int = 4,
+    pca_workers: int = 1,
     seed: int = 0,
     **_legacy,
 ) -> IntrinsicDimResults:
     """
-    Streaming intrinsic-dim computation. Works with any DataLoader yielding
-    either `(x, ...)` tuples or plain `x` tensors.
+    Compute per-cluster intrinsic dimensions from precomputed assignments.
 
-    The expensive full `(K, D, D)` covariance accumulation is avoided. Instead,
-    each cluster keeps a capped reservoir of at most `max_samples` activations.
+    `assignments` are interpreted as positions in the activation stream. For
+    sharded data, prefer `compute_intrinsic_dims_from_shards`, which maps those
+    positions through `meta_index` directly.
     """
     model_path = Path(model_path)
-    model = load_mfa(model_path, map_location="cpu").to(device)
-    model.eval()
-    K, D, q = model.K, model.D, model.q
-    print(f"MFA: K={K} components  D={D}  rank={q}")
+    assignments_path = Path(assignments_path) if assignments_path is not None else _default_assignments_path(model_path)
     if pca_device is None:
         pca_device = device
 
-    sizes = torch.zeros(K, dtype=torch.long)
-    all_assignments: list[torch.Tensor] = []
-    peakedness_sums = {name: torch.zeros(K) for name in PEAKEDNESS_METRICS}
-    buffers: list[torch.Tensor | None] = [None for _ in range(K)]
-    priorities: list[torch.Tensor | None] = [None for _ in range(K)]
-    sample_sizes = torch.zeros(K, dtype=torch.long)
-    rng = torch.Generator()
-    rng.manual_seed(int(seed))
+    assignments, sizes, peakedness, K = _load_assignments(assignments_path)
+    mfa = load_mfa(model_path, map_location="cpu")
+    if int(mfa.K) != K:
+        raise ValueError(f"Assignment file has K={K}, but model has K={mfa.K}")
 
-    with torch.no_grad():
-        for batch in tqdm(
-            loader,
-            desc="streaming assignments + reservoir",
-            mininterval=_TQDM_MININTERVAL,
-            maxinterval=_TQDM_MAXINTERVAL,
-        ):
-            x = batch[0] if isinstance(batch, (list, tuple)) else batch
-            x = x.to(device, non_blocking=True).float()
-            r = model.responsibilities(x)          # (B, K)
-            assign_dev = r.argmax(dim=1)
-            assign = assign_dev.cpu()
-            sizes += torch.bincount(assign, minlength=K)
-            all_assignments.append(assign)
+    print(f"MFA: K={mfa.K} components  D={mfa.D}  rank={mfa.q}")
+    print(f"Assignments: {assignments_path}  N={assignments.numel():,}")
+    print(
+        f"Sampling up to {max_samples:,} activations per cluster "
+        f"(min_population={min_population:,})."
+    )
 
-            for name, fn in PEAKEDNESS_METRICS.items():
-                peakedness_sums[name].scatter_add_(0, assign, fn(r).cpu())
+    sample_positions, sample_clusters, sample_sizes = _choose_sample_positions(
+        assignments,
+        sizes,
+        K=K,
+        max_samples=max_samples,
+        min_population=min_population,
+        seed=seed,
+    )
+    print(f"Selected {sample_positions.numel():,} activation vectors for PCA.")
 
-            x_cpu = x.cpu()
-            for k in assign_dev.unique().tolist():
-                chunk = x_cpu[assign == k].to(store_dtype)
-                if chunk.shape[0] == 0:
-                    continue
-                buf, pri = _update_reservoir(
-                    buffers[k], priorities[k], chunk,
-                    max_samples=max_samples,
-                    generator=rng,
-                )
-                buffers[k] = buf
-                priorities[k] = pri
-                sample_sizes[k] = buf.shape[0]
-
-    assignments = torch.cat(all_assignments)
-    peakedness = {
-        name: s / sizes.float().clamp(min=1)
-        for name, s in peakedness_sums.items()
-    }
-
-    torch.save({
-        "cluster_sizes": sizes,
-        "sample_sizes": sample_sizes,
-        "assignments": assignments,
-        "peakedness": peakedness,
-        "K": K,
-    }, model_path.parent / f"{model_path.stem}_assignments.pt")
+    buffers = _collect_sampled_activations(
+        loader,
+        sample_positions,
+        sample_clusters,
+        K=K,
+        num_expected_items=int(assignments.numel()),
+        store_dtype=store_dtype,
+    )
 
     dims, cluster_variances, num_skipped = _run_cluster_pca(
         buffers,
@@ -271,7 +482,7 @@ def compute_intrinsic_dims_from_loader(
         print(f"  median = {dims[valid].float().median():.2f}")
         print(f"  min    = {dims[valid].min().item()}")
         print(f"  max    = {dims[valid].max().item()}")
-        print(f"  MFA rank (q) = {q}  (reference)")
+        print(f"  MFA rank (q) = {mfa.q}  (reference)")
     print(f"Skipped {num_skipped} clusters with population < {min_population}")
 
     return {
@@ -279,23 +490,24 @@ def compute_intrinsic_dims_from_loader(
         "cluster_variances": cluster_variances,
         "cluster_sizes": sizes,
         "sample_sizes": sample_sizes,
-        "assignments": assignments,
         "peakedness": peakedness,
         "variance_threshold": variance_threshold,
         "max_samples": max_samples,
+        "assignments_path": str(assignments_path),
         "K": K,
-        "rank": q,
-        "D": D,
+        "rank": mfa.q,
+        "D": mfa.D,
     }
 
-
-def compute_intrinsic_dims(
+#TODO remove model dead code
+def compute_intrinsic_dims_from_shards(
     model_path: Path,
-    act_path: Path,
-    tok_path: Path,
+    shard_dir: Path,
     *,
+    layer: int,
+    assignments_path: Path | None = None,
+    drop_prefix: int | None = None,
     device: str | torch.device = "cpu",
-    batch_size: int = 512,
     variance_threshold: float = 0.90,
     min_population: int = 100,
     max_samples: int = 10_000,
@@ -305,18 +517,115 @@ def compute_intrinsic_dims(
     seed: int = 0,
     **_legacy,
 ) -> IntrinsicDimResults:
-    """Monolithic-layout wrapper: loads activations.pt/tokens.pt and streams
-    them through `compute_intrinsic_dims_from_loader`."""
-    model_path = Path(model_path)
-    act_path = Path(act_path)
-    tok_path = Path(tok_path)
-    X = torch.load(act_path, weights_only=True)
-    tok = torch.load(tok_path, weights_only=True)
-    print(f"Activations: {X.shape}  dtype={X.dtype}")
+    from dalg.data.shard_activations import load_meta_index
 
-    loader = DataLoader(TensorDataset(X, tok), batch_size=batch_size, shuffle=False)
-    return compute_intrinsic_dims_from_loader(
-        model_path, loader,
+    model_path = Path(model_path)
+    shard_dir = Path(shard_dir)
+    assignments_path = Path(assignments_path) if assignments_path is not None else _default_assignments_path(model_path)
+    if pca_device is None:
+        pca_device = device
+
+    extract_cfg = json.loads((shard_dir / "config.json").read_text())
+    window = int(extract_cfg["window"])
+    if drop_prefix is None:
+        drop_prefix = int(extract_cfg.get("drop_prefix", 32))
+
+    meta_index = load_meta_index(shard_dir, layer=layer)
+    assignments, sizes, peakedness, K = _load_assignments(assignments_path)
+    mfa = load_mfa(model_path, map_location="cpu")
+    if int(mfa.K) != K:
+        raise ValueError(f"Assignment file has K={K}, but model has K={mfa.K}")
+
+    print(f"MFA: K={mfa.K} components  D={mfa.D}  rank={mfa.q}")
+    print(f"Assignments: {assignments_path}  N={assignments.numel():,}")
+    print(
+        f"shard_dir={shard_dir}  layer={layer}  rows={len(meta_index):,}  "
+        f"window={window}  drop_prefix={drop_prefix}"
+    )
+    print("Mapping assignment indices in canonical shard order from meta_index.")
+
+    sample_positions, sample_clusters, sample_sizes = _choose_sample_positions(
+        assignments,
+        sizes,
+        K=K,
+        max_samples=max_samples,
+        min_population=min_population,
+        seed=seed,
+    )
+    print(f"Selected {sample_positions.numel():,} activation vectors for PCA.")
+
+    requests = _sample_positions_to_shard_requests(
+        sample_positions,
+        sample_clusters,
+        meta_index,
+        window=window,
+        drop_prefix=drop_prefix,
+        num_expected_items=int(assignments.numel()),
+    )
+    print(f"Sampled activations touch {len(requests):,} shard files.")
+
+    buffers = _collect_sampled_shard_activations(
+        shard_dir,
+        layer,
+        requests,
+        K=K,
+        store_dtype=store_dtype,
+    )
+
+    dims, cluster_variances, num_skipped = _run_cluster_pca(
+        buffers,
+        sizes,
+        threshold=variance_threshold,
+        min_population=min_population,
+        pca_device=pca_device,
+        pca_workers=pca_workers,
+    )
+
+    valid = dims > 0
+    if valid.any():
+        print(f"\nIntrinsic dims at {variance_threshold*100:.0f}% variance threshold:")
+        print(f"  mean   = {dims[valid].float().mean():.2f}")
+        print(f"  median = {dims[valid].float().median():.2f}")
+        print(f"  min    = {dims[valid].min().item()}")
+        print(f"  max    = {dims[valid].max().item()}")
+        print(f"  MFA rank (q) = {mfa.q}  (reference)")
+    print(f"Skipped {num_skipped} clusters with population < {min_population}")
+
+    return {
+        "intrinsic_dims": dims,
+        "cluster_variances": cluster_variances,
+        "cluster_sizes": sizes,
+        "sample_sizes": sample_sizes,
+        "peakedness": peakedness,
+        "variance_threshold": variance_threshold,
+        "max_samples": max_samples,
+        "assignments_path": str(assignments_path),
+        "K": K,
+        "rank": mfa.q,
+        "D": mfa.D,
+    }
+
+
+def compute_intrinsic_dims_from_loader(
+    model_path: Path,
+    loader: Any,
+    *,
+    assignments_path: Path | None = None,
+    device: str | torch.device = "cpu",
+    variance_threshold: float = 0.90,
+    min_population: int = 100,
+    max_samples: int = 10_000,
+    store_dtype: torch.dtype = torch.float16,
+    pca_device: str | torch.device | None = None,
+    pca_workers: int = 1,
+    seed: int = 0,
+    **legacy,
+) -> IntrinsicDimResults:
+    """Backward-compatible wrapper around the assignment-file implementation."""
+    return compute_intrinsic_dims_from_assignments(
+        model_path,
+        loader,
+        assignments_path,
         device=device,
         variance_threshold=variance_threshold,
         min_population=min_population,
@@ -325,39 +634,122 @@ def compute_intrinsic_dims(
         pca_device=pca_device,
         pca_workers=pca_workers,
         seed=seed,
+        **legacy,
     )
 
 
-# ── CLI entry point ─────────────────────────────────────────────────────
+def compute_intrinsic_dims(
+    model_path: Path,
+    act_path: Path,
+    tok_path: Path | None = None,
+    *,
+    assignments_path: Path | None = None,
+    device: str | torch.device = "cpu",
+    batch_size: int = 512,
+    variance_threshold: float = 0.90,
+    min_population: int = 100,
+    max_samples: int = 10_000,
+    store_dtype: torch.dtype = torch.float16,
+    pca_device: str | torch.device | None = None,
+    pca_workers: int = 1,
+    seed: int = 0,
+    **legacy,
+) -> IntrinsicDimResults:
+    """Monolithic-layout wrapper for activations.pt plus precomputed assignments."""
+    X = torch.load(act_path, weights_only=True)
+    print(f"Activations: {X.shape}  dtype={X.dtype}")
+
+    if tok_path is not None and Path(tok_path).exists():
+        tok = torch.load(tok_path, weights_only=True)
+        loader = DataLoader(TensorDataset(X, tok), batch_size=batch_size, shuffle=False)
+    else:
+        loader = DataLoader(TensorDataset(X), batch_size=batch_size, shuffle=False)
+
+    return compute_intrinsic_dims_from_assignments(
+        model_path,
+        loader,
+        assignments_path,
+        device=device,
+        variance_threshold=variance_threshold,
+        min_population=min_population,
+        max_samples=max_samples,
+        store_dtype=store_dtype,
+        pca_device=pca_device,
+        pca_workers=pca_workers,
+        seed=seed,
+        **legacy,
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Intrinsic dimensionality per MFA cluster")
+    parser = argparse.ArgumentParser(
+        description="Intrinsic dimensionality per MFA cluster from saved assignments"
+    )
     parser.add_argument("--model-path", type=Path, required=True, help="Path to mfa_model.pt")
-    parser.add_argument("--act-path", type=Path, required=True, help="Path to activations.pt")
-    parser.add_argument("--tok-path", type=Path, required=True, help="Path to tokens.pt")
+    parser.add_argument(
+        "--assignments-path",
+        type=Path,
+        default=None,
+        help="Path to mfa_model_assignments.pt (default: next to --model-path)",
+    )
+    parser.add_argument("--shard-dir", type=Path, default=None, help="Shard directory from extract-windows")
+    parser.add_argument("--layer", type=int, default=None, help="Layer index for --shard-dir")
+    parser.add_argument("--drop-prefix", type=int, default=None)
+    parser.add_argument("--act-path", type=Path, default=None, help="Monolithic activations.pt")
+    parser.add_argument("--tok-path", type=Path, default=None, help="Optional monolithic tokens.pt")
     parser.add_argument("--save-path", type=Path, default=None, help="Where to save results")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="cpu", help="Default PCA device if --pca-device is omitted")
     parser.add_argument("--pca-device", default=None)
-    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--batch-size", "--batch_size", dest="batch_size", type=int, default=1024)
     parser.add_argument("--variance-threshold", type=float, default=0.90)
     parser.add_argument("--min-population", type=int, default=100)
     parser.add_argument("--max-samples", type=int, default=10_000)
     parser.add_argument("--pca-workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--store-dtype",
+        choices=("float16", "bfloat16", "float32"),
+        default="float16",
+        help="Dtype used to store sampled activations before PCA",
+    )
     args = parser.parse_args()
 
-    results = compute_intrinsic_dims(
-        args.model_path, args.act_path, args.tok_path,
-        device=args.device,
-        batch_size=args.batch_size,
-        variance_threshold=args.variance_threshold,
-        min_population=args.min_population,
-        max_samples=args.max_samples,
-        pca_device=args.pca_device,
-        pca_workers=args.pca_workers,
-        seed=args.seed,
-    )
+    if args.shard_dir is not None:
+        if args.layer is None:
+            raise SystemExit("--layer is required with --shard-dir")
+        results = compute_intrinsic_dims_from_shards(
+            args.model_path,
+            args.shard_dir,
+            layer=args.layer,
+            assignments_path=args.assignments_path,
+            drop_prefix=args.drop_prefix,
+            device=args.device,
+            variance_threshold=args.variance_threshold,
+            min_population=args.min_population,
+            max_samples=args.max_samples,
+            store_dtype=_dtype_from_name(args.store_dtype),
+            pca_device=args.pca_device,
+            pca_workers=args.pca_workers,
+            seed=args.seed,
+        )
+    else:
+        if args.act_path is None:
+            raise SystemExit("Provide either --shard-dir/--layer or --act-path.")
+        results = compute_intrinsic_dims(
+            args.model_path,
+            args.act_path,
+            args.tok_path,
+            assignments_path=args.assignments_path,
+            device=args.device,
+            batch_size=args.batch_size,
+            variance_threshold=args.variance_threshold,
+            min_population=args.min_population,
+            max_samples=args.max_samples,
+            store_dtype=_dtype_from_name(args.store_dtype),
+            pca_device=args.pca_device,
+            pca_workers=args.pca_workers,
+            seed=args.seed,
+        )
 
     save_path = args.save_path or args.model_path.parent / "intrinsic_dims.pt"
     torch.save(results, save_path)

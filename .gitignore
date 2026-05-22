@@ -63,5 +63,6 @@ Thumbs.db
 .codex
 CLAUDE.md
 
-# Local dev scripts (not tracked)
-run_test.py
+# SYMLINKS
+dalg-cache
+output
