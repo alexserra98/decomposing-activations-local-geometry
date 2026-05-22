@@ -2,13 +2,18 @@ import os
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import json
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import torch
 from tqdm import tqdm
 
 from dalg.models.mfa import load_mfa
+from dalg.models.vae import load_vae
+
+
+ModelType = Literal["mfa", "vae"]
 
 
 def _resolve_device(device: str | torch.device) -> torch.device:
@@ -31,28 +36,64 @@ PEAKEDNESS_METRICS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
 }
 
 
+def load_model(
+    model_path: Path,
+    *,
+    model_type: ModelType = "mfa",
+    map_location: str | torch.device | None = None,
+):
+    """Load an assignment-compatible MFA or VAE model."""
+    if model_type == "mfa":
+        return load_mfa(model_path, map_location=map_location)
+    if model_type == "vae":
+        return load_vae(model_path, map_location=map_location)
+    raise ValueError(f"Unsupported model_type={model_type!r}")
+
+
+def _num_components(model, *, model_type: ModelType) -> int:
+    if model_type == "mfa":
+        return int(model.K)
+    prior = getattr(model, "prior", None)
+    return int(getattr(prior, "n_components", 1))
+
+
+def _describe_model(model, *, model_type: ModelType, K: int) -> None:
+    if model_type == "mfa":
+        print(f"MFA: K={K} components  D={model.D}  rank={model.q}")
+    else:
+        prior = type(model.prior).__name__
+        print(
+            f"VAE: K={K} prior components  D={model.input_dim}  "
+            f"latent_dim={model.latent_dim}  prior={prior}"
+        )
+
+
 def compute_assignments(
     model_path: Path,
     loader: Any,
     *,
+    model_type: ModelType = "mfa",
     device: str | torch.device = "cpu",
     max_batches: int | None = None,
     use_inference_cache: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """
     Single-pass streaming over `loader`. Per point, takes the argmax of the
-    MFA responsibilities and accumulates:
+    model responsibilities and accumulates:
       - cluster sizes (K,)
       - hard assignments (N,)
       - max responsibility per sample (N,)
       - mean per-cluster peakedness for each metric in `PEAKEDNESS_METRICS`
+
+    For ``model_type="vae"``, responsibilities are computed over prior
+    components from the encoder posterior mean.
     """
     model_path = Path(model_path)
     device = _resolve_device(device)
-    model = load_mfa(model_path, map_location="cpu").to(device)
+    model = load_model(model_path, model_type=model_type, map_location="cpu").to(device)
     model.eval()
-    K = model.K
-    print(f"MFA: K={K} components  D={model.D}  rank={model.q}")
+    K = _num_components(model, model_type=model_type)
+    _describe_model(model, model_type=model_type, K=K)
 
     sizes = torch.zeros(K, dtype=torch.long, device=device)
     peakedness_sums = {
@@ -61,8 +102,13 @@ def compute_assignments(
     }
     assignment_chunks: list[torch.Tensor] = []
     max_resp_chunks: list[torch.Tensor] = []
+    cache = (
+        model.inference_cache(enabled=use_inference_cache)
+        if model_type == "mfa"
+        else nullcontext(model)
+    )
 
-    with torch.no_grad(), model.inference_cache(enabled=use_inference_cache):
+    with torch.no_grad(), cache:
         for batch_idx, batch in enumerate(tqdm(loader, desc="streaming assignments + peakedness")):
             if max_batches is not None and batch_idx >= max_batches:
                 break
@@ -104,8 +150,9 @@ def main() -> None:
         load_meta_index,
     )
 
-    parser = argparse.ArgumentParser(description="Compute MFA cluster assignments for sharded activations")
-    parser.add_argument("--model-path", type=Path, required=True, help="Path to mfa_model.pt")
+    parser = argparse.ArgumentParser(description="Compute model cluster assignments for sharded activations")
+    parser.add_argument("--model-path", type=Path, required=True, help="Path to mfa_model.pt or vae_model.pt")
+    parser.add_argument("--model-type", choices=["mfa", "vae"], default="mfa")
     parser.add_argument("--shard-dir", type=Path, required=True, help="Directory produced by extract-windows")
     parser.add_argument("--layer", type=int, required=True, help="Layer index to stream from shard-dir")
     parser.add_argument("--batch-size", "--batch_size", dest="batch_size", type=int, default=1024)
@@ -154,6 +201,7 @@ def main() -> None:
     sizes, assignments, max_responsibilities, peakedness = compute_assignments(
         args.model_path,
         loader,
+        model_type=args.model_type,
         device=device,
         max_batches=args.max_batches,
         use_inference_cache=args.use_inference_cache,
@@ -172,6 +220,7 @@ def main() -> None:
         "max_responsibilities": max_responsibilities,
         "peakedness": peakedness,
         "K": int(sizes.numel()),
+        "model_type": args.model_type,
     }, save_path)
     print(f"Assignments saved to {save_path}")
 

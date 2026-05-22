@@ -29,7 +29,7 @@ os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 import torch
 
 
-def _resolve_model_path(data_dir: str) -> tuple[Path, Path]:
+def _resolve_model_path(data_dir: str, *, model_type: str = "mfa") -> tuple[Path, Path]:
     """Return ``(model_path, run_dir)`` from a CLI ``--data-dir`` argument.
 
     Accepts either a directory containing ``mfa_model.pt`` /
@@ -38,7 +38,8 @@ def _resolve_model_path(data_dir: str) -> tuple[Path, Path]:
     if os.path.isfile(data_dir):
         return Path(data_dir), Path(os.path.dirname(data_dir))
     run_dir = Path(data_dir)
-    return run_dir / "mfa_model.pt", run_dir
+    model_name = "vae_model.pt" if model_type == "vae" else "mfa_model.pt"
+    return run_dir / model_name, run_dir
 
 
 def cmd_overlap(args) -> None:
@@ -109,7 +110,7 @@ def cmd_assignments(args) -> None:
     """Compute hard cluster assignments and per-cluster peakedness stats.
 
     Streams activations from ``--shard-dir`` (at ``--layer``) through the
-    MFA, takes the argmax of the responsibilities per token, and saves
+    requested model, takes the argmax of the responsibilities per token, and saves
     cluster sizes, hard assignments, max responsibility per sample, and
     mean per-cluster peakedness metrics to a ``.pt`` file.
 
@@ -123,7 +124,7 @@ def cmd_assignments(args) -> None:
     from dalg.analysis.cluster_assignments import compute_assignments, _resolve_device
     from dalg.data.shard_activations import ActivationBatchDataset, load_meta_index
 
-    model_path, run_dir = _resolve_model_path(args.data_dir)
+    model_path, run_dir = _resolve_model_path(args.data_dir, model_type=args.model_type)
     device = _resolve_device(args.device)
 
     shard_dir = Path(args.shard_dir)
@@ -157,6 +158,7 @@ def cmd_assignments(args) -> None:
     sizes, assignments, max_responsibilities, peakedness = compute_assignments(
         model_path,
         loader,
+        model_type=args.model_type,
         device=device,
         max_batches=args.max_batches,
         use_inference_cache=args.use_inference_cache,
@@ -177,6 +179,7 @@ def cmd_assignments(args) -> None:
         "max_responsibilities": max_responsibilities,
         "peakedness": peakedness,
         "K": int(sizes.numel()),
+        "model_type": args.model_type,
     }, save_path)
     print(f"Assignments saved to {save_path}")
 
@@ -198,8 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--seed", type=int, default=None)
         sp.add_argument("--batch-size", type=int, default=128)
         sp.add_argument("--data-dir", required=True,
-                        help="Directory with mfa_model.pt / mfa_model_shards.json, "
-                             "or direct path to a .pt model file")
+                        help="Run directory with a saved model, or direct path to a .pt model file")
         sp.add_argument("--out-dir", default=None,
                         help="Where to save the result (default: same as --data-dir)")
 
@@ -233,8 +235,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_intrinsic_dim)
 
     sp = sub.add_parser("assignments",
-                        help="Compute MFA cluster assignments + peakedness stats")
+                        help="Compute model cluster assignments + peakedness stats")
     add_common(sp)
+    sp.add_argument("--model-type", choices=["mfa", "vae"], default="mfa",
+                    help="Model family to load from --data-dir")
     sp.add_argument("--shard-dir", required=True,
                     help="Activation shard directory produced by dalg-run-extraction")
     sp.add_argument("--layer", type=int, required=True,
