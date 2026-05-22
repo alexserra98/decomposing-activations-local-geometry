@@ -14,9 +14,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT))
 
+from dalg.analysis.cluster_assignments import compute_assignments  # noqa: E402
+from dalg.cli.run_metrics import build_parser as build_metrics_parser  # noqa: E402
+from dalg.cli.run_metrics import cmd_assignments  # noqa: E402
 from dalg.cli.run_training import build_parser, cmd_train_vae, validate_args  # noqa: E402
 from dalg.models.train import train_vae  # noqa: E402
-from dalg.models.vae import MoGPrior, VAE, VampPrior, adapt_activation_batch  # noqa: E402
+from dalg.models.vae import (  # noqa: E402
+    MoGPrior,
+    VAE,
+    VampPrior,
+    adapt_activation_batch,
+    load_vae,
+    save_vae,
+)
 from tests.synthetic_shards import LAYER, build_multi_shard  # noqa: E402
 
 
@@ -112,6 +122,57 @@ class VAETrainingTests(unittest.TestCase):
             self.assertEqual(saved["input_dim"], 2)
             self.assertEqual(saved["prior"]["name"], "mog")
 
+    def test_load_vae_round_trip(self):
+        torch.manual_seed(0)
+        model = VAE(
+            input_dim=2,
+            latent_dim=2,
+            enc_hidden_dims=(4,),
+            dec_hidden_dims=(4,),
+            prior=MoGPrior(latent_dim=2, n_components=3),
+            beta=0.2,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "vae_model.pt"
+            save_vae(model, path)
+            loaded = load_vae(path, map_location="cpu")
+
+            self.assertEqual(loaded.input_dim, 2)
+            self.assertEqual(loaded.latent_dim, 2)
+            self.assertEqual(loaded.enc_hidden_dims, (4,))
+            self.assertEqual(loaded.dec_hidden_dims, (4,))
+            self.assertEqual(loaded.prior.n_components, 3)
+            for key, value in model.state_dict().items():
+                self.assertTrue(torch.equal(value, loaded.state_dict()[key]), key)
+
+    def test_compute_assignments_supports_vae_model_type(self):
+        torch.manual_seed(0)
+        model = VAE(
+            input_dim=2,
+            latent_dim=2,
+            enc_hidden_dims=(4,),
+            dec_hidden_dims=(4,),
+            prior=MoGPrior(latent_dim=2, n_components=3),
+        )
+        loader = [torch.randn(5, 2), torch.randn(5, 2)]
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "vae_model.pt"
+            save_vae(model, path)
+            sizes, assignments, max_resp, peakedness = compute_assignments(
+                path,
+                loader,
+                model_type="vae",
+                device="cpu",
+            )
+
+            self.assertEqual(sizes.numel(), 3)
+            self.assertEqual(assignments.numel(), 10)
+            self.assertEqual(max_resp.numel(), 10)
+            self.assertEqual(int(sizes.sum().item()), 10)
+            self.assertIn("entropy", peakedness)
+
     def test_cmd_train_vae_uses_shard_loader_contract(self):
         with tempfile.TemporaryDirectory() as d:
             root = build_multi_shard(Path(d) / "shards", n_shards=2, rows_per_shard=4)
@@ -145,6 +206,39 @@ class VAETrainingTests(unittest.TestCase):
             cfg = json.loads((out_dir / "config.json").read_text())
             self.assertEqual(cfg["training_mode"], "vae")
             self.assertEqual(cfg["d_model"], 2)
+
+    def test_cmd_assignments_supports_vae_model_type(self):
+        torch.manual_seed(0)
+        model = VAE(
+            input_dim=2,
+            latent_dim=2,
+            enc_hidden_dims=(4,),
+            dec_hidden_dims=(4,),
+            prior=MoGPrior(latent_dim=2, n_components=3),
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            root = build_multi_shard(Path(d) / "shards", n_shards=1, rows_per_shard=2)
+            model_path = Path(d) / "vae_model.pt"
+            save_path = Path(d) / "vae_assignments.pt"
+            save_vae(model, model_path)
+
+            args = build_metrics_parser().parse_args([
+                "assignments",
+                "--model-type", "vae",
+                "--data-dir", str(model_path),
+                "--shard-dir", str(root),
+                "--layer", str(LAYER),
+                "--batch-size", "4",
+                "--device", "cpu",
+                "--save-path", str(save_path),
+            ])
+            cmd_assignments(args)
+
+            saved = torch.load(save_path, map_location="cpu", weights_only=False)
+            self.assertEqual(saved["model_type"], "vae")
+            self.assertEqual(saved["K"], 3)
+            self.assertEqual(saved["assignments"].numel(), 6)
 
 
 if __name__ == "__main__":
