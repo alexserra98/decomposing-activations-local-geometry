@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pytorch_lightning as pl
 
 
 LOG_2PI = math.log(2.0 * math.pi)
@@ -44,6 +44,33 @@ def clamp_logvar(logvar: torch.Tensor) -> torch.Tensor:
 def diagonal_gaussian_log_prob(z: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     logvar = clamp_logvar(logvar)
     return -0.5 * (logvar + (z - mu).pow(2) / logvar.exp() + LOG_2PI).sum(dim=-1)
+
+
+def adapt_activation_batch(batch: object, *, input_dim: int | None = None) -> torch.Tensor:
+    """Extract a rank-2 activation tensor from the shard-loader batch contract."""
+    x = batch
+    if isinstance(batch, (tuple, list)):
+        if not batch:
+            raise ValueError("empty activation batch")
+        first = batch[0]
+        if torch.is_tensor(first):
+            x = first
+        elif isinstance(first, (tuple, list)) and first and torch.is_tensor(first[0]):
+            x = first[0]
+
+    if not torch.is_tensor(x):
+        raise ValueError("unable to extract an activation tensor from batch")
+
+    if x.ndim == 1:
+        x = x.unsqueeze(0)
+    elif x.ndim >= 3:
+        x = x.reshape(-1, x.shape[-1])
+    elif x.ndim != 2:
+        raise ValueError(f"expected rank-2 or rank-3+ activations, got shape {tuple(x.shape)}")
+
+    if input_dim is not None and x.shape[-1] != int(input_dim):
+        raise ValueError(f"expected activation dim {input_dim}, got {x.shape[-1]}")
+    return x
 
 
 class Prior(nn.Module):
@@ -92,13 +119,25 @@ class MoGPrior(Prior):
         self.means = nn.Parameter(torch.randn(n_components, latent_dim) * 0.01)
         self.logvars = nn.Parameter(torch.zeros(n_components, latent_dim))
 
-    def log_prob(self, z: torch.Tensor) -> torch.Tensor:
+    def component_log_prob(self, z: torch.Tensor) -> torch.Tensor:
         z_expanded = z.unsqueeze(1)
         means = self.means.unsqueeze(0)
         logvars = clamp_logvar(self.logvars).unsqueeze(0)
-        comp_log_prob = -0.5 * (logvars + (z_expanded - means).pow(2) / logvars.exp() + LOG_2PI).sum(dim=-1)
+        return -0.5 * (
+            logvars + (z_expanded - means).pow(2) / logvars.exp() + LOG_2PI
+        ).sum(dim=-1)
+
+    def log_joint(self, z: torch.Tensor) -> torch.Tensor:
         log_weights = F.log_softmax(self.logits, dim=0).unsqueeze(0)
-        return torch.logsumexp(log_weights + comp_log_prob, dim=1)
+        return log_weights + self.component_log_prob(z)
+
+    def log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        return torch.logsumexp(self.log_joint(z), dim=1)
+
+    def responsibilities(self, z: torch.Tensor) -> torch.Tensor:
+        log_joint = self.log_joint(z)
+        log_norm = torch.logsumexp(log_joint, dim=1, keepdim=True)
+        return torch.exp(log_joint - log_norm)
 
 
 class VampPrior(Prior):
@@ -125,18 +164,31 @@ class VampPrior(Prior):
         mu, logvar = self.encoder.encode(self.pseudo_inputs)
         return mu, clamp_logvar(logvar)
 
-    def log_prob(self, z: torch.Tensor) -> torch.Tensor:
+    def component_log_prob(self, z: torch.Tensor) -> torch.Tensor:
         mu, logvar = self._component_params()
         z_expanded = z.unsqueeze(1)
         mu = mu.unsqueeze(0)
         logvar = logvar.unsqueeze(0)
-        comp_log_prob = -0.5 * (logvar + (z_expanded - mu).pow(2) / logvar.exp() + LOG_2PI).sum(dim=-1)
+        return -0.5 * (
+            logvar + (z_expanded - mu).pow(2) / logvar.exp() + LOG_2PI
+        ).sum(dim=-1)
+
+    def log_joint(self, z: torch.Tensor) -> torch.Tensor:
         log_weights = torch.full(
             (1, self.n_components),
             -math.log(float(self.n_components)),
             device=z.device,
+            dtype=z.dtype,
         )
-        return torch.logsumexp(log_weights + comp_log_prob, dim=1)
+        return log_weights + self.component_log_prob(z)
+
+    def log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        return torch.logsumexp(self.log_joint(z), dim=1)
+
+    def responsibilities(self, z: torch.Tensor) -> torch.Tensor:
+        log_joint = self.log_joint(z)
+        log_norm = torch.logsumexp(log_joint, dim=1, keepdim=True)
+        return torch.exp(log_joint - log_norm)
 
 
 class FeatureStandardizer(nn.Module):
@@ -291,66 +343,77 @@ class VAE(nn.Module):
         }
 
 
-class ActivationVAELightning(pl.LightningModule):
-    def __init__(
-        self,
-        vae: VAE,
-        lr: float = 1e-3,
-        weight_decay: float = 1e-4,
-        beta_warmup_steps: int = 0,
-    ) -> None:
-        super().__init__()
-        self.save_hyperparameters(ignore=["vae"])
-        self.vae = vae
+def ActivationVAELightning(
+    vae: VAE,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    beta_warmup_steps: int = 0,
+):
+    """Construct a LightningModule wrapper around a VAE when Lightning is needed."""
+    import pytorch_lightning as pl
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        return self.vae(x)
+    class _ActivationVAELightning(pl.LightningModule):
+        def __init__(
+            self,
+            vae: VAE,
+            lr: float = 1e-3,
+            weight_decay: float = 1e-4,
+            beta_warmup_steps: int = 0,
+        ) -> None:
+            super().__init__()
+            self.save_hyperparameters(ignore=["vae"])
+            self.vae = vae
 
-    def current_beta(self) -> float:
-        target_beta = float(self.vae.beta)
-        warmup_steps = int(self.hparams.beta_warmup_steps)
-        if warmup_steps <= 0:
-            return target_beta
-        progress = min(1.0, float(self.global_step + 1) / float(warmup_steps))
-        return target_beta * progress
+        def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+            return self.vae(x)
 
-    def _shared_step(self, batch_x: torch.Tensor, stage: str) -> torch.Tensor:
-        x = batch_x.reshape(-1, batch_x.shape[-1]).float()
-        out = self.vae(x)
-        beta = self.current_beta()
-        old_beta = self.vae.beta
-        self.vae.beta = beta
-        losses = self.vae.loss(x, out)
-        self.vae.beta = old_beta
-        if not torch.isfinite(losses["loss"]):
-            raise RuntimeError(
-                f"Non-finite {stage} loss: loss={losses['loss'].item()} rec={losses['rec_loss'].item()} kl={losses['kl_loss'].item()}"
+        def current_beta(self) -> float:
+            target_beta = float(self.vae.beta)
+            warmup_steps = int(self.hparams.beta_warmup_steps)
+            if warmup_steps <= 0:
+                return target_beta
+            progress = min(1.0, float(self.global_step + 1) / float(warmup_steps))
+            return target_beta * progress
+
+        def _shared_step(self, batch: object, stage: str) -> torch.Tensor:
+            x = adapt_activation_batch(batch, input_dim=self.vae.input_dim).float()
+            out = self.vae(x)
+            beta = self.current_beta()
+            old_beta = self.vae.beta
+            self.vae.beta = beta
+            losses = self.vae.loss(x, out)
+            self.vae.beta = old_beta
+            if not torch.isfinite(losses["loss"]):
+                raise RuntimeError(
+                    f"Non-finite {stage} loss: loss={losses['loss'].item()} "
+                    f"rec={losses['rec_loss'].item()} kl={losses['kl_loss'].item()}"
+                )
+
+            self.log(f"{stage}/loss", losses["loss"], prog_bar=True, on_step=stage == "train", on_epoch=True)
+            self.log(f"{stage}/rec", losses["rec_loss"], prog_bar=True, on_step=False, on_epoch=True)
+            self.log(f"{stage}/kl", losses["kl_loss"], prog_bar=True, on_step=False, on_epoch=True)
+            self.log(f"{stage}/beta", beta, prog_bar=False, on_step=stage == "train", on_epoch=True)
+            return losses["loss"]
+
+        def training_step(self, batch: object, batch_idx: int) -> torch.Tensor:  # noqa: ARG002
+            return self._shared_step(batch, "train")
+
+        def validation_step(self, batch: object, batch_idx: int) -> torch.Tensor:  # noqa: ARG002
+            return self._shared_step(batch, "val")
+
+        def configure_optimizers(self):
+            return torch.optim.AdamW(
+                self.parameters(),
+                lr=self.hparams.lr,
+                weight_decay=self.hparams.weight_decay,
             )
 
-        self.log(f"{stage}/loss", losses["loss"], prog_bar=True, on_step=stage == "train", on_epoch=True)
-        self.log(f"{stage}/rec", losses["rec_loss"], prog_bar=True, on_step=False, on_epoch=True)
-        self.log(f"{stage}/kl", losses["kl_loss"], prog_bar=True, on_step=False, on_epoch=True)
-        self.log(f"{stage}/beta", beta, prog_bar=False, on_step=stage == "train", on_epoch=True)
-        return losses["loss"]
-
-    def training_step(self, batch: object, batch_idx: int) -> torch.Tensor:  # noqa: ARG002
-        from .train_vae import adapt_loader_batch
-
-        x, _tok, _meta = adapt_loader_batch(batch)
-        return self._shared_step(x, "train")
-
-    def validation_step(self, batch: object, batch_idx: int) -> torch.Tensor:  # noqa: ARG002
-        from .train_vae import adapt_loader_batch
-
-        x, _tok, _meta = adapt_loader_batch(batch)
-        return self._shared_step(x, "val")
-
-    def configure_optimizers(self):
-        return torch.optim.AdamW(
-            self.parameters(),
-            lr=self.hparams.lr,
-            weight_decay=self.hparams.weight_decay,
-        )
+    return _ActivationVAELightning(
+        vae=vae,
+        lr=lr,
+        weight_decay=weight_decay,
+        beta_warmup_steps=beta_warmup_steps,
+    )
 
 
 @dataclass
@@ -368,7 +431,7 @@ class VAEConfig:
     input_clip: float | None = None
 
 
-def build_lightning_vae(config: VAEConfig, prior: Prior | None = None) -> ActivationVAELightning:
+def build_lightning_vae(config: VAEConfig, prior: Prior | None = None):
     normalizer = None
     if config.input_mean is not None and config.input_std is not None:
         normalizer = FeatureStandardizer(config.input_mean, config.input_std, clip_value=config.input_clip)
@@ -389,11 +452,46 @@ def build_lightning_vae(config: VAEConfig, prior: Prior | None = None) -> Activa
     )
 
 
-def build_prior(name: str, latent_dim: int, prior_components: int = 100) -> Prior:
+def build_prior(
+    name: str,
+    latent_dim: int,
+    prior_components: int = 100,
+    *,
+    input_dim: int = 2048,
+) -> Prior:
     if name == "standard":
         return StandardGaussianPrior(latent_dim)
     if name == "mog":
         return MoGPrior(latent_dim, n_components=prior_components)
     if name == "vamp":
-        return VampPrior(encoder=None, latent_dim=latent_dim, input_dim=2048, n_components=prior_components)
+        return VampPrior(
+            encoder=None,
+            latent_dim=latent_dim,
+            input_dim=input_dim,
+            n_components=prior_components,
+        )
     raise ValueError(f"Unsupported prior {name!r}.")
+
+
+def save_vae(model: VAE, path: str | Path) -> None:
+    """Save a VAE checkpoint with enough config to rebuild the module."""
+    prior = model.prior
+    if isinstance(prior, StandardGaussianPrior):
+        prior_config = {"name": "standard"}
+    elif isinstance(prior, MoGPrior):
+        prior_config = {"name": "mog", "n_components": prior.n_components}
+    elif isinstance(prior, VampPrior):
+        prior_config = {"name": "vamp", "n_components": prior.n_components}
+    else:
+        prior_config = {"name": type(prior).__name__}
+
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "input_dim": model.input_dim,
+            "latent_dim": model.latent_dim,
+            "beta": model.beta,
+            "prior": prior_config,
+        },
+        path,
+    )

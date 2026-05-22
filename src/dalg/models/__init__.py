@@ -12,8 +12,10 @@ from .vae import (
     VAE,
     VAEConfig,
     VampPrior,
+    adapt_activation_batch,
     build_lightning_vae,
     build_prior,
+    save_vae,
 )
 
 __all__ = [
@@ -28,8 +30,10 @@ __all__ = [
     "VAE",
     "VAEConfig",
     "VampPrior",
+    "adapt_activation_batch",
     "build_lightning_vae",
     "build_prior",
     "load_mfa",
     "save_mfa",
+    "save_vae",
 ]
