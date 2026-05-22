@@ -55,7 +55,7 @@ def cmd_overlap(args) -> None:
     torch.save(results, save_path)
     print(f"Overlap saved to {save_path}")
 
-
+#TODO remove monolithic option
 def cmd_intrinsic_dim(args) -> None:
     """Compute intrinsic dimensionality per cluster.
 

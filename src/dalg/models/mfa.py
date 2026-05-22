@@ -21,7 +21,6 @@ class MFA(nn.Module):
         psi_per_component: bool = False, # True => Psi_k per component; False => shared Psi
         scale_init: float = 1.0, # initial loading scales s_{k,j}
         eps_floor: float = 1e-5, # numerical floor for positivity / norms
-        use_amp: bool = False, # enable mixed precision for heavy einsum ops
     ):
         super().__init__()
         if centroids.ndim != 2:
@@ -33,7 +32,6 @@ class MFA(nn.Module):
         self.K, self.D, self.q = K, D, int(rank)
         self._two_pi_logD = self.D * math.log(2.0 * math.pi)
         self._eps = float(eps_floor)
-        self.use_amp = use_amp
 
         # Means  (K, D)
         self.mu = nn.Parameter(centroids.clone())
@@ -178,24 +176,21 @@ class MFA(nn.Module):
         if D != self.D:
             raise ValueError(f"expected input dim {self.D}, got {D}")
 
-        _dev = x.device.type
-        _amp_enabled = self.use_amp and _dev in ("cuda",)
         K, q = self.K, self.q
 
-        with torch.autocast(device_type=_dev, dtype=torch.bfloat16, enabled=_amp_enabled):
-            if cache["shared_psi"]:
-                x_quad = torch.matmul(x ** 2, cache["psi_inv"][0])
-                quad_Psi = x_quad[:, None]
-            else:
-                quad_Psi = torch.einsum("bd,kd->bk", x ** 2, cache["psi_inv"])
-            quad_Psi = (
-                quad_Psi
-                - 2.0 * torch.matmul(x, cache["mu_pinv_t"])
-                + cache["mu_quad"][None, :]
-            )
+        if cache["shared_psi"]:
+            x_quad = torch.matmul(x ** 2, cache["psi_inv"][0])
+            quad_Psi = x_quad[:, None]
+        else:
+            quad_Psi = torch.einsum("bd,kd->bk", x ** 2, cache["psi_inv"])
+        quad_Psi = (
+            quad_Psi
+            - 2.0 * torch.matmul(x, cache["mu_pinv_t"])
+            + cache["mu_quad"][None, :]
+        )
 
-            WT_Pinv_x = torch.matmul(x, cache["pinvw_flat"]).reshape(B, K, q)
-            v = WT_Pinv_x - cache["wt_pinv_mu"][None, :, :]
+        WT_Pinv_x = torch.matmul(x, cache["pinvw_flat"]).reshape(B, K, q)
+        v = WT_Pinv_x - cache["wt_pinv_mu"][None, :, :]
 
         v = v.float()
         quad_Psi = quad_Psi.float()
@@ -231,10 +226,6 @@ class MFA(nn.Module):
         if D != self.D:
             raise ValueError(f"expected input dim {self.D}, got {D}")
 
-        # Detect device type for autocast (cuda or cpu; mps not supported)
-        _dev = x.device.type
-        _amp_enabled = self.use_amp and _dev in ("cuda",)
-
         psi     = self._psi()       # (K, D)  diagonal noise Psi_k
         psi_inv = 1.0 / psi         # (K, D)
         W       = self._W()         # (K, D, q)  factor loadings W_k  (unrotated)
@@ -249,18 +240,17 @@ class MFA(nn.Module):
         L  = torch.linalg.cholesky(M)               # (K, q, q)  lower-triangular
 
         # ------------------------------------------------------------------
-        # Steps 2–3 — Mahalanobis + posterior (can use mixed precision)
+        # Steps 2–3 — Mahalanobis + posterior
         # ------------------------------------------------------------------
-        with torch.autocast(device_type=_dev, dtype=torch.bfloat16, enabled=_amp_enabled):
-            xT_Pinv_x   = torch.einsum("bd,kd->bk", x ** 2,      psi_inv)          # (B, K)
-            xT_Pinv_mu  = torch.einsum("bd,kd->bk", x,   psi_inv * self.mu)        # (B, K)
-            muT_Pinv_mu = (self.mu ** 2 * psi_inv).sum(dim=-1)                      # (K,)
-            quad_Psi    = xT_Pinv_x - 2.0 * xT_Pinv_mu + muT_Pinv_mu[None, :]     # (B, K)
+        xT_Pinv_x   = torch.einsum("bd,kd->bk", x ** 2,      psi_inv)          # (B, K)
+        xT_Pinv_mu  = torch.einsum("bd,kd->bk", x,   psi_inv * self.mu)        # (B, K)
+        muT_Pinv_mu = (self.mu ** 2 * psi_inv).sum(dim=-1)                      # (K,)
+        quad_Psi    = xT_Pinv_x - 2.0 * xT_Pinv_mu + muT_Pinv_mu[None, :]     # (B, K)
 
-            PinvW      = psi_inv[:, :, None] * W                                    # (K, D, q)
-            WT_Pinv_x  = torch.einsum("bd,kdq->bkq", x,        PinvW)              # (B, K, q)
-            WT_Pinv_mu = torch.einsum("kd,kdq->kq",  self.mu,  PinvW)              # (K, q)
-            v          = WT_Pinv_x - WT_Pinv_mu[None, :, :]                        # (B, K, q)
+        PinvW      = psi_inv[:, :, None] * W                                    # (K, D, q)
+        WT_Pinv_x  = torch.einsum("bd,kdq->bkq", x,        PinvW)              # (B, K, q)
+        WT_Pinv_mu = torch.einsum("kd,kdq->kq",  self.mu,  PinvW)              # (K, q)
+        v          = WT_Pinv_x - WT_Pinv_mu[None, :, :]                        # (B, K, q)
 
         # Cholesky solve stays in float32
         v = v.float()
@@ -421,7 +411,6 @@ class ComponentShardedMFA(MFA):
         psi_per_component: bool = False,
         scale_init: float = 1.0,
         eps_floor: float = 1e-5,
-        use_amp: bool = False,
     ):
         super().__init__(
             centroids,
@@ -430,7 +419,6 @@ class ComponentShardedMFA(MFA):
             psi_per_component=psi_per_component,
             scale_init=scale_init,
             eps_floor=eps_floor,
-            use_amp=use_amp,
         )
         self.global_K = int(global_K)
         self.component_start = int(component_start)

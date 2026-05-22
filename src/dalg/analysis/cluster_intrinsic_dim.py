@@ -499,7 +499,7 @@ def compute_intrinsic_dims_from_assignments(
         "D": mfa.D,
     }
 
-
+#TODO remove model dead code
 def compute_intrinsic_dims_from_shards(
     model_path: Path,
     shard_dir: Path,

@@ -21,8 +21,7 @@
 #SBATCH --job-name=mfa_train_component_shards
 ##SBATCH --begin=now+8hours
 #SBATCH --array=5
-##SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/mfa_train_component_shards_%A_%a.out
-#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/amp_1_compile_1_rank_300.out
+#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/mfa_train_component_shards_%A_%a.out
 
 # ── Config (override with sbatch --export=ALL,KEY=value) ─────────────────
 SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations}
@@ -35,11 +34,10 @@ REFINE_EPOCHS=${REFINE_EPOCHS:-10}
 BATCH=${BATCH:-8192}
 NUM_WORKERS=${NUM_WORKERS:-4}
 POOL_SIZE=${POOL_SIZE:-}
-VAL_FRAC=${VAL_FRAC:-0.008}                  # validation is skipped in component-shard mode
+VAL_FRAC=${VAL_FRAC:-0.05}                   # val runs on every rank via _build_val_loader
 SPLIT_SEED=${SPLIT_SEED:-42}
 SEED=${SEED:-42}
 COMPILE=${COMPILE:-1}                        # torch.compile on by default; set COMPILE=0 to disable
-USE_AMP=${USE_AMP:-1}                        # bfloat16 AMP for heavy einsums; set USE_AMP=1 to enable
 MAX_STEPS=${MAX_STEPS:-1000}                     # optional hard step cap for smoke/bisect runs
 
 LAYER_TAG="layer$(printf '%02d' "$LAYER")"
@@ -50,8 +48,6 @@ POOL_FLAG=""
 [[ -n "$POOL_SIZE" ]] && POOL_FLAG="--pool-size $POOL_SIZE"
 COMPILE_FLAG=""
 [[ "$COMPILE" -eq 1 ]] && COMPILE_FLAG="--compile"
-AMP_FLAG=""
-[[ "$USE_AMP" -eq 1 ]] && AMP_FLAG="--use-amp"
 MAX_STEPS_FLAG=""
 [[ -n "$MAX_STEPS" ]] && MAX_STEPS_FLAG="--max-steps $MAX_STEPS"
 
@@ -75,7 +71,7 @@ echo "=== $(date) === job $SLURM_JOB_ID.$SLURM_ARRAY_TASK_ID on $(hostname) ==="
 echo "repo_root: $REPO_ROOT"
 echo "shard_dir: $SHARD_DIR   layer: $LAYER   out_dir: $OUT_DIR"
 echo "K=$K  rank=$RANK  epochs=$EPOCHS  refine=$REFINE_EPOCHS  batch=$BATCH  num_workers=$NUM_WORKERS  nproc=$NPROC"
-echo "training_mode=component_shard  val_frac=$VAL_FRAC  compile=$COMPILE  use_amp=$USE_AMP  centroids_from=$CENTROIDS_FROM"
+echo "training_mode=component_shard  val_frac=$VAL_FRAC  compile=$COMPILE  centroids_from=$CENTROIDS_FROM"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 # ── Run (component-sharded MFA via torchrun) ─────────────────────────────
@@ -89,6 +85,6 @@ uv run python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=
     --device cuda --seed "$SEED" \
     --training-mode component_shard \
     --wandb --wandb-project dalg-mfa --wandb-name "smoketest_L5_K1000_q337_$(date +%H%M%S)" \
-    $POOL_FLAG $COMPILE_FLAG $AMP_FLAG $MAX_STEPS_FLAG
+    $POOL_FLAG $COMPILE_FLAG $MAX_STEPS_FLAG
 
 echo "=== $(date) === done ==="

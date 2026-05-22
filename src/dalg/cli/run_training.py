@@ -128,6 +128,33 @@ def _build_train_loader(
     return _build_data_loader(train_ds, args, device=device), len(train_ds), train_pos
 
 
+def _build_val_loader(data: dict, args, *, device: str):
+    """Build a deterministic val DataLoader (no shuffling).
+
+    With shuffles disabled, ``ActivationBatchDataset`` only partitions shards
+    by DataLoader ``worker_id``, never by distributed rank. Independent loaders
+    on every rank therefore yield the same batch sequence — exactly what we
+    need for component-sharded validation, where every rank must call
+    ``model.nll`` on the same batch so the distributed logsumexp inside
+    ``ComponentShardedMFA.log_prob`` completes symmetrically.
+    """
+    from dalg.data.shard_activations import ActivationBatchDataset
+
+    if not data["val_pos"]:
+        return None
+    val_ds = ActivationBatchDataset(
+        data["shard_dir"],
+        layer=data["layer"],
+        row_subset=data["val_pos"],
+        batch_size=args.batch_size,
+        drop_prefix=data["drop_prefix"],
+        shuffle_shards=False,
+        shuffle_within_shard=False,
+        seed=(args.seed or 0),
+    )
+    return _build_data_loader(val_ds, args, device=device)
+
+
 @torch.no_grad()
 def _materialize_val_tensor(
     shard_dir,
@@ -449,7 +476,6 @@ def cmd_train(args):
     model = MFA(
         centroids=centroids,
         rank=args.rank,
-        use_amp=getattr(args, "use_amp", False),
     ).to(args.device)
     if getattr(args, "compile", False):
         print("Compiling model with torch.compile...")
@@ -534,8 +560,13 @@ def cmd_train_component_shard(args):
         device,
     )
 
+    val_loader = _build_val_loader(data, args, device=device)
+    if val_loader is not None:
+        log("[val] using val_loader on every rank (deterministic, identical batches)")
+    else:
+        log("[val] no validation rows; best epoch will fall back to train NLL")
+
     if is_main:
-        print("[val] skipped in component-shard mode; best epoch by train NLL.")
         _write_split_info(
             data,
             out_dir,
@@ -559,7 +590,6 @@ def cmd_train_component_shard(args):
         rank=args.rank,
         dist_rank=rank,
         world_size=world_size,
-        use_amp=getattr(args, "use_amp", False),
     ).to(device)
     log(
         f"Component sharding: rank {rank}/{world_size} owns "
@@ -584,6 +614,7 @@ def cmd_train_component_shard(args):
     train_nll(
         model,
         train_loader,
+        val_loader=val_loader,
         val_tensor=None,
         epochs=args.epochs,
         lr=args.lr,
@@ -712,7 +743,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="vanilla",
         choices=["vanilla", "component_shard"],
     )
-    p.add_argument("--use-amp", action="store_true")
     p.add_argument("--compile", action="store_true")
     p.add_argument("--wandb", action="store_true", help="Log training to Weights & Biases (rank 0 only)")
     p.add_argument("--wandb-project", default=None, help="W&B project name")

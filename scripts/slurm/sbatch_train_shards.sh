@@ -34,7 +34,6 @@ VAL_FRAC=${VAL_FRAC:-0.008}
 SPLIT_SEED=${SPLIT_SEED:-42}
 SEED=${SEED:-42}
 VAL_ON_GPU=${VAL_ON_GPU:-0}                # 1 = preload val tensor on GPU (faster eval, more GPU RAM)
-USE_AMP=${USE_AMP:-1}
 MAX_STEPS=${MAX_STEPS:-}
 
 OUT_DIR=${OUT_DIR:-"$SHARD_DIR/layer$(printf '%02d' "$LAYER")_$(printf "$K")_$(printf "$RANK")_mfa"}
@@ -49,9 +48,6 @@ VAL_ON_GPU_FLAG=""
 if [[ "$VAL_ON_GPU" == "1" ]]; then
     VAL_ON_GPU_FLAG="--val-on-gpu"
 fi
-
-AMP_FLAG=""
-[[ "$USE_AMP" -eq 1 ]] && AMP_FLAG="--use-amp"
 
 MAX_STEPS_FLAG=""
 [[ -n "$MAX_STEPS" ]] && MAX_STEPS_FLAG="--max-steps $MAX_STEPS"
@@ -73,7 +69,7 @@ fi
 echo "=== $(date) === job $SLURM_JOB_ID.$SLURM_ARRAY_TASK_ID on $(hostname) ==="
 echo "repo_root: $REPO_ROOT"
 echo "shard_dir: $SHARD_DIR   layer: $LAYER   out_dir: $OUT_DIR"
-echo "K=$K  rank=$RANK  epochs=$EPOCHS  refine=$REFINE_EPOCHS  batch=$BATCH  use_amp=$USE_AMP num_workers=$NUM_WORKERS"
+echo "K=$K  rank=$RANK  epochs=$EPOCHS  refine=$REFINE_EPOCHS  batch=$BATCH  num_workers=$NUM_WORKERS"
 echo "training_mode=vanilla"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
@@ -87,6 +83,6 @@ uv run python -m dalg.cli.run_training \
     --device cuda --seed "$SEED" \
     --training-mode vanilla \
     --wandb --wandb-project dalg-mfa --wandb-name "smoketest_L5_K1000_q10_$(date +%H%M%S)" \
-    $POOL_FLAG $VAL_ON_GPU_FLAG $AMP_FLAG $MAX_STEPS_FLAG
+    $POOL_FLAG $VAL_ON_GPU_FLAG $MAX_STEPS_FLAG
 
 echo "=== $(date) === done ==="

@@ -29,11 +29,11 @@ export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
 # Step 1: compute cluster assignments (required by intrinsic-dim)
 # load_mfa falls back to mfa_model_shards.json when mfa_model.pt is absent
-# uv run python -m dalg.analysis.cluster_assignments \
-#   --model-path "$DATA_DIR/mfa_model.pt" \
-#   --shard-dir "$SHARD_DIR" \
-#   --layer "$LAYER" \
-#   --device cuda --num-workers 4
+uv run python -m dalg.analysis.cluster_assignments \
+  --model-path "$DATA_DIR/mfa_model.pt" \
+  --shard-dir "$SHARD_DIR" \
+  --layer "$LAYER" \
+  --device cuda --num-workers 4
 
 # # Step 2: intrinsic dimensionality per cluster
 # uv run dalg-run-metrics intrinsic-dim \

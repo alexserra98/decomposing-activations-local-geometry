@@ -89,7 +89,7 @@ def _restore_rng_state(state, device):
     if "cuda" in state and torch.cuda.is_available() and torch.device(device).type == "cuda":
         torch.cuda.set_rng_state(state["cuda"].cpu(), device)
 
-
+#TODO refactor to use pytorch lightining
 def train_nll(
     model,
     loader,
@@ -122,9 +122,10 @@ def train_nll(
     If both are None, the best-model metric falls back to training NLL.
 
     Distributed-aware for component-sharded MFA: when `torch.distributed` is
-    initialized, all ranks run the same batches. Rank 0 chooses the metric and
-    broadcasts that decision, while every rank can checkpoint/restore its own
-    component shard.
+    initialized, all ranks run the same train batches. Model-parallel models
+    also run the same validation batches on every rank because their forward
+    pass contains collectives. Rank 0 chooses the metric and broadcasts that
+    decision, while every rank can checkpoint/restore its own component shard.
 
     If `ckpt_path` is given, a full training checkpoint (model + optimizer +
     epoch + best state) is written atomically after every epoch. On startup,
@@ -257,20 +258,21 @@ def train_nll(
         avg_train_nll = total_nll / total_n if total_n else float("nan")
         epoch_time = time.time() - ep_start
 
-        # Validation: run only on rank 0 (others provide a placeholder).
-        if is_main:
-            if val_tensor is not None:
-                val_nll = _eval_nll_tensor(raw_model, val_tensor, device)
-                select_metric = val_nll
-            elif val_loader is not None:
-                val_nll = _eval_nll(raw_model, val_loader, device)
-                select_metric = val_nll
-            else:
-                val_nll = float("nan")
-                select_metric = avg_train_nll
+        # Validation: every rank participates so model-parallel collectives
+        # inside `model.nll` (e.g. ComponentShardedMFA's distributed
+        # logsumexp) complete symmetrically. Callers must therefore supply
+        # `val_tensor` / `val_loader` on every rank, or on none.
+        val_t0 = time.time()
+        if val_tensor is not None:
+            val_nll = _eval_nll_tensor(raw_model, val_tensor, device)
+            select_metric = val_nll
+        elif val_loader is not None:
+            val_nll = _eval_nll(raw_model, val_loader, device)
+            select_metric = val_nll
         else:
             val_nll = float("nan")
-            select_metric = float("nan")
+            select_metric = avg_train_nll
+        val_time = time.time() - val_t0
 
         if dist_on:
             t = torch.tensor([select_metric], device=device, dtype=torch.float64)
@@ -293,8 +295,11 @@ def train_nll(
         if is_main:
             val_str = f"{val_nll:.6f}" if not math.isnan(val_nll) else "n/a"
             tag = " ** best **" if improved else ""
+            val_time_str = (
+                f" (val {_fmt_eta(val_time)})" if not math.isnan(val_nll) else ""
+            )
             log(
-                f"[epoch {ep:02d}/{epochs:02d}] done in {_fmt_eta(epoch_time)} | "
+                f"[epoch {ep:02d}/{epochs:02d}] done in {_fmt_eta(epoch_time)}{val_time_str} | "
                 f"train_nll={avg_train_nll:.6f} | val_nll={val_str} | "
                 f"best_nll={best_metric:.6f} @ ep{best_epoch:02d}{tag}"
             )
@@ -305,6 +310,8 @@ def train_nll(
                     "epoch": ep,
                     "train/epoch_nll": avg_train_nll,
                     "val/nll": val_nll,
+                    "val/time_s": val_time,
+                    "epoch/time_s": epoch_time,
                     "best/metric": best_metric,
                     "best/epoch": best_epoch,
                 },

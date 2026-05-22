@@ -27,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT))
 
-from dalg.models.mfa import MFA  # noqa: E402
+from dalg.models.mfa import ComponentShardedMFA, MFA, component_shard_bounds  # noqa: E402
 from dalg.models.train import train_nll  # noqa: E402
 
 
@@ -264,7 +264,8 @@ def _dist_worker(rank, world_size, tmpdir, port, epochs, out_path):
     try:
         model = _build_tiny_mfa()
         batches = _fixed_batches()
-        # Validation only on rank 0; the metric is broadcast inside train_nll.
+        # Plain MFA validation can run only on rank 0; the metric is broadcast
+        # inside train_nll.
         val_tensor = torch.randn(32, 8, generator=torch.Generator().manual_seed(7)) \
             if rank == 0 else None
         ckpt = str(Path(tmpdir) / f"ckpt_rank{rank:04d}.pt")
@@ -284,6 +285,48 @@ def _dist_worker(rank, world_size, tmpdir, port, epochs, out_path):
             "ckpt_path": ckpt,
             "ckpt_exists": Path(ckpt).exists(),
             "ckpt_epoch": torch.load(ckpt, weights_only=False)["epoch"],
+        }, out_path.replace("RANK", str(rank)))
+    finally:
+        dist.destroy_process_group()
+
+
+def _component_sharded_val_worker(rank, world_size, port, out_path):
+    """Train a tiny component-sharded MFA with validation on every rank."""
+    import torch.distributed as dist
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    dist.init_process_group(backend="gloo")
+
+    try:
+        K, D, q = 4, 8, 2
+        centroids = torch.randn(K, D, generator=torch.Generator().manual_seed(11))
+        start, end = component_shard_bounds(K, rank, world_size)
+        model = ComponentShardedMFA(
+            centroids[start:end].clone(),
+            rank=q,
+            global_K=K,
+            component_start=start,
+        )
+        batches = _fixed_batches(n=2, B=6, D=D, seed=13)
+        val_tensor = torch.randn(18, D, generator=torch.Generator().manual_seed(17))
+
+        info = train_nll(
+            model,
+            batches,
+            val_tensor=val_tensor,
+            epochs=2,
+            lr=1e-3,
+            log_interval=1000,
+            checkpoint_all_ranks=True,
+        )
+
+        torch.save({
+            "rank": rank,
+            "best_epoch": info["best_epoch"],
+            "best_metric": info["best_metric"],
         }, out_path.replace("RANK", str(rank)))
     finally:
         dist.destroy_process_group()
@@ -322,6 +365,22 @@ class DistributedTests(unittest.TestCase):
             # With checkpoint_all_ranks=True every rank tracks best_epoch.
             self.assertGreater(r0["best_epoch"], 0)
             self.assertGreater(r1["best_epoch"], 0)
+
+    def test_component_sharded_validation_runs_on_all_ranks(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_template = str(Path(d) / "val_RANK.pt")
+            mp.spawn(
+                _component_sharded_val_worker,
+                args=(2, _free_port(), out_template),
+                nprocs=2,
+                join=True,
+            )
+            r0 = torch.load(Path(d) / "val_0.pt", weights_only=False)
+            r1 = torch.load(Path(d) / "val_1.pt", weights_only=False)
+            self.assertGreater(r0["best_epoch"], 0)
+            self.assertGreater(r1["best_epoch"], 0)
+            self.assertAlmostEqual(r0["best_metric"], r1["best_metric"], places=6)
+            self.assertLess(r0["best_metric"], float("inf"))
 
 
 if __name__ == "__main__":

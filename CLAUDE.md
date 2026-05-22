@@ -420,10 +420,15 @@ distributed across processes:
      the effective data batch.
    - `BATCH` is the logical batch each component shard sees. It should not be
      multiplied by world size when reasoning about the effective batch.
-   - Validation is currently skipped in component-shard mode: `train_nll` is
-     called with `val_tensor=None` and the best-epoch metric falls back to
-     training NLL. Use `VAL_FRAC=0.0` in Slurm scripts unless a future agent
-     implements distributed validation.
+   - Validation runs on every rank using a per-rank `val_loader` built by
+     `_build_val_loader`. The loader is deterministic (shuffles off), and
+     `ActivationBatchDataset` only partitions shards by DataLoader worker —
+     never by distributed rank — so independent loaders on every rank yield
+     the same batch sequence. Each rank calls `model.nll(xb)` on the same
+     batch; `ComponentShardedMFA.log_prob`'s distributed logsumexp produces
+     the global NLL identically on every rank. No `val_tensor` is
+     materialized in this mode (it would either duplicate memory across GPUs
+     or require a per-chunk broadcast loop).
    - `load_mfa` can assemble final component-sharded saves from
      `mfa_model_shards.json`. It also supports the historical pattern of
      passing `<run_dir>/mfa_model.pt` when that file is absent but
@@ -547,8 +552,6 @@ When adding new runnable workflows:
 - Make model-loading CLI arguments more explicit for full vs sharded MFA runs,
   e.g. avoid implying every run has a literal `mfa_model.pt` when
   component-sharded outputs are loaded through `mfa_model_shards.json`.
-- Distributed validation for component-sharded training (today it is skipped
-  and best-epoch falls back to training NLL).
 
 ## Things To Avoid
 
