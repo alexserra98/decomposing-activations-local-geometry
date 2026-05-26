@@ -15,7 +15,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=24
-#SBATCH --gres=gpu:H100:4
+#SBATCH --gres=gpu:H100:2
 #SBATCH --mem=160G
 #SBATCH --time=23:00:00
 #SBATCH --job-name=mfa_train_component_shards
@@ -24,7 +24,8 @@
 #SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/mfa_train_component_shards_%A_%a.out
 
 # ── Config (override with sbatch --export=ALL,KEY=value) ─────────────────
-SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations}
+# SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations}
+SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/newsgroups_gemma2b_activations}
 LAYER=$SLURM_ARRAY_TASK_ID
 
 SMOKE=${SMOKE:-0}                            # SMOKE=1 runs tiny epochs for quick wiring tests
@@ -45,7 +46,7 @@ if [[ "$SMOKE" -eq 1 ]]; then
   CENTROIDS_PATH=${CENTROIDS_PATH:-}
 else
   K=${K:-1000}
-  RANK=${RANK:-394}
+  RANK=${RANK:-10}
   EPOCHS=${EPOCHS:-0}
   REFINE_EPOCHS=${REFINE_EPOCHS:-10}
   BATCH=${BATCH:-8192}
