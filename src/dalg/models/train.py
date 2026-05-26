@@ -107,6 +107,7 @@ def train_nll(
     track_best=True,
     checkpoint_all_ranks=False,
     max_steps=None,
+    early_stop_delta=1e-3,
 ):
     """
     Train with NLL, keep the best (lowest) NLL model.
@@ -120,6 +121,10 @@ def train_nll(
     - `val_loader`: a regular DataLoader over the val set, re-streamed from
       disk each epoch. Fallback for val sets too large to materialize.
     If both are None, the best-model metric falls back to training NLL.
+    When validation is available, training stops once the absolute change in
+    validation NLL between consecutive epochs is below `early_stop_delta`.
+    Passing `epochs <= 0` removes the epoch cap; in that case training runs
+    until early stopping, `max_steps`, or the surrounding job limit stops it.
 
     Distributed-aware for component-sharded MFA: when `torch.distributed` is
     initialized, all ranks run the same train batches. Model-parallel models
@@ -133,6 +138,8 @@ def train_nll(
     """
     dist_on, rank = _distributed_state()
     is_main = (rank == 0)
+    epoch_limit = None if epochs is None or int(epochs) <= 0 else int(epochs)
+    epoch_label = "unbounded" if epoch_limit is None else f"{epoch_limit:02d}"
 
     raw_model = _unwrap_model(model)
     device = next(model.parameters()).device
@@ -143,6 +150,7 @@ def train_nll(
     best_state  = _cpu_state_dict(raw_model) if keep_best_on_this_rank else None
     best_epoch  = 0
     start_epoch = 1
+    last_val_metric = None
 
     load_ckpt = bool(ckpt_path) and os.path.exists(ckpt_path) and (
         is_main or checkpoint_all_ranks
@@ -155,16 +163,17 @@ def train_nll(
             best_metric = ckpt["best_metric"]
             best_state  = ckpt["best_state"] if keep_best_on_this_rank else None
             best_epoch  = ckpt["best_epoch"]
+        last_val_metric = ckpt.get("last_val_metric")
         start_epoch = ckpt["epoch"] + 1
         _restore_rng_state(ckpt.get("rng_state"), device)
         if is_main:
             if track_best:
                 print(f"[ckpt] resumed from epoch {ckpt['epoch']:02d}  "
                       f"best_metric={best_metric:.6f}  best_epoch={best_epoch:02d}  "
-                      f"next={start_epoch:02d}/{epochs:02d}")
+                      f"next={start_epoch:02d}/{epoch_label}")
             else:
                 print(f"[ckpt] resumed from epoch {ckpt['epoch']:02d}  "
-                      f"next={start_epoch:02d}/{epochs:02d}")
+                      f"next={start_epoch:02d}/{epoch_label}")
 
     if dist_on:
         starts = torch.tensor([start_epoch, start_epoch], device=device, dtype=torch.long)
@@ -184,7 +193,8 @@ def train_nll(
         if is_main:
             print(msg, flush=True)
 
-    for ep in range(start_epoch, epochs + 1):
+    ep = start_epoch
+    while epoch_limit is None or ep <= epoch_limit:
         model.train()
         total_nll, total_n = 0.0, 0
 
@@ -193,7 +203,7 @@ def train_nll(
         win_loss_sum = 0.0
         win_n = 0
         total_str = str(steps_per_epoch) if steps_per_epoch else "?"
-        log(f"[epoch {ep:02d}/{epochs:02d}] start — {total_str} steps")
+        log(f"[epoch {ep:02d}/{epoch_label}] start — {total_str} steps")
 
         for batch_idx, batch in enumerate(loader, 1):
             x = batch[0] if isinstance(batch, (tuple, list)) else batch
@@ -266,18 +276,38 @@ def train_nll(
         if val_tensor is not None:
             val_nll = _eval_nll_tensor(raw_model, val_tensor, device)
             select_metric = val_nll
+            has_val_metric = True
         elif val_loader is not None:
             val_nll = _eval_nll(raw_model, val_loader, device)
             select_metric = val_nll
+            has_val_metric = True
         else:
             val_nll = float("nan")
             select_metric = avg_train_nll
+            has_val_metric = False
         val_time = time.time() - val_t0
 
         if dist_on:
             t = torch.tensor([select_metric], device=device, dtype=torch.float64)
             dist.broadcast(t, src=0)
             select_metric = float(t[0].item())
+            has_val = torch.tensor([int(has_val_metric)], device=device, dtype=torch.long)
+            dist.broadcast(has_val, src=0)
+            has_val_metric = bool(has_val.item())
+
+        val_delta = None
+        stop_for_val_delta = False
+        if (
+            early_stop_delta is not None
+            and early_stop_delta > 0
+            and has_val_metric
+            and last_val_metric is not None
+            and not math.isnan(select_metric)
+        ):
+            val_delta = abs(select_metric - last_val_metric)
+            stop_for_val_delta = val_delta < early_stop_delta
+        if has_val_metric and not math.isnan(select_metric):
+            last_val_metric = select_metric
 
         improved = (
             track_best and (select_metric < best_metric)
@@ -299,7 +329,7 @@ def train_nll(
                 f" (val {_fmt_eta(val_time)})" if not math.isnan(val_nll) else ""
             )
             log(
-                f"[epoch {ep:02d}/{epochs:02d}] done in {_fmt_eta(epoch_time)}{val_time_str} | "
+                f"[epoch {ep:02d}/{epoch_label}] done in {_fmt_eta(epoch_time)}{val_time_str} | "
                 f"train_nll={avg_train_nll:.6f} | val_nll={val_str} | "
                 f"best_nll={best_metric:.6f} @ ep{best_epoch:02d}{tag}"
             )
@@ -310,6 +340,7 @@ def train_nll(
                     "epoch": ep,
                     "train/epoch_nll": avg_train_nll,
                     "val/nll": val_nll,
+                    "val/delta": val_delta,
                     "val/time_s": val_time,
                     "epoch/time_s": epoch_time,
                     "best/metric": best_metric,
@@ -326,12 +357,20 @@ def train_nll(
                 "best_metric": best_metric,
                 "best_state": best_state,
                 "best_epoch": best_epoch,
+                "last_val_metric": last_val_metric,
                 "rng_state": _rng_state(device),
             }, ckpt_path)
 
         if max_steps is not None and global_step >= max_steps:
             log(f"[max-steps] reached global_step={global_step} >= max_steps={max_steps}; stopping early.")
             break
+        if stop_for_val_delta:
+            log(
+                f"[early-stop] validation NLL changed by {val_delta:.6g} "
+                f"< {early_stop_delta:.6g}; stopping at epoch {ep:02d}."
+            )
+            break
+        ep += 1
 
     if keep_best_on_this_rank and best_state is not None:
         raw_model.load_state_dict(best_state)

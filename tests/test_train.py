@@ -77,7 +77,7 @@ class CheckpointContentsTests(unittest.TestCase):
     EXPECTED_KEYS = {
         "epoch", "model", "optimizer",
         "best_metric", "best_state", "best_epoch",
-        "rng_state",
+        "last_val_metric", "rng_state",
     }
 
     def test_checkpoint_file_written_with_expected_keys(self):
@@ -231,6 +231,22 @@ class BestEpochTests(unittest.TestCase):
                          epochs=3, lr=1e-3, log_interval=1000)
         self.assertGreaterEqual(info["best_epoch"], 1)
         self.assertLess(info["best_metric"], float("inf"))
+
+    def test_unbounded_epochs_stop_on_validation_delta(self):
+        model = _build_tiny_mfa()
+        with tempfile.TemporaryDirectory() as d:
+            ckpt = Path(d) / "ckpt.pt"
+            train_nll(
+                model,
+                _fixed_batches(),
+                val_tensor=torch.randn(32, 8),
+                epochs=0,
+                lr=0.0,
+                ckpt_path=str(ckpt),
+                log_interval=1000,
+                early_stop_delta=1e-3,
+            )
+            self.assertEqual(torch.load(ckpt, weights_only=False)["epoch"], 2)
 
 
 # --------------------------------------------------------------------------

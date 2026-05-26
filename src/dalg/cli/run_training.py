@@ -128,6 +128,15 @@ def _build_train_loader(
     return _build_data_loader(train_ds, args, device=device), len(train_ds), train_pos
 
 
+def _limit_steps_per_epoch(steps_per_epoch: int, args, *, log) -> int:
+    limit = getattr(args, "steps_per_epoch", None)
+    if limit is None:
+        return steps_per_epoch
+    limited = min(steps_per_epoch, int(limit))
+    log(f"[debug] limiting each epoch to {limited:,}/{steps_per_epoch:,} batches")
+    return limited
+
+
 def _build_val_loader(data: dict, args, *, device: str):
     """Build a deterministic val DataLoader (no shuffling).
 
@@ -310,15 +319,33 @@ def _ensure_centroids(
     device: str,
     barrier: bool,
 ) -> torch.Tensor:
-    """Fit missing centroids on rank 0, then load them on every rank."""
+    """Resolve centroids for the run, then load them on every rank.
+
+    Order of precedence on rank 0:
+    1. If ``<out_dir>/centroids.pt`` already exists, use it.
+    2. Otherwise, if ``--centroids-path`` points to an existing file (or a
+       directory containing ``centroids.pt``), copy it into the run dir.
+    3. Otherwise, fit a fresh KMeans from streamed shards.
+    """
     centroids_path = out_dir / "centroids.pt"
     if is_main and not centroids_path.exists():
-        _fit_and_save_centroids(
-            centroids_path,
-            data,
-            args,
-            device=device,
-        )
+        provided = getattr(args, "centroids_path", None)
+        if provided:
+            src = Path(provided)
+            if src.is_dir():
+                src = src / "centroids.pt"
+            if not src.is_file():
+                raise SystemExit(f"--centroids-path not found: {provided}")
+            import shutil
+            shutil.copyfile(src, centroids_path)
+            print(f"Centroids: copied from {src} to {centroids_path}")
+        else:
+            _fit_and_save_centroids(
+                centroids_path,
+                data,
+                args,
+                device=device,
+            )
     if barrier and dist.is_available() and dist.is_initialized():
         dist.barrier()
     centroids = torch.load(centroids_path, map_location=device, weights_only=True)
@@ -368,6 +395,8 @@ def _write_run_config(
         "K": args.K,
         "rank": args.rank,
         "epochs": args.epochs,
+        "early_stop_delta": args.early_stop_delta,
+        "steps_per_epoch": args.steps_per_epoch,
         "lr": args.lr,
         "batch_size": args.batch_size,
         "num_workers": _loader_num_workers(args),
@@ -400,6 +429,8 @@ def _maybe_init_wandb(args, data: dict, *, training_mode: str, world_size: int, 
         "K": args.K,
         "rank": args.rank,
         "epochs": args.epochs,
+        "early_stop_delta": args.early_stop_delta,
+        "steps_per_epoch": args.steps_per_epoch,
         "lr": args.lr,
         "batch_size": args.batch_size,
         "grad_clip": args.grad_clip,
@@ -451,6 +482,7 @@ def cmd_train(args):
         args,
         device=args.device,
     )
+    steps_per_epoch = _limit_steps_per_epoch(steps_per_epoch, args, log=print)
     val_tensor = _build_val_tensor_for_main(
         data,
         args,
@@ -494,6 +526,7 @@ def cmd_train(args):
         steps_per_epoch=steps_per_epoch,
         track_best=True,
         max_steps=args.max_steps,
+        early_stop_delta=args.early_stop_delta,
     )
 
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -550,6 +583,7 @@ def cmd_train_component_shard(args):
         args,
         device=device,
     )
+    steps_per_epoch = _limit_steps_per_epoch(steps_per_epoch, args, log=log)
     log(f"each rank sees all {len(train_pos):,} train rows")
 
     train_loader = _ComponentShardLoader(
@@ -626,6 +660,7 @@ def cmd_train_component_shard(args):
         track_best=True,
         checkpoint_all_ranks=True,
         max_steps=args.max_steps,
+        early_stop_delta=args.early_stop_delta,
     )
 
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -711,6 +746,16 @@ def validate_args(args) -> None:
             raise SystemExit(f"train: --training-mode {mode} requires torchrun with WORLD_SIZE>1")
         if args.device != "cuda":
             raise SystemExit("train: component_shard requires --device cuda")
+    if args.steps_per_epoch is not None and args.steps_per_epoch <= 0:
+        raise SystemExit("train: --steps-per-epoch must be positive")
+    if (
+        args.epochs <= 0
+        and args.max_steps is None
+        and (args.val_frac <= 0 or args.early_stop_delta <= 0)
+    ):
+        raise SystemExit(
+            "train: --epochs <= 0 needs validation early stopping or --max-steps"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -722,12 +767,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--shard-dir", required=True, help="Activation shard root from extract-windows")
     p.add_argument("--layer", type=int, required=True, help="Layer to train on")
     p.add_argument("--out-dir", default=None, help="Where to save centroids/model")
+    p.add_argument(
+        "--centroids-path",
+        default=None,
+        help="Path to a pre-computed centroids.pt (or a directory containing one) "
+             "to use instead of fitting KMeans. Copied into <out_dir>/centroids.pt.",
+    )
     p.add_argument("--val-frac", type=float, default=0.05)
     p.add_argument("--split-seed", type=int, default=42)
     p.add_argument("--val-on-gpu", action="store_true")
     p.add_argument("--K", type=int, required=True, help="Number of components")
     p.add_argument("--rank", type=int, default=10, help="MFA rank (q)")
-    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--epochs", type=int, default=10,
+                   help="Epoch cap. Set <=0 to run until early stopping, max-steps, or walltime.")
+    p.add_argument("--steps-per-epoch", type=int, default=None,
+                   help="Debug/smoke option: cap batches per epoch.")
+    p.add_argument("--early-stop-delta", type=float, default=1e-3,
+                   help="Stop once consecutive validation NLLs differ by less than this. "
+                        "Set <=0 to disable.")
     p.add_argument("--max-steps", type=int, default=None,
                    help="Hard cap on total optimizer steps; if reached, training stops early. "
                         "Useful for bisect/smoke runs.")

@@ -111,9 +111,11 @@ def main():
     ap.add_argument("--out", type=Path, default=OUT_DIR)
     ap.add_argument("--subsets", nargs="*", default=SUBSETS)
     ap.add_argument("--dry-run", action="store_true", help="just print config")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="override rows-per-subset (for smoke tests)")
     args = ap.parse_args()
 
-    target = rows_per_subset()
+    target = args.limit if args.limit is not None else rows_per_subset()
     print(f"subsets: {len(args.subsets)}")
     print(f"target rows/subset: {target}  (window={WINDOW_SIZE})")
     print(f"total target tokens: {target * WINDOW_SIZE * len(args.subsets):,}")
