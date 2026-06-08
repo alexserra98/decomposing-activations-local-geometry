@@ -108,6 +108,8 @@ def train_nll(
     checkpoint_all_ranks=False,
     max_steps=None,
     early_stop_delta=1e-3,
+    epoch_snapshot_func=None,
+    epoch_snapshot_every=5,
 ):
     """
     Train with NLL, keep the best (lowest) NLL model.
@@ -313,6 +315,18 @@ def train_nll(
             track_best and (select_metric < best_metric)
             if not math.isnan(select_metric) else False
         )
+        # Periodic full-model snapshots for monitoring properties across
+        # training. `epoch_snapshot_func(raw_model, ep)` runs on every rank so
+        # mode-specific saving (per-rank shards, manifests, barriers) can be
+        # encapsulated by the caller; it is independent of the best-model
+        # `save_path`/`save_func` machinery below.
+        if (
+            epoch_snapshot_func is not None
+            and epoch_snapshot_every
+            and (ep % epoch_snapshot_every == 0 or ep == 1)
+        ):
+            epoch_snapshot_func(raw_model, ep)
+
         if improved:
             best_metric = select_metric
             if keep_best_on_this_rank:

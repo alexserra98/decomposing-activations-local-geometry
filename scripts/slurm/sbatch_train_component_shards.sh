@@ -24,8 +24,8 @@
 #SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/mfa_train_component_shards_%A_%a.out
 
 # ── Config (override with sbatch --export=ALL,KEY=value) ─────────────────
-# SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations}
-SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/newsgroups_gemma2b_activations}
+SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations}
+# SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/newsgroups_gemma2b_activations}
 LAYER=$SLURM_ARRAY_TASK_ID
 
 SMOKE=${SMOKE:-0}                            # SMOKE=1 runs tiny epochs for quick wiring tests
@@ -45,9 +45,9 @@ if [[ "$SMOKE" -eq 1 ]]; then
   WANDB=${WANDB:-0}
   CENTROIDS_PATH=${CENTROIDS_PATH:-}
 else
-  K=${K:-1000}
+  K=${K:-8000}
   RANK=${RANK:-10}
-  EPOCHS=${EPOCHS:-0}
+  EPOCHS=${EPOCHS:-15}
   REFINE_EPOCHS=${REFINE_EPOCHS:-10}
   BATCH=${BATCH:-8192}
   NUM_WORKERS=${NUM_WORKERS:-4}

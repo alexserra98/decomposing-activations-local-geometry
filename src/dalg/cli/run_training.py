@@ -513,6 +513,11 @@ def cmd_train(args):
         print("Compiling model with torch.compile...")
         model = torch.compile(model)
 
+    def _epoch_snapshot(snapshot_model, ep):
+        snap_dir = out_dir / f"epoch_{ep:04d}"
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        save_mfa(snapshot_model, str(snap_dir / "mfa_model.pt"))
+
     train_nll(
         model,
         train_loader,
@@ -527,6 +532,7 @@ def cmd_train(args):
         track_best=True,
         max_steps=args.max_steps,
         early_stop_delta=args.early_stop_delta,
+        epoch_snapshot_func=_epoch_snapshot,
     )
 
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -645,6 +651,23 @@ def cmd_train_component_shard(args):
         (out_dir / "checkpoint_shards.json").write_text(json.dumps(ckpt_manifest, indent=2))
     dist.barrier()
 
+    def _epoch_snapshot(snapshot_model, ep):
+        snap_dir = out_dir / f"epoch_{ep:04d}"
+        if is_main:
+            snap_dir.mkdir(parents=True, exist_ok=True)
+        dist.barrier()
+        save_component_shard(snapshot_model, snap_dir / f"mfa_model_rank{rank:04d}.pt")
+        dist.barrier()
+        if is_main:
+            snap_manifest = {
+                "format": "component_sharded_mfa",
+                "global_K": args.K,
+                "rank": args.rank,
+                "world_size": world_size,
+                "shards": [f"mfa_model_rank{r:04d}.pt" for r in range(world_size)],
+            }
+            (snap_dir / "mfa_model_shards.json").write_text(json.dumps(snap_manifest, indent=2))
+
     train_nll(
         model,
         train_loader,
@@ -661,6 +684,7 @@ def cmd_train_component_shard(args):
         checkpoint_all_ranks=True,
         max_steps=args.max_steps,
         early_stop_delta=args.early_stop_delta,
+        epoch_snapshot_func=_epoch_snapshot,
     )
 
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -791,7 +815,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--grad-clip", type=float, default=None)
     p.add_argument("--proj-dim", type=int, default=32)
-    p.add_argument("--refine-epochs", type=int, default=25)
+    p.add_argument("--refine-epochs", type=int, default=25,
+                   help="Number of additional epochs to run with token assignments fixed to "
+                        "the nearest centroid; only applies when fitting centroids from scratch.")
     p.add_argument("--vocab-size", type=int, default=50257)
     p.add_argument("--pool-size", type=int, default=None)
     p.add_argument("--max-pool-size", type=int, default=2_000_000)
