@@ -37,6 +37,31 @@ OverlapResults = dict[str, torch.Tensor]
 # ── Vectorized overlap computation ──────────────────────────────────────
 
 
+def _cholesky_with_jitter(M: torch.Tensor, eps: float) -> torch.Tensor:
+    """Cholesky factorization, adding jitter only for batches that need it."""
+    L, info = torch.linalg.cholesky_ex(M)
+    if not torch.any(info):
+        return L
+
+    eye = torch.eye(M.shape[-1], device=M.device, dtype=M.dtype)
+    fixed = M.clone()
+    bad = info > 0
+    jitter = eps
+    for _ in range(6):
+        fixed[bad] = M[bad] + jitter * eye
+        L_new, info_new = torch.linalg.cholesky_ex(fixed[bad])
+        L[bad] = L_new
+        still_bad = info_new > 0
+        if not torch.any(still_bad):
+            return L
+        bad_indices = bad.nonzero(as_tuple=True)[0]
+        bad = torch.zeros_like(bad)
+        bad[bad_indices[still_bad]] = True
+        jitter *= 10.0
+
+    return torch.linalg.cholesky(fixed)
+
+
 def _batched_kl_one_way(
     mu_i: torch.Tensor,
     mu_j: torch.Tensor,
@@ -119,10 +144,7 @@ def _batched_bhattacharyya(
     I2q = torch.eye(2 * q, device=mu_i.device, dtype=mu_i.dtype)
     M_bar = I2q[None] + torch.einsum("pdi,pdj->pij", A_bar, A_bar)  # (P, 2q, 2q)
 
-    # Add small jitter for numerical stability with large K
-    M_bar = M_bar + eps * I2q[None]
-
-    L_bar = torch.linalg.cholesky(M_bar)                        # (P, 2q, 2q)
+    L_bar = _cholesky_with_jitter(M_bar, eps)                   # (P, 2q, 2q)
 
     # log|Bar_C| = log|Psi_bar| + log|M_bar|
     logdet_Cbar = (
@@ -259,9 +281,19 @@ def compute_overlap(
     db[idx_i, idx_j]      = db_flat;        db[idx_j, idx_i]      = db_flat
     bc[idx_i, idx_j]      = bc_flat;        bc[idx_j, idx_i]      = bc_flat
 
-    print(f"KL_sym  — min: {kl_flat[kl_flat>0].min():.3f}  max: {kl_flat.max():.3f}")
-    print(f"D_B     — min: {db_flat[db_flat>0].min():.3f}  max: {db_flat.max():.3f}")
-    print(f"BC      — min: {bc_flat[bc_flat<1].min():.4f}  max: {bc_flat[bc_flat<1].max():.4f}")
+    bc.fill_diagonal_(1.0)
+
+    if n_pairs > 0:
+        kl_pos = kl_flat[kl_flat > 0]
+        db_pos = db_flat[db_flat > 0]
+        bc_below_one = bc_flat[bc_flat < 1]
+        kl_min = kl_pos.min() if kl_pos.numel() else kl_flat.min()
+        db_min = db_pos.min() if db_pos.numel() else db_flat.min()
+        bc_min = bc_below_one.min() if bc_below_one.numel() else bc_flat.min()
+        bc_max = bc_below_one.max() if bc_below_one.numel() else bc_flat.max()
+        print(f"KL_sym  — min: {kl_min:.3f}  max: {kl_flat.max():.3f}")
+        print(f"D_B     — min: {db_min:.3f}  max: {db_flat.max():.3f}")
+        print(f"BC      — min: {bc_min:.4f}  max: {bc_max:.4f}")
 
     return {"kl_sym": kl_sym, "db": db, "db_mean": db_mean, "db_cov": db_cov, "bc": bc}
 
