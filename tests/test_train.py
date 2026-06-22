@@ -18,6 +18,7 @@ import socket
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import torch
@@ -77,7 +78,7 @@ class CheckpointContentsTests(unittest.TestCase):
     EXPECTED_KEYS = {
         "epoch", "model", "optimizer",
         "best_metric", "best_state", "best_epoch",
-        "last_val_metric", "rng_state",
+        "last_val_metric", "epochs_without_improvement", "rng_state",
     }
 
     def test_checkpoint_file_written_with_expected_keys(self):
@@ -247,6 +248,34 @@ class BestEpochTests(unittest.TestCase):
                 early_stop_delta=1e-3,
             )
             self.assertEqual(torch.load(ckpt, weights_only=False)["epoch"], 2)
+
+    def test_validation_patience_stops_after_repeated_non_improvement(self):
+        model = _build_tiny_mfa()
+        with tempfile.TemporaryDirectory() as d:
+            ckpt = Path(d) / "ckpt.pt"
+            with mock.patch(
+                "dalg.models.train._eval_nll_tensor",
+                side_effect=[1.0, 0.9, 1.0, 1.1],
+            ) as eval_mock:
+                info = train_nll(
+                    model,
+                    _fixed_batches(),
+                    val_tensor=torch.randn(32, 8),
+                    epochs=20,
+                    lr=0.0,
+                    ckpt_path=str(ckpt),
+                    log_interval=1000,
+                    early_stop_delta=0.0,
+                    early_stop_patience=2,
+                    early_stop_min_delta=0.0,
+                )
+
+            obj = torch.load(ckpt, weights_only=False)
+            self.assertEqual(eval_mock.call_count, 4)
+            self.assertEqual(obj["epoch"], 4)
+            self.assertEqual(obj["best_epoch"], 2)
+            self.assertEqual(obj["epochs_without_improvement"], 2)
+            self.assertEqual(info["best_epoch"], 2)
 
 
 # --------------------------------------------------------------------------

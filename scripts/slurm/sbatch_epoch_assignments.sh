@@ -10,7 +10,7 @@
 #SBATCH --time=1-02:00:00
 #SBATCH --job-name=mfa_epoch_assign
 #SBATCH --array=0-4
-#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/experiments/mfa_epoch_assign_%A_%a.out
+#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/experiments/mfa_epoch_assign_%A_%a.out
 
 # One array task per epoch snapshot: stream the full dataset through that
 # snapshot's MFA and save hard cluster assignments via dalg.analysis.cluster_assignments.

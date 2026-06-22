@@ -108,6 +108,8 @@ def train_nll(
     checkpoint_all_ranks=False,
     max_steps=None,
     early_stop_delta=1e-3,
+    early_stop_patience=None,
+    early_stop_min_delta=0.0,
     epoch_snapshot_func=None,
     epoch_snapshot_every=5,
 ):
@@ -124,7 +126,10 @@ def train_nll(
       disk each epoch. Fallback for val sets too large to materialize.
     If both are None, the best-model metric falls back to training NLL.
     When validation is available, training stops once the absolute change in
-    validation NLL between consecutive epochs is below `early_stop_delta`.
+    validation NLL between consecutive epochs is below `early_stop_delta`. If
+    `early_stop_patience` is set, training also stops after that many epochs
+    without improving the best validation NLL by at least
+    `early_stop_min_delta`.
     Passing `epochs <= 0` removes the epoch cap; in that case training runs
     until early stopping, `max_steps`, or the surrounding job limit stops it.
 
@@ -153,6 +158,7 @@ def train_nll(
     best_epoch  = 0
     start_epoch = 1
     last_val_metric = None
+    epochs_without_improvement = 0
 
     load_ckpt = bool(ckpt_path) and os.path.exists(ckpt_path) and (
         is_main or checkpoint_all_ranks
@@ -166,6 +172,9 @@ def train_nll(
             best_state  = ckpt["best_state"] if keep_best_on_this_rank else None
             best_epoch  = ckpt["best_epoch"]
         last_val_metric = ckpt.get("last_val_metric")
+        epochs_without_improvement = int(
+            ckpt.get("epochs_without_improvement", max(0, ckpt["epoch"] - best_epoch))
+        )
         start_epoch = ckpt["epoch"] + 1
         _restore_rng_state(ckpt.get("rng_state"), device)
         if is_main:
@@ -311,10 +320,10 @@ def train_nll(
         if has_val_metric and not math.isnan(select_metric):
             last_val_metric = select_metric
 
-        improved = (
-            track_best and (select_metric < best_metric)
-            if not math.isnan(select_metric) else False
-        )
+        min_delta = 0.0 if early_stop_min_delta is None else float(early_stop_min_delta)
+        improved = False
+        if track_best and not math.isnan(select_metric):
+            improved = select_metric < (best_metric - max(0.0, min_delta))
         # Periodic full-model snapshots for monitoring properties across
         # training. `epoch_snapshot_func(raw_model, ep)` runs on every rank so
         # mode-specific saving (per-rank shards, manifests, barriers) can be
@@ -329,16 +338,25 @@ def train_nll(
 
         if improved:
             best_metric = select_metric
+            epochs_without_improvement = 0
             if keep_best_on_this_rank:
                 best_state  = _cpu_state_dict(raw_model)
                 best_epoch  = ep
             if is_main:
                 if save_path and save_func:
                     save_func(raw_model, save_path)
+        elif has_val_metric and not math.isnan(select_metric) and best_epoch > 0:
+            epochs_without_improvement += 1
 
         if is_main:
             val_str = f"{val_nll:.6f}" if not math.isnan(val_nll) else "n/a"
             tag = " ** best **" if improved else ""
+            patience_str = ""
+            if early_stop_patience is not None and early_stop_patience > 0 and has_val_metric:
+                patience_str = (
+                    f" | no_improve={epochs_without_improvement}/"
+                    f"{int(early_stop_patience)}"
+                )
             val_time_str = (
                 f" (val {_fmt_eta(val_time)})" if not math.isnan(val_nll) else ""
             )
@@ -346,6 +364,7 @@ def train_nll(
                 f"[epoch {ep:02d}/{epoch_label}] done in {_fmt_eta(epoch_time)}{val_time_str} | "
                 f"train_nll={avg_train_nll:.6f} | val_nll={val_str} | "
                 f"best_nll={best_metric:.6f} @ ep{best_epoch:02d}{tag}"
+                f"{patience_str}"
             )
 
         if wandb_on:
@@ -359,6 +378,7 @@ def train_nll(
                     "epoch/time_s": epoch_time,
                     "best/metric": best_metric,
                     "best/epoch": best_epoch,
+                    "early_stop/no_improve_epochs": epochs_without_improvement,
                 },
                 step=global_step,
             )
@@ -372,6 +392,7 @@ def train_nll(
                 "best_state": best_state,
                 "best_epoch": best_epoch,
                 "last_val_metric": last_val_metric,
+                "epochs_without_improvement": epochs_without_improvement,
                 "rng_state": _rng_state(device),
             }, ckpt_path)
 
@@ -382,6 +403,19 @@ def train_nll(
             log(
                 f"[early-stop] validation NLL changed by {val_delta:.6g} "
                 f"< {early_stop_delta:.6g}; stopping at epoch {ep:02d}."
+            )
+            break
+        if (
+            early_stop_patience is not None
+            and early_stop_patience > 0
+            and has_val_metric
+            and best_epoch > 0
+            and epochs_without_improvement >= int(early_stop_patience)
+        ):
+            log(
+                f"[early-stop] validation NLL did not improve by "
+                f"{max(0.0, min_delta):.6g} for {epochs_without_improvement} "
+                f"epochs; stopping at epoch {ep:02d}."
             )
             break
         ep += 1

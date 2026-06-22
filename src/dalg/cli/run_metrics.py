@@ -6,10 +6,16 @@ Subcommands:
     intrinsic-dim  PCA-based intrinsic dimensionality per cluster.
     assignments    Hard cluster assignments + per-cluster peakedness stats
                    (streams activations through the MFA in one pass).
+    description-fit
+                   Description-vs-context metrics for labeled clusters.
+    description-semantics
+                   Embedding similarity between cluster descriptions.
 
-Both expect a trained MFA run directory (``--data-dir``) containing either
-``mfa_model.pt`` or, for component-sharded runs, ``mfa_model_shards.json``.
-``--data-dir`` may also be a direct path to a ``.pt`` model file.
+The model-based subcommands expect a trained MFA run directory (``--data-dir``)
+containing either ``mfa_model.pt`` or, for component-sharded runs,
+``mfa_model_shards.json``. ``--data-dir`` may also be a direct path to a
+``.pt`` model file. The description subcommands read ``cluster_labels.json``
+from the interpretation pipeline.
 
 Example::
 
@@ -181,12 +187,133 @@ def cmd_assignments(args) -> None:
     print(f"Assignments saved to {save_path}")
 
 
+def _description_out_dir(args) -> Path:
+    labels_path = Path(args.labels_path)
+    out_dir = Path(args.out_dir) if args.out_dir is not None else labels_path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def cmd_description_fit(args) -> None:
+    """Compute description-fit metrics for labeled cluster interpretations."""
+    import json
+
+    from dalg.analysis.cluster_labeling import ORFEO_MODEL
+    from dalg.analysis.description_metrics import (
+        compute_detection_scores,
+        compute_token_embedding_scores,
+    )
+
+    out_dir = _description_out_dir(args)
+    detection = None
+    token_embedding = None
+
+    if not args.skip_detection:
+        detection = compute_detection_scores(
+            args.labels_path,
+            model=(args.judge_model or ORFEO_MODEL),
+            temperature=args.judge_temperature,
+            max_tokens=args.judge_max_tokens,
+            positive_examples=args.positive_examples,
+            negative_examples=args.negative_examples,
+            cluster_ids=args.clusters,
+            max_clusters=args.max_clusters,
+            seed=(args.seed or 0),
+            max_workers=args.judge_workers,
+            show_progress=not args.quiet,
+        )
+
+    if not args.skip_token_embedding:
+        token_embedding = compute_token_embedding_scores(
+            args.labels_path,
+            model_name=args.embedding_model,
+            device=args.embedding_device,
+            batch_size=args.embedding_batch_size,
+            target_batch_size=args.target_batch_size,
+            positive_examples=args.positive_examples,
+            negative_examples=args.negative_examples,
+            cluster_ids=args.clusters,
+            max_clusters=args.max_clusters,
+            seed=(args.seed or 0),
+        )
+
+    output = {
+        "metadata": {
+            "labels_path": str(args.labels_path),
+            "positive_examples": int(args.positive_examples),
+            "negative_examples": int(args.negative_examples),
+            "seed": int(args.seed or 0),
+        },
+        "detection": detection,
+        "token_embedding": token_embedding,
+    }
+    save_path = out_dir / "description_fit.json"
+    save_path.write_text(json.dumps(output, ensure_ascii=False, indent=2))
+    print(f"Description fit metrics saved to {save_path}")
+
+
+def cmd_description_semantics(args) -> None:
+    """Compute semantic similarity between cluster descriptions."""
+    import json
+
+    from dalg.analysis.description_metrics import (
+        compute_description_semantics,
+        load_labeled_clusters,
+    )
+
+    loaded = load_labeled_clusters(args.labels_path)
+    all_cluster_ids = sorted(loaded["clusters"])
+    selected = [int(k) for k in args.clusters] if args.clusters is not None else all_cluster_ids
+    if args.max_clusters is not None:
+        selected = selected[: int(args.max_clusters)]
+
+    if args.full_matrix == "always":
+        save_full_matrix = True
+    elif args.full_matrix == "never":
+        save_full_matrix = False
+    else:
+        save_full_matrix = len(selected) <= int(args.max_full_matrix_clusters)
+
+    dtype = torch.float16 if args.full_matrix_dtype == "float16" else torch.float32
+    tensor_output, json_output = compute_description_semantics(
+        args.labels_path,
+        model_name=args.embedding_model,
+        device=args.embedding_device,
+        batch_size=args.embedding_batch_size,
+        similarity_batch_size=args.similarity_batch_size,
+        top_k=args.top_k,
+        similarity_threshold=args.similarity_threshold,
+        min_group_size=args.min_group_size,
+        save_full_matrix=save_full_matrix,
+        full_matrix_dtype=dtype,
+        cluster_ids=args.clusters,
+        max_clusters=args.max_clusters,
+    )
+
+    out_dir = _description_out_dir(args)
+    tensor_path = out_dir / "description_semantics.pt"
+    groups_path = out_dir / "description_semantic_groups.json"
+    torch.save(tensor_output, tensor_path)
+    groups_path.write_text(json.dumps(json_output, ensure_ascii=False, indent=2))
+    if save_full_matrix:
+        print(f"Saved full similarity matrix for {len(selected):,} descriptions.")
+    else:
+        print(
+            "Skipped full similarity matrix; use --full-matrix always "
+            "if you want a dense heatmap artifact."
+        )
+    print(f"Description semantics saved to {tensor_path} and {groups_path}")
+
+
 def validate_args(args) -> None:
     if args.command == "intrinsic-dim":
         if args.shard_dir is not None and args.act_dir is not None:
             raise SystemExit("intrinsic-dim: --shard-dir and --act-dir are mutually exclusive")
         if args.shard_dir is not None and args.layer is None:
             raise SystemExit("intrinsic-dim: --layer is required with --shard-dir")
+    if args.command == "description-fit":
+        if args.skip_detection and args.skip_token_embedding:
+            raise SystemExit("description-fit: at least one metric must be enabled")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -250,6 +377,66 @@ def build_parser() -> argparse.ArgumentParser:
                     action="store_false", default=True,
                     help="Disable the MFA inference cache during responsibilities()")
     sp.set_defaults(func=cmd_assignments)
+
+
+    sp = sub.add_parser("description-fit",
+                        help="Judge whether descriptions fit marked token contexts")
+    sp.add_argument("--labels-path", required=True,
+                    help="Path to cluster_labels.json from dalg-interpret-mfa or dalg-label-mfa-clusters")
+    sp.add_argument("--out-dir", default=None,
+                    help="Where to save description_fit.json (default: labels directory)")
+    sp.add_argument("--seed", type=int, default=None)
+    sp.add_argument("--clusters", type=int, nargs="*", default=None,
+                    help="Specific cluster ids to score. Defaults to all clusters.")
+    sp.add_argument("--max-clusters", type=int, default=None,
+                    help="Debug convenience: score only the first N selected clusters")
+    sp.add_argument("--positive-examples", type=int, default=8,
+                    help="Top examples from the feature to judge as positives")
+    sp.add_argument("--negative-examples", type=int, default=8,
+                    help="Random examples from other features to judge as negatives")
+    sp.add_argument("--skip-detection", action="store_true",
+                    help="Skip the LLM activation-detection metric")
+    sp.add_argument("--judge-model", default=None,
+                    help="Judge model for detection scoring (default: labeling ORFEO_MODEL)")
+    sp.add_argument("--judge-temperature", type=float, default=0.0)
+    sp.add_argument("--judge-max-tokens", type=int, default=1024)
+    sp.add_argument("--judge-workers", type=int, default=1)
+    sp.add_argument("--skip-token-embedding", action="store_true",
+                    help="Skip the experimental token-context embedding metric")
+    sp.add_argument("--embedding-model", default="sentence-transformers/all-MiniLM-L6-v2",
+                    help="Transformer encoder used for description and target-token embeddings")
+    sp.add_argument("--embedding-device", default="cpu")
+    sp.add_argument("--embedding-batch-size", type=int, default=32)
+    sp.add_argument("--target-batch-size", type=int, default=16)
+    sp.add_argument("--quiet", action="store_true")
+    sp.set_defaults(func=cmd_description_fit)
+
+    sp = sub.add_parser("description-semantics",
+                        help="Embed descriptions and compute semantic similarity")
+    sp.add_argument("--labels-path", required=True,
+                    help="Path to cluster_labels.json from dalg-interpret-mfa or dalg-label-mfa-clusters")
+    sp.add_argument("--out-dir", default=None,
+                    help="Where to save description_semantics.pt and groups JSON")
+    sp.add_argument("--clusters", type=int, nargs="*", default=None,
+                    help="Specific cluster ids to embed. Defaults to all clusters.")
+    sp.add_argument("--max-clusters", type=int, default=None,
+                    help="Debug convenience: embed only the first N selected clusters")
+    sp.add_argument("--embedding-model", default="sentence-transformers/all-MiniLM-L6-v2",
+                    help="Transformer encoder used for description embeddings")
+    sp.add_argument("--embedding-device", default="cpu")
+    sp.add_argument("--embedding-batch-size", type=int, default=32)
+    sp.add_argument("--similarity-batch-size", type=int, default=1024)
+    sp.add_argument("--top-k", type=int, default=25,
+                    help="Number of nearest description neighbors to keep per cluster")
+    sp.add_argument("--similarity-threshold", type=float, default=0.70,
+                    help="Cosine threshold for semantic groups")
+    sp.add_argument("--min-group-size", type=int, default=2)
+    sp.add_argument("--full-matrix", choices=("auto", "always", "never"), default="auto",
+                    help="Whether to save a dense similarity matrix for heatmaps")
+    sp.add_argument("--max-full-matrix-clusters", type=int, default=5000,
+                    help="With --full-matrix auto, save dense matrix only up to this many clusters")
+    sp.add_argument("--full-matrix-dtype", choices=("float32", "float16"), default="float32")
+    sp.set_defaults(func=cmd_description_semantics)
 
     return p
 

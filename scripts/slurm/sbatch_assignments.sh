@@ -10,7 +10,7 @@
 #SBATCH --time=1-02:00:00
 #SBATCH --job-name=mfa_assign
 #SBATCH --array=0-3
-#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/experiments/mfa_assign_%A_%a.out
+#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/experiments/mfa_assign_%A_%a.out
 
 # SLURM stages this script into /var/spool/slurm/, so don't rely on
 # BASH_SOURCE — hardcode the repo root.

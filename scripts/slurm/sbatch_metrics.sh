@@ -11,7 +11,7 @@
 #SBATCH --job-name=mfa_metric_cluster
 ##SBATCH --begin=now+4hours
 #SBATCH --array=5
-#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/mfa_metric_cluster_%A_%a.out
+#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/experiments/mfa_metric_cluster_%A_%a.out
 
 REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
 K=1000
