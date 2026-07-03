@@ -68,3 +68,5 @@ dalg-cache
 output
 
 random/
+mfa_vae_test/*
+vamp_factory/*
