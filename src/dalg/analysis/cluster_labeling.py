@@ -65,6 +65,7 @@ def load_assignment_data(assignments_path: str | Path) -> dict[str, Any]:
         "max_responsibilities": max_responsibilities,
         "peakedness": data.get("peakedness", {}),
         "K": K,
+        "subset_spec": data.get("subset_spec"),
     }
 
 
@@ -630,6 +631,12 @@ def label_mfa_clusters(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    subset_spec = None
+    if shard_dir is not None:
+        from dalg.data.subset_spec import split_shard_dir_spec
+
+        shard_dir, subset_spec = split_shard_dir_spec(shard_dir)
+
     config = resolve_labeling_config(
         assignments_path,
         shard_dir=shard_dir,
@@ -643,6 +650,10 @@ def label_mfa_clusters(
 
     assignment_data = load_assignment_data(assignments_path)
     K = int(assignment_data["K"])
+    # Fall back to the subset spec recorded at assignment time so labeling maps
+    # positions through the same row subset even if --shard-dir carried no suffix.
+    if subset_spec is None:
+        subset_spec = assignment_data.get("subset_spec")
     if cluster_ids is None and max_clusters is not None:
         cluster_ids = list(range(min(int(max_clusters), K)))
 
@@ -665,6 +676,16 @@ def label_mfa_clusters(
         from dalg.data.shard_activations import load_meta_index
 
         meta_index = load_meta_index(config["shard_dir"], layer=config.get("layer"))
+        if subset_spec:
+            from dalg.data.subset_spec import resolve_spec_positions
+
+            keep = resolve_spec_positions(
+                meta_index,
+                subset_spec,
+                window=int(config["window"]),
+                drop_prefix=int(config["drop_prefix"]),
+            )
+            meta_index = [meta_index[i] for i in keep]
     coordinates = map_positions_to_token_coordinates(
         top_index["positions"],
         meta_index,

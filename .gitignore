@@ -54,9 +54,11 @@ Thumbs.db
 *.swo
 
 # DATA
-
+*.csv
 *.png
-
+*.tar.gz
+*.html
+outputs/experiments/synthetic_qk_sweep_report/*_executed.ipynb
 # AI
 .codex
 CLAUDE.md

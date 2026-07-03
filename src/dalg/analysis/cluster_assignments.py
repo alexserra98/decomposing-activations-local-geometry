@@ -109,6 +109,7 @@ def main() -> None:
         ActivationBatchDataset,
         load_meta_index,
     )
+    from dalg.data.subset_spec import resolve_spec_positions, split_shard_dir_spec
 
     parser = argparse.ArgumentParser(description="Compute MFA cluster assignments for sharded activations")
     parser.add_argument("--model-path", type=Path, required=True, help="Path to mfa_model.pt")
@@ -129,15 +130,19 @@ def main() -> None:
     args = parser.parse_args()
     device = _resolve_device(args.device)
 
-    shard_dir = args.shard_dir
+    shard_dir, subset_spec = split_shard_dir_spec(args.shard_dir)
     extract_cfg = json.loads((shard_dir / "config.json").read_text())
+    window = int(extract_cfg["window"])
     drop_prefix = args.drop_prefix
     if drop_prefix is None:
         drop_prefix = int(extract_cfg.get("drop_prefix", 32))
 
     meta_index = load_meta_index(shard_dir, layer=args.layer)
-    positions = list(range(len(meta_index)))
-    print(f"shard_dir={shard_dir}  layer={args.layer}  rows={len(positions):,}")
+    positions = resolve_spec_positions(
+        meta_index, subset_spec, window=window, drop_prefix=drop_prefix
+    )
+    print(f"shard_dir={shard_dir}  layer={args.layer}  rows={len(positions):,}"
+          + (f"  spec={subset_spec!r}" if subset_spec else ""))
 
     ds = ActivationBatchDataset(
         shard_dir,
@@ -178,6 +183,7 @@ def main() -> None:
         "max_responsibilities": max_responsibilities,
         "peakedness": peakedness,
         "K": int(sizes.numel()),
+        "subset_spec": subset_spec,
     }, save_path)
     print(f"Assignments saved to {save_path}")
 

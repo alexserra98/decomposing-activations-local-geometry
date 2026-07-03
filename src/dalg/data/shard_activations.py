@@ -89,11 +89,17 @@ def stratified_split(
     meta_index: Sequence[dict],
     val_frac: float = 0.05,
     seed: int = 42,
+    positions: Optional[Sequence[int]] = None,
 ) -> Tuple[List[int], List[int]]:
-    """Stratified-by-subset train/val split over positions into ``meta_index``."""
+    """Stratified-by-subset train/val split over positions into ``meta_index``.
+
+    When ``positions`` is given, only those positions are split (original
+    indices into ``meta_index`` are preserved); otherwise all rows are used.
+    """
+    idxs = range(len(meta_index)) if positions is None else positions
     by_subset: Dict[str, List[int]] = defaultdict(list)
-    for i, row in enumerate(meta_index):
-        by_subset[row.get("subset", "all")].append(i)
+    for i in idxs:
+        by_subset[meta_index[int(i)].get("subset", "all")].append(int(i))
 
     rng = random.Random(seed)
     train: List[int] = []

@@ -30,6 +30,7 @@ def _resolve_activation_data(args, *, log) -> dict:
         per_subset_counts,
         stratified_split,
     )
+    from dalg.data.subset_spec import resolve_spec_positions, split_shard_dir_spec
 
     shard_dir_arg = getattr(args, "shard_dir", None)
     if shard_dir_arg is None:
@@ -40,7 +41,7 @@ def _resolve_activation_data(args, *, log) -> dict:
     val_frac = getattr(args, "val_frac", 0.05)
     split_seed = getattr(args, "split_seed", 42)
 
-    shard_dir = Path(shard_dir_arg)
+    shard_dir, subset_spec = split_shard_dir_spec(shard_dir_arg)
     extract_cfg = json.loads((shard_dir / "config.json").read_text())
     window = int(extract_cfg["window"])
     d_model = int(extract_cfg["d_model"])
@@ -52,10 +53,16 @@ def _resolve_activation_data(args, *, log) -> dict:
         )
 
     meta_index = load_meta_index(shard_dir, layer=args.layer)
+    keep = resolve_spec_positions(
+        meta_index, subset_spec, window=window, drop_prefix=drop_prefix
+    )
+    if subset_spec:
+        log(f"subset spec={subset_spec!r}: {len(keep):,}/{len(meta_index):,} rows selected")
     train_pos_full, val_pos = stratified_split(
         meta_index,
         val_frac=val_frac,
         seed=split_seed,
+        positions=keep,
     )
     n_train_tokens = len(train_pos_full) * per_row_tokens
 
@@ -532,7 +539,10 @@ def cmd_train(args):
         track_best=True,
         max_steps=args.max_steps,
         early_stop_delta=args.early_stop_delta,
+        early_stop_patience=args.early_stop_patience,
+        early_stop_min_delta=args.early_stop_min_delta,
         epoch_snapshot_func=_epoch_snapshot,
+        epoch_snapshot_every=args.epoch_snapshot_every,
     )
 
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -684,7 +694,10 @@ def cmd_train_component_shard(args):
         checkpoint_all_ranks=True,
         max_steps=args.max_steps,
         early_stop_delta=args.early_stop_delta,
+        early_stop_patience=args.early_stop_patience,
+        early_stop_min_delta=args.early_stop_min_delta,
         epoch_snapshot_func=_epoch_snapshot,
+        epoch_snapshot_every=args.epoch_snapshot_every,
     )
 
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -809,6 +822,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--early-stop-delta", type=float, default=1e-3,
                    help="Stop once consecutive validation NLLs differ by less than this. "
                         "Set <=0 to disable.")
+    p.add_argument("--early-stop-patience", type=int, default=None,
+                   help="Stop after this many epochs without improving the best validation "
+                        "NLL by at least --early-stop-min-delta. Off by default.")
+    p.add_argument("--early-stop-min-delta", type=float, default=0.0,
+                   help="Minimum validation-NLL improvement to count as progress for patience.")
+    p.add_argument("--epoch-snapshot-every", type=int, default=5,
+                   help="Save a full model snapshot every N epochs (plus epoch 1) under "
+                        "<out_dir>/epoch_XXXX/. Set 0 to disable snapshots.")
     p.add_argument("--max-steps", type=int, default=None,
                    help="Hard cap on total optimizer steps; if reached, training stops early. "
                         "Useful for bisect/smoke runs.")

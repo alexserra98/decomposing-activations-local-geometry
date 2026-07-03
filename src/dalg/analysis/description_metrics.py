@@ -702,6 +702,160 @@ def _mean_internal_similarity(id_to_row: dict[int, int], group: Sequence[int], e
     return float(sim[triu[0], triu[1]].mean().item())
 
 
+def _summary_stats(values: torch.Tensor) -> dict[str, float | int | None]:
+    values = values.float().flatten()
+    values = values[torch.isfinite(values)]
+    if values.numel() == 0:
+        return {
+            "count": 0,
+            "mean": None,
+            "median": None,
+            "min": None,
+            "max": None,
+        }
+    return {
+        "count": int(values.numel()),
+        "mean": float(values.mean().item()),
+        "median": float(values.median().item()),
+        "min": float(values.min().item()),
+        "max": float(values.max().item()),
+    }
+
+
+def _condensed_distance(distance: torch.Tensor) -> torch.Tensor:
+    if distance.ndim != 2 or distance.shape[0] != distance.shape[1]:
+        raise ValueError(f"distance matrix must be square, got shape {tuple(distance.shape)}")
+    if distance.shape[0] < 2:
+        return torch.empty(0, dtype=torch.float32)
+    idx = torch.triu_indices(distance.shape[0], distance.shape[1], offset=1)
+    condensed = distance[idx[0], idx[1]].float()
+    if not torch.isfinite(condensed).all():
+        raise ValueError("distance matrix contains non-finite off-diagonal values")
+    return condensed
+
+
+def compute_gaussian_group_label_coherence(
+    labels_path: str | Path,
+    overlap_path: str | Path,
+    *,
+    embedder: TransformerTextEmbedder | Any | None = None,
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    device: str = "cpu",
+    batch_size: int = 32,
+    distance_key: str = "db",
+    distance_threshold: float,
+    linkage: str = "average",
+    top_groups: int = 10,
+) -> dict[str, Any]:
+    """Cluster MFA Gaussians by distance and summarize label coherence per group."""
+    from scipy.cluster.hierarchy import fcluster, linkage as scipy_linkage
+
+    labels_path = Path(labels_path)
+    overlap_path = Path(overlap_path)
+    loaded = load_labeled_clusters(labels_path)
+    clusters = loaded["clusters"]
+
+    overlap = torch.load(overlap_path, map_location="cpu")
+    if distance_key not in overlap:
+        raise ValueError(f"{overlap_path} is missing distance key {distance_key!r}")
+    distance = overlap[distance_key].float().cpu()
+    if distance.ndim != 2 or distance.shape[0] != distance.shape[1]:
+        raise ValueError(f"{distance_key} must be a square matrix, got shape {tuple(distance.shape)}")
+
+    K = int(distance.shape[0])
+    wanted = list(range(K))
+    missing = [cluster_id for cluster_id in wanted if cluster_id not in clusters]
+    if missing:
+        raise ValueError(f"labels are missing component ids from overlap matrix: {missing[:10]}")
+
+    if embedder is None:
+        embedder = TransformerTextEmbedder(model_name, device=device)
+    texts = [description_text(clusters[k]) for k in wanted]
+    embeddings = embedder.encode_texts(texts, batch_size=batch_size).float()
+    if embeddings.shape[0] != K:
+        raise ValueError(f"embedder returned {embeddings.shape[0]} embeddings for {K} descriptions")
+
+    condensed = _condensed_distance(distance)
+    if K == 1:
+        flat_labels = [1]
+    else:
+        Z = scipy_linkage(condensed.numpy(), method=linkage)
+        flat_labels = fcluster(Z, t=float(distance_threshold), criterion="distance").tolist()
+
+    label_to_members: dict[int, list[int]] = {}
+    for component_id, group_label in enumerate(flat_labels):
+        label_to_members.setdefault(int(group_label), []).append(int(component_id))
+
+    all_groups = sorted(
+        (sorted(members) for members in label_to_members.values()),
+        key=lambda members: (-len(members), members[0]),
+    )
+    selected_groups = [group for group in all_groups if len(group) >= 2][: int(top_groups)]
+
+    semantic_sim = embeddings @ embeddings.T if embeddings.numel() else torch.empty((K, K))
+    group_outputs: list[dict[str, Any]] = []
+    member_rows: list[dict[str, Any]] = []
+    for group_id, group in enumerate(selected_groups):
+        rows = torch.tensor(group, dtype=torch.long)
+        pair_idx = torch.triu_indices(len(group), len(group), offset=1)
+        group_semantic = semantic_sim[rows][:, rows][pair_idx[0], pair_idx[1]]
+        group_distance = distance[rows][:, rows][pair_idx[0], pair_idx[1]]
+
+        semantic_stats = _summary_stats(group_semantic)
+        distance_stats = _summary_stats(group_distance)
+        members = []
+        for component_id in group:
+            cluster = clusters[int(component_id)]
+            member = {
+                "component_id": int(component_id),
+                "label": cluster.get("label"),
+                "description": cluster.get("description"),
+                "text": description_text(cluster),
+            }
+            members.append(member)
+            member_rows.append({
+                "group_id": group_id,
+                "group_size": len(group),
+                "component_id": int(component_id),
+                "label": cluster.get("label"),
+                "description": cluster.get("description"),
+                "mean_label_cosine": semantic_stats["mean"],
+                "median_label_cosine": semantic_stats["median"],
+                "mean_distance": distance_stats["mean"],
+                "median_distance": distance_stats["median"],
+            })
+
+        group_outputs.append({
+            "group_id": group_id,
+            "size": len(group),
+            "component_ids": group,
+            "label_cosine": semantic_stats,
+            "distance": distance_stats,
+            "members": members,
+        })
+
+    return {
+        "metadata": {
+            "labels_path": str(labels_path),
+            "overlap_path": str(overlap_path),
+            "distance_key": distance_key,
+            "distance_threshold": float(distance_threshold),
+            "linkage": linkage,
+            "top_groups": int(top_groups),
+            "model_name": getattr(embedder, "model_name", model_name),
+        },
+        "summary": {
+            "n_components": K,
+            "n_gaussian_groups": len(all_groups),
+            "n_non_singleton_gaussian_groups": sum(1 for group in all_groups if len(group) >= 2),
+            "largest_group_sizes": [len(group) for group in all_groups[: int(top_groups)]],
+            "n_selected_groups": len(selected_groups),
+        },
+        "groups": group_outputs,
+        "member_rows": member_rows,
+    }
+
+
 def compute_description_semantics(
     labels_path: str | Path,
     *,

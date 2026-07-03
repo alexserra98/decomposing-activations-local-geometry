@@ -6,7 +6,7 @@
 #   sbatch scripts/slurm/sbatch_synthetic_qk_sweep.sh
 #
 # To run one K with all q values:
-#   K_GRID="8" Q_GRID="10 50 100 200 500" sbatch --array=0-0 scripts/slurm/sbatch_synthetic_qk_sweep.sh
+#   K_GRID="100" Q_GRID="5 10 20 30 40 50" sbatch --array=0-0 scripts/slurm/sbatch_synthetic_qk_sweep.sh
 
 #SBATCH --partition=H100
 #SBATCH --account=LADE
@@ -34,14 +34,12 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$SLURM_CPUS_PER_TASK}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-$SLURM_CPUS_PER_TASK}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-$SLURM_CPUS_PER_TASK}"
 
-# K_GRID=${K_GRID:-"10 50 100 250 500 750 1000 1250 1500 2000"}
-K_GRID=${K_GRID:-"500 750 1000 1250 1500 2000"}
-Q_GRID=${Q_GRID:-"5 10 15 20 25 30 35 40 60 80 100 120 140 160 180 200 220 240 260 280 300 350 400 500"}
-# Q_GRID=${Q_GRID:-"300 350 400 500"}
-D=${D:-500}
-K_TRUE=${K_TRUE:-1000}
-Q_TRUE=${Q_TRUE:-20}
-N_TRAIN=${N_TRAIN:-500000}
+K_GRID=${K_GRID:-"10 25 50 100 125 150 250"}
+Q_GRID=${Q_GRID:-"5 10 20 30 40 50"}
+D=${D:-256}
+K_TRUE=${K_TRUE:-100}
+Q_TRUE=${Q_TRUE:-30}
+N_TRAIN=${N_TRAIN:-1000000}
 N_TEST=${N_TEST:-10000}
 SEED=${SEED:-0}
 BATCH_SIZE=${BATCH_SIZE:-512}

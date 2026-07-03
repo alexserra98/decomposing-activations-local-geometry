@@ -1,6 +1,7 @@
 import os
 import math
 import time
+from contextlib import contextmanager
 import torch
 import torch.distributed as dist
 
@@ -41,17 +42,40 @@ def _cpu_state_dict(model):
     return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
 
+@contextmanager
+def _strict_validation_matmul(device):
+    """Use full float32 matmul precision for validation likelihoods."""
+    dev = torch.device(device)
+    if dev.type != "cuda" or not torch.cuda.is_available():
+        yield
+        return
+
+    old_precision = torch.get_float32_matmul_precision()
+    old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(old_precision)
+        torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+        torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+
+
 @torch.no_grad()
 def _eval_nll(model, loader, device):
     model.eval()
     tot_nll, tot_n = 0.0, 0
-    for batch in loader:
-        x = batch[0] if isinstance(batch, (tuple, list)) else batch
-        x = x.view(x.size(0), -1).to(device)
-        nll = model.nll(x)                  # mean over batch
-        B = x.size(0)
-        tot_nll += nll.item() * B
-        tot_n   += B
+    with _strict_validation_matmul(device):
+        for batch in loader:
+            x = batch[0] if isinstance(batch, (tuple, list)) else batch
+            x = x.view(x.size(0), -1).to(device)
+            nll = model.nll(x)                  # mean over batch
+            B = x.size(0)
+            tot_nll += nll.item() * B
+            tot_n   += B
     return tot_nll / tot_n
 
 
@@ -61,10 +85,11 @@ def _eval_nll_tensor(model, X, device, chunk=8192):
     model.eval()
     N = X.shape[0]
     tot = 0.0
-    for i in range(0, N, chunk):
-        xb = X[i:i + chunk].to(device, non_blocking=True)
-        xb = xb.view(xb.size(0), -1).float()
-        tot += float(model.nll(xb).item()) * xb.size(0)
+    with _strict_validation_matmul(device):
+        for i in range(0, N, chunk):
+            xb = X[i:i + chunk].to(device, non_blocking=True)
+            xb = xb.view(xb.size(0), -1).float()
+            tot += float(model.nll(xb).item()) * xb.size(0)
     return tot / max(N, 1)
 
 

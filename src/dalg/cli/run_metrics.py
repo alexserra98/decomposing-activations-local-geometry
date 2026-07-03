@@ -10,6 +10,8 @@ Subcommands:
                    Description-vs-context metrics for labeled clusters.
     description-semantics
                    Embedding similarity between cluster descriptions.
+    gaussian-group-semantics
+                   Label coherence inside groups of nearby MFA Gaussians.
 
 The model-based subcommands expect a trained MFA run directory (``--data-dir``)
 containing either ``mfa_model.pt`` or, for component-sharded runs,
@@ -73,15 +75,18 @@ def cmd_intrinsic_dim(args) -> None:
     from dalg.analysis.cluster_intrinsic_dim import (
         compute_intrinsic_dims, compute_intrinsic_dims_from_shards,
     )
+    from dalg.data.subset_spec import split_shard_dir_spec
 
     model_path, run_dir = _resolve_model_path(args.data_dir)
     out_dir = Path(args.out_dir or run_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.shard_dir is not None:
+        shard_dir, subset_spec = split_shard_dir_spec(args.shard_dir)
         results = compute_intrinsic_dims_from_shards(
-            model_path, Path(args.shard_dir),
+            model_path, shard_dir,
             layer=args.layer,
+            subset_spec=subset_spec,
             assignments_path=args.assignments_path,
             device=args.device,
             variance_threshold=args.variance_threshold,
@@ -128,19 +133,24 @@ def cmd_assignments(args) -> None:
 
     from dalg.analysis.cluster_assignments import compute_assignments, _resolve_device
     from dalg.data.shard_activations import ActivationBatchDataset, load_meta_index
+    from dalg.data.subset_spec import resolve_spec_positions, split_shard_dir_spec
 
     model_path, run_dir = _resolve_model_path(args.data_dir)
     device = _resolve_device(args.device)
 
-    shard_dir = Path(args.shard_dir)
+    shard_dir, subset_spec = split_shard_dir_spec(args.shard_dir)
     extract_cfg = json.loads((shard_dir / "config.json").read_text())
+    window = int(extract_cfg["window"])
     drop_prefix = args.drop_prefix
     if drop_prefix is None:
         drop_prefix = int(extract_cfg.get("drop_prefix", 32))
 
     meta_index = load_meta_index(shard_dir, layer=args.layer)
-    positions = list(range(len(meta_index)))
-    print(f"shard_dir={shard_dir}  layer={args.layer}  rows={len(positions):,}")
+    positions = resolve_spec_positions(
+        meta_index, subset_spec, window=window, drop_prefix=drop_prefix
+    )
+    print(f"shard_dir={shard_dir}  layer={args.layer}  rows={len(positions):,}"
+          + (f"  spec={subset_spec!r}" if subset_spec else ""))
 
     ds = ActivationBatchDataset(
         shard_dir,
@@ -183,6 +193,7 @@ def cmd_assignments(args) -> None:
         "max_responsibilities": max_responsibilities,
         "peakedness": peakedness,
         "K": int(sizes.numel()),
+        "subset_spec": subset_spec,
     }, save_path)
     print(f"Assignments saved to {save_path}")
 
@@ -305,6 +316,50 @@ def cmd_description_semantics(args) -> None:
     print(f"Description semantics saved to {tensor_path} and {groups_path}")
 
 
+def cmd_gaussian_group_semantics(args) -> None:
+    """Cluster Gaussians by overlap distance and score label coherence."""
+    import csv
+    import json
+
+    from dalg.analysis.description_metrics import compute_gaussian_group_label_coherence
+
+    out_dir = _description_out_dir(args)
+    output = compute_gaussian_group_label_coherence(
+        args.labels_path,
+        args.overlap_path,
+        model_name=args.embedding_model,
+        device=args.embedding_device,
+        batch_size=args.embedding_batch_size,
+        distance_key=args.distance_key,
+        distance_threshold=args.distance_threshold,
+        linkage=args.linkage,
+        top_groups=args.top_groups,
+    )
+
+    json_path = out_dir / "gaussian_group_label_coherence.json"
+    csv_path = out_dir / "gaussian_group_members.csv"
+    json_path.write_text(json.dumps(output, ensure_ascii=False, indent=2))
+
+    rows = output["member_rows"]
+    fieldnames = [
+        "group_id",
+        "group_size",
+        "component_id",
+        "label",
+        "description",
+        "mean_label_cosine",
+        "median_label_cosine",
+        "mean_distance",
+        "median_distance",
+    ]
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Gaussian-group label coherence saved to {json_path} and {csv_path}")
+
+
 def validate_args(args) -> None:
     if args.command == "intrinsic-dim":
         if args.shard_dir is not None and args.act_dir is not None:
@@ -314,6 +369,11 @@ def validate_args(args) -> None:
     if args.command == "description-fit":
         if args.skip_detection and args.skip_token_embedding:
             raise SystemExit("description-fit: at least one metric must be enabled")
+    if args.command == "gaussian-group-semantics":
+        if args.distance_threshold < 0:
+            raise SystemExit("gaussian-group-semantics: --distance-threshold must be non-negative")
+        if args.top_groups <= 0:
+            raise SystemExit("gaussian-group-semantics: --top-groups must be positive")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -437,6 +497,29 @@ def build_parser() -> argparse.ArgumentParser:
                     help="With --full-matrix auto, save dense matrix only up to this many clusters")
     sp.add_argument("--full-matrix-dtype", choices=("float32", "float16"), default="float32")
     sp.set_defaults(func=cmd_description_semantics)
+
+    sp = sub.add_parser(
+        "gaussian-group-semantics",
+        help="Cluster Gaussians by Bhattacharyya distance and score label coherence",
+    )
+    sp.add_argument("--labels-path", required=True,
+                    help="Path to cluster_labels.json from dalg-label-mfa-clusters")
+    sp.add_argument("--overlap-path", required=True,
+                    help="Path to overlap.pt containing a square Gaussian distance matrix")
+    sp.add_argument("--out-dir", default=None,
+                    help="Where to save gaussian_group_label_coherence.json and CSV")
+    sp.add_argument("--distance-key", default="db",
+                    help="Distance matrix key inside overlap.pt, usually db")
+    sp.add_argument("--distance-threshold", type=float, required=True,
+                    help="Hierarchical clustering distance cutoff")
+    sp.add_argument("--linkage", choices=("average", "complete", "single"), default="average")
+    sp.add_argument("--top-groups", type=int, default=10,
+                    help="Number of largest non-singleton Gaussian-groups to summarize")
+    sp.add_argument("--embedding-model", default="sentence-transformers/all-MiniLM-L6-v2",
+                    help="Transformer encoder used for description embeddings")
+    sp.add_argument("--embedding-device", default="cpu")
+    sp.add_argument("--embedding-batch-size", type=int, default=32)
+    sp.set_defaults(func=cmd_gaussian_group_semantics)
 
     return p
 

@@ -507,6 +507,7 @@ def compute_intrinsic_dims_from_shards(
     layer: int,
     assignments_path: Path | None = None,
     drop_prefix: int | None = None,
+    subset_spec: str | None = None,
     device: str | torch.device = "cpu",
     variance_threshold: float = 0.90,
     min_population: int = 100,
@@ -518,6 +519,7 @@ def compute_intrinsic_dims_from_shards(
     **_legacy,
 ) -> IntrinsicDimResults:
     from dalg.data.shard_activations import load_meta_index
+    from dalg.data.subset_spec import resolve_spec_positions
 
     model_path = Path(model_path)
     shard_dir = Path(shard_dir)
@@ -531,6 +533,11 @@ def compute_intrinsic_dims_from_shards(
         drop_prefix = int(extract_cfg.get("drop_prefix", 32))
 
     meta_index = load_meta_index(shard_dir, layer=layer)
+    if subset_spec:
+        keep = resolve_spec_positions(
+            meta_index, subset_spec, window=window, drop_prefix=drop_prefix
+        )
+        meta_index = [meta_index[i] for i in keep]
     assignments, sizes, peakedness, K = _load_assignments(assignments_path)
     mfa = load_mfa(model_path, map_location="cpu")
     if int(mfa.K) != K:

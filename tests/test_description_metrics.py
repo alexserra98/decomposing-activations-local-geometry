@@ -12,6 +12,7 @@ import torch
 from dalg.analysis.description_metrics import (
     compute_description_semantics,
     compute_detection_scores,
+    compute_gaussian_group_label_coherence,
     compute_token_embedding_scores,
     load_labeled_clusters,
     select_detection_examples,
@@ -205,6 +206,36 @@ class DescriptionMetricsTests(unittest.TestCase):
         grouped_ids = [set(group["cluster_ids"]) for group in groups["groups"]]
         self.assertIn({0, 2}, grouped_ids)
 
+    def test_gaussian_group_label_coherence_uses_distance_clusters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            labels_path = root / "cluster_labels.json"
+            overlap_path = root / "overlap.pt"
+            _write_labels(labels_path)
+            torch.save({
+                "db": torch.tensor([
+                    [0.0, 4.0, 0.1],
+                    [4.0, 0.0, 5.0],
+                    [0.1, 5.0, 0.0],
+                ])
+            }, overlap_path)
+
+            out = compute_gaussian_group_label_coherence(
+                labels_path,
+                overlap_path,
+                embedder=FakeEmbedder(),
+                distance_threshold=0.2,
+                linkage="average",
+                top_groups=10,
+            )
+
+        self.assertEqual(out["summary"]["n_gaussian_groups"], 2)
+        self.assertEqual(out["summary"]["n_non_singleton_gaussian_groups"], 1)
+        self.assertEqual(out["groups"][0]["component_ids"], [0, 2])
+        self.assertEqual(out["groups"][0]["label_cosine"]["count"], 1)
+        self.assertGreater(out["groups"][0]["label_cosine"]["mean"], 0.99)
+        self.assertAlmostEqual(out["groups"][0]["distance"]["mean"], 0.1, places=6)
+
     def test_run_metrics_parser_accepts_description_commands(self):
         parser = build_parser()
         args = parser.parse_args([
@@ -235,6 +266,18 @@ class DescriptionMetricsTests(unittest.TestCase):
         ])
         validate_args(args)
         self.assertEqual(args.command, "description-semantics")
+
+        args = parser.parse_args([
+            "gaussian-group-semantics",
+            "--labels-path",
+            "cluster_labels.json",
+            "--overlap-path",
+            "overlap.pt",
+            "--distance-threshold",
+            "0.5",
+        ])
+        validate_args(args)
+        self.assertEqual(args.command, "gaussian-group-semantics")
 
 
 if __name__ == "__main__":

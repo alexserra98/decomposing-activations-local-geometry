@@ -1,65 +1,59 @@
 # AGENTS.md
 
-This file gives future agents the minimum context needed to work effectively in this repository.
+This file gives future agents the minimum context needed to work effectively in
+this repository.
 
 ## Project Goal
 
-This is a machine learning research codebase for **"From Directions to Regions: Decomposing Activations in Language Models via Local Geometry"**.
+This is a machine learning research codebase for **"From Directions to Regions:
+Decomposing Activations in Language Models via Local Geometry"**.
 
-The main idea is:
-- model LLM activations with a **Mixture of Factor Analyzers (MFA)**
-- each component is a **region** with a centroid `mu_k`
-- each region also has a **local low-rank subspace** defined by `W_k`
+The core object is a **Mixture of Factor Analyzers (MFA)** over language-model
+activations:
 
-This supports:
-- training MFA models on activations
-- analyzing regions and overlaps
-- estimating local intrinsic dimensionality
-- interpreting clusters from top-activating tokens
-- steering models with region-level structure
+- each component is a local activation region with centroid `mu_k`
+- each component has a local low-rank subspace `W_k`
+- the model supports cluster/region analysis, overlap metrics, intrinsic
+  dimension estimates, interpretation from top token contexts, and steering
 
-## What The User Cares About
+This is research code. Prefer clear, direct implementations over general
+frameworks. Keep edits small, readable, and easy to modify.
 
-The user is doing research, not building a polished production system.
-
-Priorities:
-- keep code **simple**
-- keep code **readable**
-- keep code **easy to modify**
-- prefer direct implementations over abstractions
-- do not over-engineer
-
-Do not optimize prematurely. If something is a bit repetitive but clearer, clarity wins.
-
-## Current Repository Layout
+## Repository Layout
 
 The repo uses a `src/` layout.
 
 ```text
 src/dalg/
   cli/            Main runnable entrypoints
-  models/         MFA model and training code
-  init/           Initialization / KMeans
-  data/           Dataset loaders and sharded activation streaming
-  llm/            Activation extraction from TransformerLens models
-  analysis/       Overlap, intrinsic dimension, assignments, interpretation helpers
-  intervention/   Steering code
+  models/         MFA model, component-sharded MFA, training loop
+  init/           Reservoir KMeans centroid initialization
+  data/           Window builders and activation-shard streaming
+  llm/            TransformerLens activation extraction wrapper
+  analysis/       Overlap, intrinsic dim, assignments, labels, description metrics
+  intervention/   Region/subspace steering code
 
-scripts/slurm/    Cluster job scripts
-outputs/          Generated experiment artifacts and job logs
+scripts/slurm/    Cluster job scripts for extraction, training, metrics, labels
+scripts/          Temporary/profiling/synthetic-analysis scripts
+tests/            Unit/smoke tests and synthetic shard fixtures
 notebooks/        Exploratory notebooks
-tests/            Smoke tests, synthetic-shard fixtures, equivalence checks
+outputs/          Generated local artifacts; may contain untracked reports
+logs/             Slurm logs in current scripts
+dalg-cache/       Symlink to scratch cache
+output/           Symlink to scratch output artifacts
 ```
 
 Important top-level files:
-- `pyproject.toml`: package + CLI entrypoints
-- `.vscode/launch.json`: useful local debug configs
-- `mfa_tutorial.py` and `mfa_tutorial.ipynb`: tutorial material
-- `README.md`: short project description
 
-## Main Entry Points
+- `pyproject.toml`: package metadata and console scripts
+- `README.md`: short project description
+- `.vscode/launch.json`: local debug configs when present
+- `AGENTS.md` and `CLAUDE.md`: future-agent context
+
+## Main Entrypoints
 
 Preferred CLI entrypoints are defined in `pyproject.toml`:
+
 - `dalg-run-extraction`
 - `dalg-run-training`
 - `dalg-run-metrics`
@@ -68,502 +62,542 @@ Preferred CLI entrypoints are defined in `pyproject.toml`:
 - `dalg-cluster-overlap`
 - `dalg-cluster-intrinsic-dim`
 - `dalg-build-pile-windows`
+- `dalg-build-newsgroups-windows`
 
-The three most important ones are:
-- `dalg-run-extraction` — activation extraction into on-disk shards.
-- `dalg-run-training` — MFA training (vanilla single-process, or component-sharded model-parallel).
-- `dalg-run-metrics` — cluster-level metrics (overlap, intrinsic dim) on a trained MFA.
+The main workflow is:
 
-`dalg-run-extraction` lives in `src/dalg/cli/run_extraction.py` and is a flat
-single-command CLI: it reads a pre-tokenized HF windows dataset and writes
-per-layer activation shards (resume-safe).
+```text
+token windows dataset
+  -> activation shards
+  -> centroid init
+  -> MFA training
+  -> assignments / overlap / intrinsic dim
+  -> cluster examples and LLM labels
+  -> optional description metrics / steering / notebooks
+```
 
-`dalg-run-metrics` lives in `src/dalg/cli/run_metrics.py` and has two
-subcommands:
-- `overlap`
-- `intrinsic-dim`
+There is no current `dalg-run-layer` entrypoint in `pyproject.toml`. If old
+docs or logs mention it, treat that path as stale.
 
-`dalg-run-training` lives in `src/dalg/cli/run_training.py` and is a single
-command selected by `--training-mode {vanilla, component_shard}`. The dataset
-is always a directory of pre-extracted activation shards produced by
-`dalg-run-extraction`, passed via `--shard-dir`. The older monolithic
-`activations.pt` / `tokens.pt` path and the previous `--training-mode ddp`
-data-parallel mode have been removed; if you need data parallelism, run more
-than one job rather than reintroducing DDP here.
+## Data Layout
 
-When in doubt, start from `src/dalg/cli/run_extraction.py` for extraction,
-`src/dalg/cli/run_metrics.py` for analysis, and
-`src/dalg/cli/run_training.py` for training.
+Large runs use activation shards produced by `dalg-run-extraction`.
 
-## Core Code Map
+Expected layout for `--shard-dir <root>`:
 
-### `src/dalg/models/mfa.py`
+```text
+<root>/config.json
+<root>/layerNN/shard_NNNNN.pt
+<root>/tokens/shard_NNNNN.pt
+<root>/meta/shard_NNNNN.json
+```
 
-This is the core model.
+Layer shard tensors have shape `(rows, window, d_model)`. Metadata maps shard
+rows back to global window rows and optional subset labels.
 
-Key parameters:
-- `mu`: component means, shape `(K, D)`
-- `dir_raw` and derived loadings: local directions
+`src/dalg/data/shard_activations.py` is the streaming layer:
+
+- `load_meta_index(activation_dir, layer)` returns one row entry per window
+- `stratified_split(meta_index, val_frac, seed)` builds train/val row splits
+- `per_subset_counts(meta_index, positions)` summarizes split composition
+- `ActivationBatchDataset` streams flattened token activations of shape
+  `(batch, d_model)` after dropping prefix tokens
+- set `return_metadata=True` when downstream code needs `(x, global_rows, tok_pos)`
+
+`ActivationBatchDataset` is already batched, so wrap it with
+`DataLoader(dataset, batch_size=None, ...)`.
+
+### Subset Slice Suffix (`--shard-dir <root>#<spec>`)
+
+`src/dalg/data/subset_spec.py` is a small, deletable helper that lets you re-run
+the pipeline on a filtered, randomly-subsampled slice of an existing activation
+shard directory **without re-extracting or duplicating activations**. The slice
+is encoded as a `#<spec>` suffix on the value you already pass to `--shard-dir`:
+
+```bash
+--shard-dir dalg-cache/pile_gemma2b_activations#pile_wikipedia_1M
+```
+
+The spec format is `pile_<subset>_<N>[K|M]`:
+
+- `<subset>` is resolved via `_SUBSET_ALIASES` (currently `wikipedia ->
+  pile-wikipedia_en`); other names fall back to `pile-<subset>`.
+- `<N>[K|M]` is a **token budget**, translated to
+  `ceil(N / (window - drop_prefix))` randomly chosen windows of that subset.
+- Selection is deterministic (fixed seed) so every pipeline step picks the same
+  rows; positions are returned sorted to match canonical stream order.
+
+Two functions form the whole surface:
+
+- `split_shard_dir_spec(value)` -> `(clean_path, spec_or_None)`
+- `resolve_spec_positions(meta_index, spec, *, window, drop_prefix)` -> sorted
+  positions into the full `meta_index` (all positions when `spec` is `None`)
+
+The suffix is honored end-to-end: training, `dalg-run-metrics assignments` /
+`intrinsic-dim`, the standalone `cluster_assignments`, and
+`dalg-label-mfa-clusters`. `overlap` needs no filter (pure model geometry).
+Assignments save the resolved `subset_spec`, and labeling falls back to that
+recorded value when `--shard-dir` carries no suffix, so positions are always
+inverted through the same filtered meta. When no `#<spec>` is present behavior is
+identical to before. To remove the feature: delete `subset_spec.py`, revert the
+`split_shard_dir_spec` call sites to `Path(args.shard_dir)`, and drop the
+`positions=` argument added to `stratified_split`.
+
+## Core Model and Training Code
+
+`src/dalg/models/mfa.py` contains:
+
+- `MFA`: full single-process model
+- `ComponentShardedMFA`: model-parallel MFA where each rank owns a slice of K
+- `save_mfa`, `load_mfa`, `save_component_shard`, `load_component_shards`
+- `component_shard_bounds(K, rank, world_size)`
+
+Important model parameters:
+
+- `mu`: component means, `(K, D)`
+- `dir_raw` and derived `W`: local directions/loadings
 - `scale_rho`: loading scales
 - `psi_rho`: diagonal noise
 - `pi_logits`: mixture weights
 
-Important detail:
-- likelihood and posterior computations rely on the **Woodbury identity**
-- `q` is much smaller than `D`, so many operations are done in the small latent space
+Likelihood and posterior computations use Woodbury-style small latent-space
+operations because `q << D`.
 
-Common methods:
-- `responsibilities`
-- `log_prob`
-- `nll`
-- `component_posterior`
-- `reconstruct`
+`src/dalg/models/train.py` contains `train_nll`, the main optimizer loop. It is
+distributed-aware:
 
-Serialization helpers:
-- `save_mfa`
-- `load_mfa`
-- `save_component_shard` (per-rank save for component-sharded runs)
+- rank 0 handles printing, tqdm, W&B logging, and main checkpoint bookkeeping
+- validation can use `val_tensor` or `val_loader`
+- component-sharded training saves per-rank checkpoints and synchronizes
+  gradients for replicated parameters via `sync_replicated_grads()`
 
-### `src/dalg/models/train.py`
+## Recurring Workflow: Train a New MFA
 
-Contains `train_nll`, the main optimizer loop.
-
-Important details:
-- it is distributed-aware via `torch.distributed`: when initialized, rank 0
-  drives validation and metric selection, then broadcasts the selection metric
-  so every rank stays in sync.
-- only rank 0 prints, drives `tqdm`, runs validation, and logs to W&B.
-- validation can be supplied two ways, with `val_tensor` taking priority:
-    - `val_tensor`: a pre-materialized tensor holding the whole val split
-      (typically built once on rank 0). Iterated in chunks; this is the fast
-      path used by the shard-training CLI when the val set fits in memory.
-    - `val_loader`: a regular DataLoader fallback for val sets too large to
-      materialize.
-  When both are `None`, the best-model metric falls back to training NLL.
-- it also supports component-sharded training checkpoints, where every rank
-  saves and resumes its own model/optimizer shard (`checkpoint_all_ranks=True`).
-- after each `loss.backward()` the loop calls
-  `raw_model.sync_replicated_grads()` if present, so component-sharded models
-  can sum gradients on replicated parameters before `optimizer.step()`.
-
-### `src/dalg/cli/run_training.py`
-
-The training CLI (`dalg-run-training`). Two training modes selected by
-`--training-mode`:
-
-- `vanilla` — `cmd_train`: one process, one full MFA model. Must be launched
-  with `WORLD_SIZE=1` (i.e. *not* under `torchrun`); `validate_args` rejects
-  the combination of `vanilla` and `WORLD_SIZE>1`.
-- `component_shard` — `cmd_train_component_shard`: N processes, each holds a
-  contiguous `K/N` slice of the MFA components (model-parallel over
-  components). Requires `torchrun` with `WORLD_SIZE>1` and `--device cuda`.
-
-The word "shard" is overloaded: `--shard-dir` refers to on-disk *dataset*
-shards, while `--training-mode component_shard` refers to splitting the
-*model* across processes. The two axes are independent.
-
-Shared helpers in this module:
-- `_resolve_activation_data(args, *, log)`: reads shard config / meta and
-  builds the stratified train/val row split. Returns a `dict` carrying
-  `shard_dir`, `out_dir`, `layer`, `window`, `d_model`, `drop_prefix`,
-  `n_train_tokens`, `meta_index`, `train_pos_full`, `val_pos`,
-  `train_counts`, `val_counts`, `val_frac`, `split_seed`.
-- `_build_train_loader(data, args, *, device)`: builds an
-  `ActivationBatchDataset` over `train_pos_full` wrapped in a
-  `DataLoader(batch_size=None, ...)`, returning `(loader, steps_per_epoch, train_pos)`.
-- `_materialize_val_tensor(...)` and `_build_val_tensor_for_main(data, args, *, device)`:
-  rank-0 helper that streams the validation rows into one contiguous tensor
-  (on GPU when `--val-on-gpu`, otherwise pinned CPU memory) for use as
-  `val_tensor` in `train_nll`.
-- `_ensure_centroids(data, args, *, out_dir, is_main, device, barrier)`:
-  fits and caches `centroids.pt` on rank 0 via `ReservoirKMeans`, then every
-  rank loads the cached centroids (gated by a `dist.barrier()` when relevant).
-- `_write_split_info` / `_write_run_config`: persist `val_indices.json` and
-  `config.json` next to the model output.
-- `_maybe_init_wandb` / `_finish_wandb`: rank-0-only W&B init and teardown,
-  driven by `--wandb`, `--wandb-project`, `--wandb-name`.
-- `_ComponentShardLoader`: rank-0-broadcast loader that guarantees every rank
-  sees the same activation batch in component-shard mode. Rank 0 pulls from
-  the underlying `DataLoader` and broadcasts the shape then the tensor;
-  non-zero ranks allocate an empty tensor of the broadcast shape and receive
-  the data.
-
-### `src/dalg/init/projected_knn.py`
-
-Contains `ReservoirKMeans`, used to initialize MFA centroids at scale.
-
-High-level idea:
-- stream activations from a loader
-- sample a reservoir
-- optionally project to `proj_dim`
-- run KMeans
-- refine centroids
-
-### `src/dalg/data/shard_activations.py`
-
-Very important for large runs. This is the streaming layer for pre-extracted
-activation shards produced by `dalg-run-extraction`.
-
-Expected on-disk layout (`<root>` is `--shard-dir`):
-
-```text
-<root>/config.json
-<root>/layerNN/shard_NNNNN.pt    # tensors of shape (rows, window, d_model)
-<root>/meta/shard_NNNNN.json     # per-shard row metadata: row_indices, rows[i].subset
-```
-
-Only this layout is supported now; the older "single tensor" and
-auto-synthesized-metadata code paths have been removed. There is no fallback
-to a monolithic `activations.pt`.
-
-Public surface:
-- `load_meta_index(activation_dir, layer)` returns one entry per row with
-  `shard`, `row_in_shard`, `global_row`, `subset`. Subset defaults to
-  `"all"` when missing.
-- `stratified_split(meta_index, val_frac, seed)` returns sorted
-  `(train_positions, val_positions)` stratified by `subset`. Positions index
-  into `meta_index`.
-- `per_subset_counts(meta_index, positions)` summarizes a row-position list
-  by subset.
-- `ActivationBatchDataset`: the core `IterableDataset`. Wrap with
-  `DataLoader(dataset, batch_size=None, num_workers=...)`. It already yields
-  batched activation tensors of shape `(B, d_model)`. With
-  `return_metadata=True`, it yields `(x, global_rows, tok_pos)`.
-- `ShardActivationBatchDataset`: alias of `ActivationBatchDataset` kept for
-  backwards compatibility with callers.
-
-Iteration details worth knowing:
-- Each shard is loaded with `torch.load(..., mmap=True, weights_only=True)`,
-  the prefix tokens are dropped, and rows × tokens are flattened to
-  `(N, d_model)` before being sliced into batches of size `batch_size`.
-- Multi-worker sharding: as an `IterableDataset`, every `DataLoader` worker
-  runs its own `__iter__`. The dataset partitions the shard list with
-  `shards[wid::nworkers]` so workers do not yield duplicate batches.
-- `shuffle_shards` and `shuffle_within_shard` are seeded by `seed` and by
-  the current `epoch` (set via `set_epoch`); shard-level and within-shard
-  shuffles use independent derived seeds.
-- Canonical (unshuffled) random access is available via `dataset[i]` for
-  tests and interpretation lookups; `dataset.num_items` is the flattened
-  token count, while `len(dataset)` is the number of batches.
-
-### `src/dalg/llm/activation_generator.py`
-
-Wraps TransformerLens to extract activations from a model.
-
-Supported activation modes include:
-- `residual`
-- `residual_pre`
-- `mlp`
-- `mlp_out`
-- `attn_out`
-
-### `src/dalg/analysis/`
-
-Main analysis modules:
-- `cluster_overlap.py`: pairwise overlap metrics between MFA components
-- `cluster_intrinsic_dim.py`: per-cluster PCA-based intrinsic dimension
-- `cluster_assignments.py`: save hard assignments and cluster sizes
-- `cluster_labeling.py`: helpers used by `dalg-label-mfa-clusters`
-- `subspace_interpretation.py`: top strings / examples per component
-- `subspace_visualization.py`: projection and visualization helpers
-
-### `src/dalg/cli/interpret_mfa.py`
-
-Interpretation pipeline for trained MFA models.
-
-Typical flow:
-1. stream over shards
-2. compute top-responsibility tokens per cluster
-3. recover local text context from the HF windows dataset using `global_row` / `tok_pos`
-4. optionally label clusters with an LLM
-
-## Main Workflow
-
-For large-scale work, the usual research path is:
-
-1. build token windows dataset (`dalg-build-pile-windows`)
-2. extract activations into shards (`dalg-run-extraction`)
-3. train MFA from shards (`dalg-run-training --shard-dir ...`)
-4. analyze overlaps / intrinsic dimension / assignments (`dalg-run-metrics`
-   subcommands, or the standalone `dalg-cluster-*` entrypoints)
-5. interpret regions (`dalg-interpret-mfa`, then optionally
-   `dalg-label-mfa-clusters`)
-6. optionally steer with the learned structure
-
-In practice:
-- extraction and training often happen through `scripts/slurm/`
-- local debugging often happens through `.vscode/launch.json`
-
-## Cluster / SLURM Notes
-
-The user usually works on a SLURM cluster and often debugs via VS Code remote/tunneling.
-
-Important operational assumptions:
-- you are often on a GPU node
-- local home storage is limited
-- large data usually lives in `/orfeo/scratch/dssc/zenocosini`
-- do not delete things from scratch unless explicitly asked
-
-Useful locations:
-- job scripts: `scripts/slurm/`
-- job logs: `outputs/jobs/`
-- experiment artifacts: `outputs/experiments/`
-- scratch/cache symlink: `dalg-cache/`
-- scratch experiment symlink: `output/`
-
-Important scripts:
-- `scripts/slurm/sbatch_train_shards.sh` — single-process vanilla shard
-  training (one GPU, full MFA on one rank).
-- `scripts/slurm/sbatch_train_component_shards.sh` — component-sharded MFA
-  training launched under `torchrun`.
-
-Together these mirror the real production training shape more than small
-local runs do.
-
-## Scratch Symlinks
-
-The repo has two top-level symlinks into scratch storage:
-- `dalg-cache/` -> `/orfeo/scratch/dssc/zenocosini/dalg-cache/`
-- `output/` -> `/orfeo/scratch/dssc/zenocosini/dalg-cache/output/`
-
-Some scratch paths may also appear through older direct aliases such as
-`/orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations` or
-`/orfeo/scratch/dssc/zenocosini/pile_gemma2b_100M_windows/merged`. When a
-scratch path looks missing, check the symlink target and the `dalg-cache/...`
-form before assuming data was deleted.
-
-These point to large generated data. Treat them like scratch experiment state:
-- do not delete or overwrite large files there unless the user explicitly asks
-- prefer writing new large artifacts under these symlinks instead of home storage
-- use `output/` for analysis artifacts from recent runs; note that older docs may say `outputs/`
-
-Current `dalg-cache/` contents:
-- `pile_gemma2b_100M_windows/`: Hugging Face token-window dataset built from the Pile for Gemma 2B activation extraction.
-- `pile_gemma2b_100M_windows/shards/`: intermediate window shards from dataset construction.
-- `pile_gemma2b_100M_windows/merged/`: merged HF dataset with Arrow files plus `dataset_info.json` and `state.json`.
-- `pile_gemma2b_activations_debug/`: small debug activation extraction output.
-- `pile_gemma2b_activations_debug/layer05/`: debug layer 5 activation shard tensors.
-- `pile_gemma2b_activations_debug/layer17/`: debug layer 17 activation shard tensors.
-- `pile_gemma2b_activations_debug/tokens/`: debug token shard tensors aligned with activation shards.
-- `pile_gemma2b_activations_debug/meta/`: debug per-shard JSON metadata.
-- `pile_gemma2b_activations/`: main Gemma 2B activation cache and trained MFA run folders.
-- `pile_gemma2b_activations/layer05/`: main layer 5 activation shard tensors.
-- `pile_gemma2b_activations/layer17/`: main layer 17 activation shard tensors.
-- `pile_gemma2b_activations/tokens/`: token shard tensors aligned with the main activations.
-- `pile_gemma2b_activations/meta/`: per-shard JSON metadata for the main activations.
-- `pile_gemma2b_activations/layer*_????_mfa/` and `layer05_mfa_32000/`: MFA training outputs for specific layers and cluster counts; typical files include `config.json`, `centroids.pt`, `checkpoint.pt`, `mfa_model.pt`, `overlap.pt`, `val_indices.json`, and assignment tensors.
-- `output/`: nested output symlink target used for experiment analysis artifacts.
-- `pile_gemma2b_build.log`: build/extraction log for the Gemma 2B Pile cache.
-
-Current `output/` contents:
-- `output/experiments/`: analysis outputs such as `intrinsic_dims.pt`, `overlap.pt`, PCA plots, heatmaps, histograms, dendrograms, and cluster-size plots.
-- `output/experiments/1000_05/`, `1000_17/`, `8000_05/`, `8000_17/`, `32000_05/`, `32000_17/`: experiment folders named by cluster count and layer.
-- `output/experiments/*_backup/`: backup copies of earlier experiment analysis outputs.
-- `output/experiments/8000_05_assignments_only/`: assignments-only experiment output folder.
-
-## Local Development / Debugging
-
-The repo uses a virtual environment in `.venv`.
-
-Typical setup:
+Most training starts from an existing activation shard directory. If activations
+do not exist yet, build token windows first and run extraction:
 
 ```bash
-source .venv/bin/activate
+uv run dalg-run-extraction \
+  --dataset /path/to/windows_dataset \
+  --out-dir /path/to/activation_shards \
+  --model google/gemma-2b \
+  --layers 5 17 \
+  --mode residual \
+  --extract-batch-size 16 \
+  --shard-size 512 \
+  --dtype float16 \
+  --drop-prefix 32 \
+  --device cuda
 ```
 
-When using package imports locally without installing the package, `PYTHONPATH=src` is often needed.
+Extraction writes `config.json`, per-layer activation shards, token shards, and
+metadata. It is designed to be resume-safe.
 
-VS Code launch configs already account for this.
+### Vanilla Training
 
-On Apple Silicon or mixed backends:
+Use vanilla mode for one process holding the full MFA on one GPU:
 
 ```bash
-export PYTORCH_ENABLE_MPS_FALLBACK=1
+uv run dalg-run-training \
+  --shard-dir /path/to/activation_shards \
+  --layer 5 \
+  --out-dir /path/to/activation_shards/layer05_1000_10_mfa \
+  --K 1000 \
+  --rank 10 \
+  --epochs 20 \
+  --refine-epochs 10 \
+  --batch-size 2048 \
+  --num-workers 2 \
+  --val-frac 0.008 \
+  --split-seed 42 \
+  --device cuda \
+  --seed 42 \
+  --training-mode vanilla
 ```
 
-## Data / Batch Conventions
+Relevant Slurm script:
 
-Some recurring conventions across the codebase:
-- shard loaders usually yield activation batches `x`; optional metadata batches are `(x, global_row, tok_pos)`
-- `ActivationBatchDataset.__len__` is number of batches; use `dataset.num_items` for flattened token count and `dataset[n]` for canonical random access
-- shard-based training uses token windows and drops a prefix (`drop_prefix`) before training
-- positive MFA parameters are represented via raw tensors passed through `softplus`
-- many analysis utilities stream activations instead of loading everything into memory
+- `scripts/slurm/sbatch_train_shards.sh`
 
-Do not casually change these conventions unless the caller chain is checked carefully.
+Vanilla outputs usually include:
 
-## Docstring
-Docstrings and comments need to explain the code, not the changes you have just made to the code. For example, if I ask you to refactor the training loop to be more modular, the docstring should not say "refactored the training loop to be more modular", it should explain how the training loop works and what each part does. The docstring should be written as if the reader has no context about the recent changes, and should provide a clear understanding of the code's functionality and purpose.
+- `config.json`
+- `val_indices.json`
+- `centroids.pt`
+- `checkpoint.pt`
+- `mfa_model.pt`
 
-## Important Implementation Details
+Notes:
 
-### Sharded training
+- Do not launch vanilla mode under `torchrun`; `validate_args` rejects
+  `WORLD_SIZE > 1`.
+- `--centroids-path` can reuse an existing `centroids.pt` or directory
+  containing one.
+- If `--out-dir` is omitted, the default is under `--shard-dir` with a
+  layer/K-based name.
+- W&B is opt-in with `--wandb --wandb-project ... --wandb-name ...`.
 
-`dalg-run-training` always reads from on-disk activation shards
-(`--shard-dir`). The two training modes differ only in how the model is
-distributed across processes:
+### Component-Sharded Training
 
-1. **Vanilla mode** (`--training-mode vanilla`, default)
-   - Single process. Must run with `WORLD_SIZE=1`; do not launch under
-     `torchrun`.
-   - Holds a full MFA model on one device.
-   - Saves the usual full-model files: `mfa_model.pt`, `checkpoint.pt`,
-     `centroids.pt`, `config.json`, `val_indices.json`.
-   - Reference Slurm script: `scripts/slurm/sbatch_train_shards.sh`.
+Use component-sharded mode when the full K x D x q model is too large for one
+GPU. This is model parallelism over mixture components, not data parallelism:
+every rank sees the same activation batch, and each rank owns a contiguous
+component slice.
 
-2. **Component-sharded / model-parallel mode** (`--training-mode component_shard`)
-   - Launched under `torchrun` with `WORLD_SIZE>1` and `--device cuda`.
-   - Reference Slurm script: `scripts/slurm/sbatch_train_component_shards.sh`.
-   - Each rank owns a contiguous slice of the MFA components `K`. For
-     example, with `K=8000` and 4 ranks, each rank owns about 2000 components.
-   - Every rank must see the same activation batches in the same order. This
-     is **not** data parallelism. `_ComponentShardLoader` enforces this by
-     having rank 0 read the batch and `dist.broadcast` it to other ranks.
-   - Increasing GPUs reduces per-rank component memory instead of increasing
-     the effective data batch.
-   - `BATCH` is the logical batch each component shard sees. It should not be
-     multiplied by world size when reasoning about the effective batch.
-   - Validation is currently skipped in component-shard mode: `train_nll` is
-     called with `val_tensor=None` and the best-epoch metric falls back to
-     training NLL. Use `VAL_FRAC=0.0` in Slurm scripts unless a future agent
-     implements distributed validation.
-   - `load_mfa` can assemble final component-sharded saves from
-     `mfa_model_shards.json`. It also supports the historical pattern of
-     passing `<run_dir>/mfa_model.pt` when that file is absent but
-     `<run_dir>/mfa_model_shards.json` exists. This assembles a full MFA in
-     memory, so it can still be too large for some downstream analysis jobs.
+```bash
+uv run python -m torch.distributed.run --standalone --nproc_per_node=2 \
+  -m dalg.cli.run_training \
+  --shard-dir /path/to/activation_shards \
+  --layer 5 \
+  --out-dir /path/to/activation_shards/layer05_8000_10_component_sharded_mfa \
+  --K 8000 \
+  --rank 10 \
+  --epochs 15 \
+  --refine-epochs 10 \
+  --batch-size 8192 \
+  --num-workers 4 \
+  --val-frac 0.05 \
+  --split-seed 42 \
+  --early-stop-delta 1e-3 \
+  --device cuda \
+  --seed 42 \
+  --training-mode component_shard \
+  --compile
+```
 
-There is no longer a `ddp` (data-parallel) mode. If a path in the repo or in
-old docs refers to one, treat it as stale.
+Relevant Slurm script:
 
-Shared startup behaviour for both modes:
-- rank 0 (or the single process in vanilla mode) computes centroids and saves
-  them to `<out_dir>/centroids.pt`; in distributed mode other ranks wait at a
-  `dist.barrier()` and then load the cached centroids.
-- many debugging issues appear only in the distributed path, not in
-  single-process training, so reproduce locally with the small synthetic
-  shards under `tests/fixtures/` when possible.
+- `scripts/slurm/sbatch_train_component_shards.sh`
 
-Important component-sharded implementation details:
-- `ComponentShardedMFA` lives in `src/dalg/models/mfa.py`.
-- Component ownership is assigned by `component_shard_bounds(K, rank, world_size)`.
-- The mixture likelihood is assembled with a distributed logsumexp over the
-  component dimension. Be careful with autograd here: every rank participates
-  in the same logical loss, so a naive autograd-aware all-reduce can
-  double-count gradients.
-- The shared diagonal noise parameter `psi_rho` is replicated when
-  `psi_per_component=False` (the default). Its gradient must be summed across
-  ranks before `optimizer.step()`. This is handled by
-  `ComponentShardedMFA.sync_replicated_grads()` and called from `train_nll`.
-- Component-local parameters such as `mu`, `dir_raw`, `scale_rho`, and local
-  `pi_logits` should not be DDP-wrapped or all-reduced.
+Component-sharded outputs include:
 
-Component-sharded checkpointing:
-- Do **not** gather and save one full model checkpoint on rank 0 for large
-  runs. For `K=8000`, `D=2048`, `q=160`, the full `dir_raw` tensor alone is
-  about 10 GiB in fp32, before Adam state.
-- Component-sharded training saves per-rank checkpoints:
-  - `checkpoint_rank0000.pt`
-  - `checkpoint_rank0001.pt`
-  - ...
-  - `checkpoint_shards.json`
-- Each rank checkpoint contains that rank's local model shard, local optimizer
-  state, epoch, and RNG state.
-- Resume assumes the same world size and rank-to-component mapping. If you
-  change the number of GPUs, expect shape mismatches or invalid optimizer
-  state unless explicit repartitioning support has been added.
-- Final component-sharded model saves are also per-rank:
-  - `mfa_model_rank0000.pt`
-  - `mfa_model_rank0001.pt`
-  - ...
-  - `mfa_model_shards.json`
-- A component-sharded run usually does not have a single `mfa_model.pt`.
-  `load_mfa` supports sharded model manifests, so point tools at the
-  sharded model path/manifest instead of assuming `mfa_model.pt` exists.
+- `config.json`
+- `val_indices.json`
+- `centroids.pt`
+- `checkpoint_rank0000.pt`, `checkpoint_rank0001.pt`, ...
+- `checkpoint_shards.json`
+- `mfa_model_rank0000.pt`, `mfa_model_rank0001.pt`, ...
+- `mfa_model_shards.json`
 
-Testing component-sharded changes:
-- Use `tests/component_sharded_mfa_equivalence.py` for a small serial-vs-sharded
-  equivalence check. It builds a full serial MFA and a two-rank sharded MFA
-  from identical weights, trains both on the same batches, gathers the shards,
-  and compares parameters.
-- A useful local CPU command is:
+Notes:
+
+- Launch with `torchrun`; `--device cuda` and `WORLD_SIZE > 1` are required.
+- Increasing GPUs reduces per-rank component memory. It does not increase the
+  logical batch size.
+- `_ComponentShardLoader` broadcasts rank-0 training batches so all ranks train
+  on identical data.
+- Validation currently uses a deterministic `val_loader` on every rank, so each
+  rank participates in the same distributed likelihood calls.
+- `load_mfa(<run_dir>/mfa_model.pt)` falls back to assembling from
+  `<run_dir>/mfa_model_shards.json` when the `.pt` file is absent. This can be
+  memory-heavy for large K.
+- Do not gather and save a single full checkpoint for large component-sharded
+  runs.
+
+Useful smoke test:
 
 ```bash
 PYTHONPATH=src python -m torch.distributed.run --standalone --nproc_per_node=2 \
   tests/component_sharded_mfa_equivalence.py --device cpu --optimizer adam --steps 4
 ```
 
-- For CUDA, run the same script under a two-GPU Slurm allocation with
-  `--device cuda`.
-- Also test the actual CLI path with a tiny synthetic shard dataset before
-  launching a large job, because the CLI path covers centroid loading,
-  checkpoint manifests, and final per-rank shard saves. `tests/fixtures/`
-  and `tests/synthetic_shards.py` provide ready-made small shard layouts
-  compatible with `ActivationBatchDataset`.
+## Recurring Workflow: Compute Metrics
 
-### W&B logging
+Use `dalg-run-metrics` for current metric workflows. `--data-dir` accepts either
+a run directory containing `mfa_model.pt` / `mfa_model_shards.json`, or a direct
+path to a `.pt` model file.
 
-`train_nll` logs to Weights & Biases on rank 0 only when `wandb.run` is
-active. Initialization is opt-in via `--wandb`, `--wandb-project`,
-`--wandb-name`, handled by `_maybe_init_wandb` / `_finish_wandb` in
-`run_training.py`. When `--wandb` is not passed the logging calls degrade to
-no-ops, so the loop has no extra dependency at runtime.
+### Overlap
 
-### Outputs
+```bash
+uv run dalg-run-metrics overlap \
+  --data-dir /path/to/mfa_run \
+  --out-dir /path/to/output_dir \
+  --device cuda \
+  --batch-pairs 512
+```
 
-Generated outputs should generally go under:
-- `outputs/jobs/`
-- `outputs/experiments/`
+Output:
 
-Avoid scattering logs and generated files across source directories.
+- `overlap.pt`
 
-### Tutorial files
+For high-rank models, reduce `--batch-pairs` to avoid GPU OOM. The Slurm metrics
+script uses `512` for large `q`.
 
-`mfa_tutorial.py` is not a normal clean Python script; it contains notebook-style magics and is closer to a synced notebook representation.
+### Intrinsic Dimension
 
-Be careful when linting or compiling it.
+Intrinsic dimension can stream from activation shards and can optionally reuse
+precomputed assignments:
 
-## Guidance For Future Agents
+```bash
+uv run dalg-run-metrics intrinsic-dim \
+  --data-dir /path/to/mfa_run \
+  --shard-dir /path/to/activation_shards \
+  --layer 5 \
+  --out-dir /path/to/output_dir \
+  --device cuda \
+  --pca-device cpu \
+  --pca-workers 8 \
+  --assignments-path /path/to/mfa_model_assignments.pt \
+  --variance-threshold 0.90 \
+  --min-population 100 \
+  --max-samples-per-cluster 2000
+```
 
-When modifying this repo:
-- preserve the user's research-first style
-- prefer small, local edits
-- avoid heavy abstractions
-- do not turn the code into a framework
-- keep command paths and SLURM flows aligned with the current package layout
+Output:
 
-When investigating bugs:
-- first determine whether the issue is in the single-process path or the
-  distributed component-shard path
-- check `scripts/slurm/` and `.vscode/launch.json`
-- inspect `outputs/jobs/` logs
+- `intrinsic_dims.pt`
 
-When adding new analysis code:
-- prefer putting reusable logic under `src/dalg/analysis/`
-- expose a CLI only if it is genuinely useful as a standalone workflow
+Relevant Slurm script:
 
-When adding new runnable workflows:
-- prefer package entrypoints over ad hoc top-level scripts
+- `scripts/slurm/sbatch_metrics.sh`
 
-## TODO
+### Description Metrics
 
-- Make model-loading CLI arguments more explicit for full vs sharded MFA runs,
-  e.g. avoid implying every run has a literal `mfa_model.pt` when
-  component-sharded outputs are loaded through `mfa_model_shards.json`.
-- Distributed validation for component-sharded training (today it is skipped
-  and best-epoch falls back to training NLL).
+After clusters have labels, `dalg-run-metrics` can score or compare label text:
 
-## Things To Avoid
+```bash
+uv run dalg-run-metrics description-fit \
+  --labels-path /path/to/cluster_labels.json \
+  --out-dir /path/to/cluster_labels \
+  --positive-examples 8 \
+  --negative-examples 8 \
+  --judge-workers 4
 
-- do not reintroduce old imports like `from modeling...` or `from experiments...`
-- do not add new generated outputs inside source folders
-- do not over-abstract simple research code
-- do not delete scratch data or large experiment outputs unless the user explicitly asks
+uv run dalg-run-metrics description-semantics \
+  --labels-path /path/to/cluster_labels.json \
+  --out-dir /path/to/cluster_labels \
+  --embedding-device cpu \
+  --top-k 25 \
+  --similarity-threshold 0.70
+```
 
-## Short Mental Model
+Outputs:
 
-If you need a quick picture of the repo:
+- `description_fit.json`
+- `description_semantics.pt` and related JSON summaries
 
-**windows dataset -> activation shards -> centroid init -> MFA training -> analysis / interpretation / steering**
+## Recurring Workflow: Compute Assignments
 
-That is the backbone of the project.
+Assignments stream activation shards through a trained MFA, compute
+responsibilities, store the hard argmax cluster for each token, and accumulate
+cluster sizes plus responsibility-peakedness statistics.
+
+Preferred current command:
+
+```bash
+uv run dalg-run-metrics assignments \
+  --data-dir /path/to/mfa_run \
+  --shard-dir /path/to/activation_shards \
+  --layer 5 \
+  --batch-size 1024 \
+  --device cuda
+```
+
+Equivalent direct module:
+
+```bash
+uv run python -m dalg.analysis.cluster_assignments \
+  --model-path /path/to/mfa_run/mfa_model.pt \
+  --shard-dir /path/to/activation_shards \
+  --layer 5 \
+  --batch-size 1024 \
+  --device cuda
+```
+
+Default output:
+
+- `<run_dir>/mfa_model_assignments.pt`
+
+Saved fields:
+
+- `cluster_sizes`: `(K,)`
+- `assignments`: `(N,)` hard cluster id for each streamed token
+- `max_responsibilities`: `(N,)`
+- `peakedness`: per-cluster means for entropy, one-minus-max, and top1-minus-top2
+- `K`
+
+Relevant Slurm scripts:
+
+- `scripts/slurm/sbatch_assignments.sh`
+- `scripts/slurm/sbatch_epoch_assignments.sh`
+
+Notes:
+
+- `--drop-prefix` defaults to the value in `<shard-dir>/config.json`.
+- Use `--max-batches` for smoke tests.
+- Assignments are useful before intrinsic-dim and required by the preferred
+  label workflow.
+
+## Recurring Workflow: Label MFA Gaussians
+
+The preferred labeling path starts from assignments, finds the top activation
+examples per cluster, recovers token-window contexts from the HF windows
+dataset, and optionally calls the Orfeo-hosted LLM to produce labels.
+
+```bash
+uv run dalg-label-mfa-clusters \
+  --assignments-path /path/to/mfa_run/mfa_model_assignments.pt \
+  --shard-dir /path/to/activation_shards \
+  --layer 5 \
+  --windows-dataset /path/to/windows_dataset/merged \
+  --tokenizer google/gemma-2b \
+  --out-dir /path/to/output_dir/cluster_labels \
+  --top-n 50 \
+  --max-examples-per-cluster 25 \
+  --pad 10 \
+  --chunk-size 2000000 \
+  --llm-workers 4 \
+  --llm-temperature 0.0 \
+  --llm-max-tokens 512
+```
+
+Outputs:
+
+- `top_activations.pt`
+- `cluster_examples.json`
+- `cluster_labels.json`
+
+Relevant Slurm script:
+
+- `scripts/slurm/sbatch_label_mfa_clusters.sh`
+
+Useful options:
+
+- `--skip-llm`: build top activations and context examples without calling the LLM
+- `--clusters 1 2 3`: label specific clusters
+- `--max-clusters N`: debug on first N clusters
+- `--top-index-path`: reuse or control the cached top-activation index path
+
+`dalg-interpret-mfa` is an older/more integrated interpretation CLI. It can use
+an assignments file when present, otherwise it falls back to scanning the model
+for top responsibilities. Prefer `dalg-label-mfa-clusters` when assignments have
+already been computed.
+
+## Temporary Workflow: Synthetic MFA Analyses
+
+There is an active temporary research workflow under `scripts/` and
+`notebooks/` for synthetic MFA experiments. Treat it as analysis code, not core
+library API.
+
+Main script:
+
+- `scripts/synthetic_mfa_qk_sweep.py`
+
+Purpose:
+
+- generate data from a known MFA
+- fit MFA models over a grid of fitted `K` and `q`
+- record responsibility peakiness and label-recovery metrics
+- collect results and plots
+
+Typical commands:
+
+```bash
+PYTHONPATH=src python scripts/synthetic_mfa_qk_sweep.py generate-dataset \
+  --dataset-path /orfeo/scratch/dssc/zenocosini/dalg-cache/assets/synthetic_mfa_Ktrue1000_qtrue20_D500_seed0.pt \
+  --D 500 --K-true 1000 --q-true 20 \
+  --n-train 500000 --n-test 10000 --seed 0
+
+PYTHONPATH=src python scripts/synthetic_mfa_qk_sweep.py fit-one \
+  --dataset-path /path/to/synthetic_dataset.pt \
+  --model-root dalg-cache/qk_sweep_exploration \
+  --run-name Ktrue1000_qtrue20 \
+  --K-fit 1250 --q-fit 20 \
+  --device cuda
+
+PYTHONPATH=src python scripts/synthetic_mfa_qk_sweep.py collect-results \
+  --model-root dalg-cache/qk_sweep_exploration \
+  --run-name Ktrue1000_qtrue20
+```
+
+Related scripts:
+
+- `scripts/slurm/sbatch_synthetic_qk_sweep.sh`: Slurm array over fitted K, with
+  an inner loop over q values
+- `scripts/synthetic_mfa_bhattacharyya_by_q.py`: post-hoc overlap/Bhattacharyya
+  summaries across q for a fixed fitted K
+- `scripts/synthetic_mfa_feature_splitting.py`: feature-splitting and covariance
+  reconstruction analysis over fitted sweep models
+- `scripts/slurm/sbatch_feature_splitting.sh`: Slurm wrapper for feature
+  splitting
+- `notebooks/synthetic_mfa_qk_sweep_results.ipynb`: exploratory result notebook
+- `outputs/experiments/synthetic_qk_sweep_report/`: offline report artifacts
+
+Generated synthetic models can be very large and live under `dalg-cache/`.
+Do not delete or overwrite them unless the user explicitly asks.
+
+## Cluster and Scratch Notes
+
+The user usually works on a Slurm cluster and often debugs via VS Code remote or
+tunneling.
+
+Common locations:
+
+- `scripts/slurm/`: cluster job scripts
+- `logs/jobs/` and `logs/experiments/`: current Slurm log targets
+- `outputs/experiments/`: generated local/repo artifacts
+- `dalg-cache/`: symlink to `/orfeo/scratch/dssc/zenocosini/dalg-cache/`
+- `output/`: symlink to scratch output artifacts
+
+Large data generally belongs on scratch, not home storage. Prefer writing new
+large artifacts under `dalg-cache/` or `output/`. Do not delete scratch data or
+large experiment outputs unless explicitly asked.
+
+Useful known scratch contents include:
+
+- `dalg-cache/pile_gemma2b_100M_windows/merged/`
+- `dalg-cache/pile_gemma2b_activations/`
+- `dalg-cache/pile_gemma2b_activations_debug/`
+- `dalg-cache/qk_sweep_exploration/`
+
+Older direct aliases such as `/orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations`
+may still appear in scripts or logs. Check symlink targets before assuming data
+is missing.
+
+## Local Development
+
+The repo commonly uses `.venv` or `uv run`.
+
+Typical local setup:
+
+```bash
+source .venv/bin/activate
+export PYTHONPATH=src
+```
+
+For Apple Silicon or mixed backends:
+
+```bash
+export PYTORCH_ENABLE_MPS_FALLBACK=1
+```
+
+Useful tests:
+
+```bash
+PYTHONPATH=src pytest tests/test_train.py
+PYTHONPATH=src pytest tests/test_shard_activations
+PYTHONPATH=src pytest tests/test_cluster_labeling.py
+PYTHONPATH=src pytest tests/test_description_metrics.py
+PYTHONPATH=src python -m torch.distributed.run --standalone --nproc_per_node=2 \
+  tests/component_sharded_mfa_equivalence.py --device cpu --optimizer adam --steps 4
+```
+
+## Implementation Guidance
+
+- Preserve the research-first style.
+- Prefer direct code over abstractions unless the abstraction removes real
+  complexity.
+- Do not reintroduce stale imports like `from modeling...` or
+  `from experiments...`.
+- Do not reintroduce the old monolithic training path as the primary path.
+  Current training expects activation shards through `--shard-dir`.
+- Do not reintroduce DDP data-parallel training into `dalg-run-training`.
+  Component sharding is model parallel over K.
+- Keep command paths and Slurm scripts aligned with package entrypoints.
+- Put reusable analysis logic under `src/dalg/analysis/`; expose a CLI only
+  when it is useful as a standalone workflow.
+- Comments and docstrings should explain what the code does, not narrate recent
+  changes.
+- Avoid generated outputs inside source folders.
+- When I ask you to implement an experimental module the guiding principle is: **implement something easy to add and easy to remove**. Avoid overengineering or overgeneralizing.

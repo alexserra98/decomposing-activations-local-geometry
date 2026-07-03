@@ -105,6 +105,37 @@ def write_csv(rows: list[dict], path: Path) -> None:
         writer.writerows(rows)
 
 
+def save_summary(
+    rows_by_key: dict[tuple[int, int, int], dict],
+    *,
+    out_csv: Path,
+    out_pt: Path,
+    run_dir: Path,
+    k_fit: int,
+    seed: int,
+    metric: str,
+    batch_pairs: int,
+) -> list[dict]:
+    """Persist the q summary accumulated so far."""
+    rows = [rows_by_key[key] for key in sorted(rows_by_key)]
+    rows = sorted(rows, key=lambda row: (row["K_fit"], row["q_fit"], row["seed"]))
+    write_csv(rows, out_csv)
+    torch.save(
+        {
+            "rows": rows,
+            "meta": {
+                "run_dir": str(run_dir),
+                "K_fit": int(k_fit),
+                "seed": int(seed),
+                "metric": metric,
+                "batch_pairs": int(batch_pairs),
+            },
+        },
+        out_pt,
+    )
+    return rows
+
+
 def load_or_compute_overlap(
     fit_dir: Path,
     *,
@@ -312,40 +343,54 @@ def main() -> None:
             result_iter = executor.map(worker, sorted_fits)
             for n, row in enumerate(result_iter, 1):
                 rows_by_key[(row["K_fit"], row["q_fit"], row["seed"])] = row
+                rows = save_summary(
+                    rows_by_key,
+                    out_csv=out_csv,
+                    out_pt=out_pt,
+                    run_dir=args.run_dir,
+                    k_fit=args.k_fit,
+                    seed=int(args.seed),
+                    metric=args.metric,
+                    batch_pairs=args.batch_pairs,
+                )
                 print(
                     f"[{n}/{len(sorted_fits)}] K={row['K_fit']:>4} q={row['q_fit']:>4} seed={row['seed']} "
                     f"{row['status']} | mean={row['mean_offdiag']:.4f} "
                     f"min={row['min_offdiag']:.4f} max={row['max_offdiag']:.4f} "
-                    f"| {row['seconds']:.1f}s",
+                    f"| {row['seconds']:.1f}s | saved {len(rows)} rows",
                     flush=True,
                 )
     else:
         for n, fit in enumerate(sorted_fits, 1):
             row = worker(fit)
             rows_by_key[(row["K_fit"], row["q_fit"], row["seed"])] = row
+            rows = save_summary(
+                rows_by_key,
+                out_csv=out_csv,
+                out_pt=out_pt,
+                run_dir=args.run_dir,
+                k_fit=args.k_fit,
+                seed=int(args.seed),
+                metric=args.metric,
+                batch_pairs=args.batch_pairs,
+            )
             print(
                 f"[{n}/{len(sorted_fits)}] K={row['K_fit']:>4} q={row['q_fit']:>4} seed={row['seed']} "
                 f"{row['status']} | mean={row['mean_offdiag']:.4f} "
                 f"min={row['min_offdiag']:.4f} max={row['max_offdiag']:.4f} "
-                f"| {row['seconds']:.1f}s",
+                f"| {row['seconds']:.1f}s | saved {len(rows)} rows",
                 flush=True,
             )
 
-    rows = [rows_by_key[key] for key in sorted(rows_by_key)]
-    rows = sorted(rows, key=lambda row: (row["K_fit"], row["q_fit"], row["seed"]))
-    write_csv(rows, out_csv)
-    torch.save(
-        {
-            "rows": rows,
-            "meta": {
-                "run_dir": str(args.run_dir),
-                "K_fit": int(args.k_fit),
-                "seed": int(args.seed),
-                "metric": args.metric,
-                "batch_pairs": int(args.batch_pairs),
-            },
-        },
-        out_pt,
+    rows = save_summary(
+        rows_by_key,
+        out_csv=out_csv,
+        out_pt=out_pt,
+        run_dir=args.run_dir,
+        k_fit=args.k_fit,
+        seed=int(args.seed),
+        metric=args.metric,
+        batch_pairs=args.batch_pairs,
     )
     print(f"\nsaved {len(rows)} rows -> {out_csv}\n                -> {out_pt}", flush=True)
 
