@@ -429,6 +429,113 @@ Notes:
 - Assignments are useful before intrinsic-dim and required by the preferred
   label workflow.
 
+### Nearest-Medoid / Nearest-Centroid Assignments
+
+`dalg-run-metrics assignments` also supports non-MFA centroids/medoids. Pass
+`--medoids-path` (alias `--centroids-path`) instead of `--data-dir`; the command
+streams the same activation shards but assigns each activation to the nearest
+Euclidean centroid.
+
+```bash
+PYTHONPATH=src .venv/bin/python -m dalg.cli.run_metrics assignments \
+  --medoids-path outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/k12/medoids.npy \
+  --shard-dir /orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations#pile_wikipedia_100K \
+  --layer 5 \
+  --batch-size 8192 \
+  --device cuda \
+  --save-path outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/k12/run_metrics_nearest_centroid_assignments.pt
+```
+
+Implementation:
+
+- `src/dalg/analysis/nearest_centroid_assignments.py` contains
+  `compute_nearest_centroid_assignments(...)` and the direct CLI.
+- `src/dalg/cli/run_metrics.py::cmd_assignments` chooses the MFA path when
+  `--data-dir` is passed and the nearest-centroid path when `--medoids-path` is
+  passed.
+
+Saved nearest-centroid fields:
+
+- `cluster_sizes`: `(K,)`
+- `assignments`: `(N,)`
+- `min_distances`: `(N,)`
+- `K`
+- `centroids_path`
+- `subset_spec`
+- `source`
+
+## Temporary Workflow: Wikipedia KMedoids Slice
+
+This workflow materializes the deterministic Wikipedia slice and runs KMedoids
+on it. It is experimental analysis code, not core library API.
+
+The native subset-suffix path is still streaming: `#pile_wikipedia_100K`
+resolves row positions and `ActivationBatchDataset` emits flattened activation
+batches from the original shards. `activations.npy` is only a derived,
+random-access cache for KMedoids/CLARA.
+
+Files:
+
+- `scripts/materialize_subset_activations.py`: streams a subset-spec shard
+  selection to the derived cache `activations.npy`.
+- `scripts/run_kmedoids.py`: runs CLARA-style KMedoids and saves medoids,
+  labels, medoid indices, distances, and config. `labels.npy` is the
+  nearest-medoid assignment for each row of `activations.npy`.
+- `tests/test_nearest_centroid_assignments.py`: unit tests for nearest-centroid
+  assignment.
+
+Clean 100K run:
+
+- Run root:
+  `outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/full_100k_clean`
+- Logs:
+  `full_100k_clean/logs/materialize.log` and
+  `full_100k_clean/logs/run_kmedoids.log`
+
+Commands that were run:
+
+```bash
+mkdir -p outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/full_100k_clean/logs
+
+PYTHONPATH=src .venv/bin/python scripts/materialize_subset_activations.py \
+  --shard-dir /orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations#pile_wikipedia_100K \
+  --layer 5 \
+  --out-dir outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/full_100k_clean/data \
+  > outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/full_100k_clean/logs/materialize.log 2>&1
+
+PYTHONPATH=src .venv/bin/python scripts/run_kmedoids.py \
+  --activations-path outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/full_100k_clean/data/activations.npy \
+  --K 12 \
+  --out-dir outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/full_100k_clean/k12 \
+  --device cuda \
+  > outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/full_100k_clean/logs/run_kmedoids.log 2>&1
+```
+
+Verified outputs:
+
+- `full_100k_clean/data/metadata.json`: `subset_spec=pile_wikipedia_100K`,
+  `resolved_rows=447`, `resolved_items=100128`,
+  `materialized_items=100128`, `shape=[100128, 2048]`
+- `full_100k_clean/data/activations.npy`: `(100128, 2048)`, `float32`
+- `full_100k_clean/k12/medoids.npy`: `(12, 2048)`, `float32`
+- `full_100k_clean/k12/labels.npy`: `(100128,)`
+- `full_100k_clean/k12/config.json`: backend, cluster sizes, paths, and any
+  sklearn-extra fallback error
+
+Do not recompute assignments with `dalg-run-metrics assignments --medoids-path`
+after `run_kmedoids.py` unless a later step specifically needs the `.pt`
+assignment-bundle format. For the materialized-array workflow, `labels.npy` is
+already the assignment output.
+
+KMedoids package note:
+
+- `pyproject.toml` includes `scikit-learn-extra>=0.3.0`.
+- In this environment, `sklearn_extra.cluster.CLARA` installs but fails to
+  import with NumPy 2.4 ABI errors.
+- `scripts/run_kmedoids.py` therefore tries `sklearn-extra` first and falls
+  back to a small local CLARA-style implementation. The backend and import error
+  are recorded in `full_100k_clean/k12/config.json`.
+
 ## Recurring Workflow: Label MFA Gaussians
 
 The preferred labeling path starts from assignments, finds the top activation

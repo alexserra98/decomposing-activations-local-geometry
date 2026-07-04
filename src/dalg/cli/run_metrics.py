@@ -4,8 +4,9 @@ CLI for cluster-level metrics on a trained MFA.
 Subcommands:
     overlap        Pairwise overlap metrics between MFA components.
     intrinsic-dim  PCA-based intrinsic dimensionality per cluster.
-    assignments    Hard cluster assignments + per-cluster peakedness stats
-                   (streams activations through the MFA in one pass).
+    assignments    Hard cluster assignments. With an MFA, streams activations
+                   through responsibilities; with medoids, assigns by nearest
+                   Euclidean centroid.
     description-fit
                    Description-vs-context metrics for labeled clusters.
     description-semantics
@@ -117,25 +118,29 @@ def cmd_intrinsic_dim(args) -> None:
 
 
 def cmd_assignments(args) -> None:
-    """Compute hard cluster assignments and per-cluster peakedness stats.
+    """Compute hard cluster assignments.
 
-    Streams activations from ``--shard-dir`` (at ``--layer``) through the
-    MFA, takes the argmax of the responsibilities per token, and saves
-    cluster sizes, hard assignments, max responsibility per sample, and
-    mean per-cluster peakedness metrics to a ``.pt`` file.
+    Streams activations from ``--shard-dir`` (at ``--layer``). By default it
+    uses MFA responsibilities from ``--data-dir``. If ``--medoids-path`` is
+    provided, it assigns by nearest Euclidean medoid instead.
 
     The default save path is ``<run_dir>/<model_stem>_assignments.pt`` so
     that ``intrinsic-dim`` can pick it up via its ``--assignments-path``
-    default of ``<data-dir>/mfa_model_assignments.pt``.
+    default of ``<data-dir>/mfa_model_assignments.pt``. For medoids, the
+    default save path is next to the medoid file.
     """
     import json
     from torch.utils.data import DataLoader
 
-    from dalg.analysis.cluster_assignments import compute_assignments, _resolve_device
+    from dalg.analysis.cluster_assignments import compute_assignments
+    from dalg.analysis.nearest_centroid_assignments import (
+        _load_centroids,
+        _resolve_device,
+        compute_nearest_centroid_assignments,
+    )
     from dalg.data.shard_activations import ActivationBatchDataset, load_meta_index
     from dalg.data.subset_spec import resolve_spec_positions, split_shard_dir_spec
 
-    model_path, run_dir = _resolve_model_path(args.data_dir)
     device = _resolve_device(args.device)
 
     shard_dir, subset_spec = split_shard_dir_spec(args.shard_dir)
@@ -170,31 +175,65 @@ def cmd_assignments(args) -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    sizes, assignments, max_responsibilities, peakedness = compute_assignments(
-        model_path,
-        loader,
-        device=device,
-        max_batches=args.max_batches,
-        use_inference_cache=args.use_inference_cache,
-    )
+    if args.medoids_path is not None:
+        medoids_path = Path(args.medoids_path)
+        centroids = _load_centroids(medoids_path)
+        sizes, assignments, min_distances = compute_nearest_centroid_assignments(
+            centroids,
+            loader,
+            device=device,
+            batch_size=args.batch_size,
+            max_batches=args.max_batches,
+        )
+        payload = {
+            "cluster_sizes": sizes,
+            "assignments": assignments,
+            "min_distances": min_distances,
+            "K": int(sizes.numel()),
+            "centroids_path": str(medoids_path),
+            "subset_spec": subset_spec,
+            "source": {
+                "shard_dir": str(shard_dir),
+                "layer": int(args.layer),
+                "drop_prefix": int(drop_prefix),
+                "num_items": int(assignments.numel()),
+            },
+        }
+        default_dir = medoids_path.parent
+        default_stem = medoids_path.stem
+        default_suffix = "_nearest_centroid_assignments.pt" if args.max_batches is None \
+            else f"_nearest_centroid_assignments_first{args.max_batches}_batches.pt"
+    else:
+        model_path, run_dir = _resolve_model_path(args.data_dir)
+        sizes, assignments, max_responsibilities, peakedness = compute_assignments(
+            model_path,
+            loader,
+            device=device,
+            max_batches=args.max_batches,
+            use_inference_cache=args.use_inference_cache,
+        )
+        payload = {
+            "cluster_sizes": sizes,
+            "assignments": assignments,
+            "max_responsibilities": max_responsibilities,
+            "peakedness": peakedness,
+            "K": int(sizes.numel()),
+            "subset_spec": subset_spec,
+        }
+        default_dir = run_dir
+        default_stem = model_path.stem
+        default_suffix = "_assignments.pt" if args.max_batches is None \
+            else f"_assignments_first{args.max_batches}_batches.pt"
 
     if args.save_path is not None:
         save_path = Path(args.save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
     else:
-        out_dir = Path(args.out_dir) if args.out_dir else run_dir
+        out_dir = Path(args.out_dir) if args.out_dir else default_dir
         out_dir.mkdir(parents=True, exist_ok=True)
-        suffix = "_assignments.pt" if args.max_batches is None \
-            else f"_assignments_first{args.max_batches}_batches.pt"
-        save_path = out_dir / f"{model_path.stem}{suffix}"
+        save_path = out_dir / f"{default_stem}{default_suffix}"
 
-    torch.save({
-        "cluster_sizes": sizes,
-        "assignments": assignments,
-        "max_responsibilities": max_responsibilities,
-        "peakedness": peakedness,
-        "K": int(sizes.numel()),
-        "subset_spec": subset_spec,
-    }, save_path)
+    torch.save(payload, save_path)
     print(f"Assignments saved to {save_path}")
 
 
@@ -361,11 +400,19 @@ def cmd_gaussian_group_semantics(args) -> None:
 
 
 def validate_args(args) -> None:
+    if args.command in {"overlap", "intrinsic-dim"}:
+        if args.data_dir is None:
+            raise SystemExit(f"{args.command}: --data-dir is required")
     if args.command == "intrinsic-dim":
         if args.shard_dir is not None and args.act_dir is not None:
             raise SystemExit("intrinsic-dim: --shard-dir and --act-dir are mutually exclusive")
         if args.shard_dir is not None and args.layer is None:
             raise SystemExit("intrinsic-dim: --layer is required with --shard-dir")
+    if args.command == "assignments":
+        if args.data_dir is None and args.medoids_path is None:
+            raise SystemExit("assignments: pass either --data-dir for MFA or --medoids-path for nearest-medoid assignment")
+        if args.data_dir is not None and args.medoids_path is not None:
+            raise SystemExit("assignments: --data-dir and --medoids-path are mutually exclusive")
     if args.command == "description-fit":
         if args.skip_detection and args.skip_token_embedding:
             raise SystemExit("description-fit: at least one metric must be enabled")
@@ -384,7 +431,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--device", default="cuda", help="Device (cuda/cpu/mps)")
         sp.add_argument("--seed", type=int, default=None)
         sp.add_argument("--batch-size", type=int, default=128)
-        sp.add_argument("--data-dir", required=True,
+        sp.add_argument("--data-dir", default=None,
                         help="Directory with mfa_model.pt / mfa_model_shards.json, "
                              "or direct path to a .pt model file")
         sp.add_argument("--out-dir", default=None,
@@ -420,8 +467,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_intrinsic_dim)
 
     sp = sub.add_parser("assignments",
-                        help="Compute MFA cluster assignments + peakedness stats")
+                        help="Compute MFA or nearest-medoid cluster assignments")
     add_common(sp)
+    sp.add_argument("--medoids-path", "--centroids-path", dest="medoids_path",
+                    default=None,
+                    help="Optional .npy/.pt medoids or centroids. If set, "
+                         "assign by nearest Euclidean centroid instead of MFA responsibilities.")
     sp.add_argument("--shard-dir", required=True,
                     help="Activation shard directory produced by dalg-run-extraction")
     sp.add_argument("--layer", type=int, required=True,

@@ -34,9 +34,11 @@ uv.lock
 experiments/data/
 experiments/*.png
 experiments/*.pdf
+outputs/
 output_job/
 
 # Logs
+logs/
 *.log
 wandb/
 runs/
