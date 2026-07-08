@@ -78,7 +78,11 @@ def cmd_intrinsic_dim(args) -> None:
     )
     from dalg.data.subset_spec import split_shard_dir_spec
 
-    model_path, run_dir = _resolve_model_path(args.data_dir)
+    if args.data_dir is not None:
+        model_path, run_dir = _resolve_model_path(args.data_dir)
+    else:
+        model_path = None
+        run_dir = Path(args.assignments_path).parent
     out_dir = Path(args.out_dir or run_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -400,10 +404,12 @@ def cmd_gaussian_group_semantics(args) -> None:
 
 
 def validate_args(args) -> None:
-    if args.command in {"overlap", "intrinsic-dim"}:
+    if args.command == "overlap":
         if args.data_dir is None:
             raise SystemExit(f"{args.command}: --data-dir is required")
     if args.command == "intrinsic-dim":
+        if args.data_dir is None and args.assignments_path is None:
+            raise SystemExit("intrinsic-dim: pass --data-dir or --assignments-path")
         if args.shard_dir is not None and args.act_dir is not None:
             raise SystemExit("intrinsic-dim: --shard-dir and --act-dir are mutually exclusive")
         if args.shard_dir is not None and args.layer is None:

@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sized
 
 import numpy as np
 import torch
@@ -48,6 +49,19 @@ def _iter_batches(loader_or_array: Any, batch_size: int) -> Iterator[torch.Tenso
         yield _as_tensor(x)
 
 
+def _num_batches(loader_or_array: Any, batch_size: int) -> int | None:
+    if isinstance(loader_or_array, np.ndarray):
+        return math.ceil(len(loader_or_array) / batch_size)
+    if isinstance(loader_or_array, torch.Tensor):
+        return math.ceil(loader_or_array.shape[0] / batch_size)
+    if isinstance(loader_or_array, Sized):
+        try:
+            return len(loader_or_array)
+        except TypeError:
+            return None
+    return None
+
+
 @torch.no_grad()
 def compute_nearest_centroid_assignments(
     centroids: torch.Tensor | np.ndarray,
@@ -74,7 +88,15 @@ def compute_nearest_centroid_assignments(
     distance_chunks: list[torch.Tensor] = []
     c2 = (C * C).sum(dim=1).unsqueeze(0)
 
-    for batch_idx, x in enumerate(tqdm(_iter_batches(loader_or_array, batch_size), desc="nearest-centroid assignments")):
+    total_batches = _num_batches(loader_or_array, batch_size)
+    if max_batches is not None and total_batches is not None:
+        total_batches = min(total_batches, max_batches)
+    batches = tqdm(
+        _iter_batches(loader_or_array, batch_size),
+        desc="nearest-centroid assignments",
+        total=total_batches,
+    )
+    for batch_idx, x in enumerate(batches):
         if max_batches is not None and batch_idx >= max_batches:
             break
         x = x.to(device=device, dtype=torch.float32, non_blocking=(device.type == "cuda"))
@@ -126,7 +148,10 @@ def _loader_from_shards(args, device: torch.device):
         shuffle_shards=False,
         shuffle_within_shard=False,
     )
-    loader = DataLoader(ds, batch_size=None, num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
+    # num_workers must stay 0: with workers, the DataLoader interleaves batches
+    # across workers and the saved assignments no longer follow the canonical
+    # stream order that downstream position-based consumers assume.
+    loader = DataLoader(ds, batch_size=None, num_workers=0, pin_memory=(device.type == "cuda"))
     return loader, {
         "shard_dir": str(shard_dir),
         "subset_spec": subset_spec,
@@ -144,7 +169,6 @@ def main() -> None:
     parser.add_argument("--layer", type=int, default=None)
     parser.add_argument("--drop-prefix", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=8192)
-    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--max-batches", type=int, default=None)
     parser.add_argument("--save-path", type=Path, required=True)

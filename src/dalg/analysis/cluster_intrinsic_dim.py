@@ -38,6 +38,14 @@ def _default_assignments_path(model_path: Path) -> Path:
     return model_path.parent / f"{model_path.stem}_assignments.pt"
 
 
+def _resolve_assignments_path(model_path: Path | None, assignments_path: Path | None) -> Path:
+    if assignments_path is not None:
+        return Path(assignments_path)
+    if model_path is None:
+        raise ValueError("assignments_path is required when model_path is not provided")
+    return _default_assignments_path(Path(model_path))
+
+
 def _loader_len(loader: Any) -> int | None:
     try:
         return len(loader)
@@ -188,7 +196,7 @@ def intrinsic_dim_pca(
     return dim, var
 
 
-def _load_assignments(assignments_path: Path) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], int]:
+def _load_assignments(assignments_path: Path) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], int, dict[str, Any]]:
     data = torch.load(assignments_path, map_location="cpu", weights_only=True)
     if "assignments" not in data or "cluster_sizes" not in data:
         raise ValueError(
@@ -208,7 +216,62 @@ def _load_assignments(assignments_path: Path) -> tuple[torch.Tensor, torch.Tenso
             "using assignments to choose samples and saved cluster_sizes for reporting."
         )
 
-    return assignments, sizes, peakedness, K
+    metadata = {
+        "subset_spec": data.get("subset_spec"),
+        "source": data.get("source", {}),
+        "centroids_path": data.get("centroids_path"),
+    }
+    return assignments, sizes, peakedness, K, metadata
+
+
+def _assignment_subset_spec(metadata: dict[str, Any]) -> str | None:
+    subset_spec = metadata.get("subset_spec")
+    source = metadata.get("source")
+    if subset_spec is None and isinstance(source, dict):
+        subset_spec = source.get("subset_spec")
+    return str(subset_spec) if subset_spec else None
+
+
+def _validate_assignment_source(
+    metadata: dict[str, Any],
+    *,
+    layer: int | None = None,
+    drop_prefix: int | None = None,
+) -> None:
+    source = metadata.get("source")
+    if not isinstance(source, dict):
+        return
+
+    if layer is not None and source.get("layer") is not None and int(source["layer"]) != int(layer):
+        raise ValueError(
+            f"Assignment file was computed for layer={source['layer']}, "
+            f"but intrinsic-dim was requested for layer={layer}."
+        )
+    if (
+        drop_prefix is not None
+        and source.get("drop_prefix") is not None
+        and int(source["drop_prefix"]) != int(drop_prefix)
+    ):
+        raise ValueError(
+            f"Assignment file was computed with drop_prefix={source['drop_prefix']}, "
+            f"but intrinsic-dim was requested with drop_prefix={drop_prefix}."
+        )
+
+
+def _load_model_metadata(model_path: Path | None, K: int) -> dict[str, Any]:
+    if model_path is None:
+        return {"model_kind": "assignments", "model_path": None, "D": None, "rank": None}
+
+    mfa = load_mfa(model_path, map_location="cpu")
+    if int(mfa.K) != K:
+        raise ValueError(f"Assignment file has K={K}, but model has K={mfa.K}")
+
+    return {
+        "model_kind": "mfa",
+        "model_path": str(model_path),
+        "D": int(mfa.D),
+        "rank": int(mfa.q),
+    }
 
 
 def _choose_sample_positions(
@@ -409,7 +472,7 @@ def _run_cluster_pca(
 
 
 def compute_intrinsic_dims_from_assignments(
-    model_path: Path,
+    model_path: Path | None,
     loader: Any,
     assignments_path: Path | None = None,
     *,
@@ -430,17 +493,21 @@ def compute_intrinsic_dims_from_assignments(
     sharded data, prefer `compute_intrinsic_dims_from_shards`, which maps those
     positions through `meta_index` directly.
     """
-    model_path = Path(model_path)
-    assignments_path = Path(assignments_path) if assignments_path is not None else _default_assignments_path(model_path)
+    model_path = Path(model_path) if model_path is not None else None
+    assignments_path = _resolve_assignments_path(model_path, assignments_path)
     if pca_device is None:
         pca_device = device
 
-    assignments, sizes, peakedness, K = _load_assignments(assignments_path)
-    mfa = load_mfa(model_path, map_location="cpu")
-    if int(mfa.K) != K:
-        raise ValueError(f"Assignment file has K={K}, but model has K={mfa.K}")
+    assignments, sizes, peakedness, K, assignment_metadata = _load_assignments(assignments_path)
+    model_metadata = _load_model_metadata(model_path, K)
 
-    print(f"MFA: K={mfa.K} components  D={mfa.D}  rank={mfa.q}")
+    if model_metadata["model_kind"] == "mfa":
+        print(
+            f"MFA: K={K} components  D={model_metadata['D']}  "
+            f"rank={model_metadata['rank']}"
+        )
+    else:
+        print(f"Assignments-only clusters: K={K}")
     print(f"Assignments: {assignments_path}  N={assignments.numel():,}")
     print(
         f"Sampling up to {max_samples:,} activations per cluster "
@@ -482,7 +549,8 @@ def compute_intrinsic_dims_from_assignments(
         print(f"  median = {dims[valid].float().median():.2f}")
         print(f"  min    = {dims[valid].min().item()}")
         print(f"  max    = {dims[valid].max().item()}")
-        print(f"  MFA rank (q) = {mfa.q}  (reference)")
+        if model_metadata["rank"] is not None:
+            print(f"  MFA rank (q) = {model_metadata['rank']}  (reference)")
     print(f"Skipped {num_skipped} clusters with population < {min_population}")
 
     return {
@@ -495,13 +563,16 @@ def compute_intrinsic_dims_from_assignments(
         "max_samples": max_samples,
         "assignments_path": str(assignments_path),
         "K": K,
-        "rank": mfa.q,
-        "D": mfa.D,
+        "rank": model_metadata["rank"],
+        "D": model_metadata["D"],
+        "model_kind": model_metadata["model_kind"],
+        "model_path": model_metadata["model_path"],
+        "assignment_metadata": assignment_metadata,
     }
 
 #TODO remove model dead code
 def compute_intrinsic_dims_from_shards(
-    model_path: Path,
+    model_path: Path | None,
     shard_dir: Path,
     *,
     layer: int,
@@ -521,9 +592,9 @@ def compute_intrinsic_dims_from_shards(
     from dalg.data.shard_activations import load_meta_index
     from dalg.data.subset_spec import resolve_spec_positions
 
-    model_path = Path(model_path)
+    model_path = Path(model_path) if model_path is not None else None
     shard_dir = Path(shard_dir)
-    assignments_path = Path(assignments_path) if assignments_path is not None else _default_assignments_path(model_path)
+    assignments_path = _resolve_assignments_path(model_path, assignments_path)
     if pca_device is None:
         pca_device = device
 
@@ -532,22 +603,30 @@ def compute_intrinsic_dims_from_shards(
     if drop_prefix is None:
         drop_prefix = int(extract_cfg.get("drop_prefix", 32))
 
+    assignments, sizes, peakedness, K, assignment_metadata = _load_assignments(assignments_path)
+    _validate_assignment_source(assignment_metadata, layer=layer, drop_prefix=drop_prefix)
+
     meta_index = load_meta_index(shard_dir, layer=layer)
-    if subset_spec:
+    effective_subset_spec = subset_spec if subset_spec is not None else _assignment_subset_spec(assignment_metadata)
+    if effective_subset_spec:
         keep = resolve_spec_positions(
-            meta_index, subset_spec, window=window, drop_prefix=drop_prefix
+            meta_index, effective_subset_spec, window=window, drop_prefix=drop_prefix
         )
         meta_index = [meta_index[i] for i in keep]
-    assignments, sizes, peakedness, K = _load_assignments(assignments_path)
-    mfa = load_mfa(model_path, map_location="cpu")
-    if int(mfa.K) != K:
-        raise ValueError(f"Assignment file has K={K}, but model has K={mfa.K}")
+    model_metadata = _load_model_metadata(model_path, K)
 
-    print(f"MFA: K={mfa.K} components  D={mfa.D}  rank={mfa.q}")
+    if model_metadata["model_kind"] == "mfa":
+        print(
+            f"MFA: K={K} components  D={model_metadata['D']}  "
+            f"rank={model_metadata['rank']}"
+        )
+    else:
+        print(f"Assignments-only clusters: K={K}")
     print(f"Assignments: {assignments_path}  N={assignments.numel():,}")
     print(
         f"shard_dir={shard_dir}  layer={layer}  rows={len(meta_index):,}  "
         f"window={window}  drop_prefix={drop_prefix}"
+        + (f"  spec={effective_subset_spec!r}" if effective_subset_spec else "")
     )
     print("Mapping assignment indices in canonical shard order from meta_index.")
 
@@ -595,7 +674,8 @@ def compute_intrinsic_dims_from_shards(
         print(f"  median = {dims[valid].float().median():.2f}")
         print(f"  min    = {dims[valid].min().item()}")
         print(f"  max    = {dims[valid].max().item()}")
-        print(f"  MFA rank (q) = {mfa.q}  (reference)")
+        if model_metadata["rank"] is not None:
+            print(f"  MFA rank (q) = {model_metadata['rank']}  (reference)")
     print(f"Skipped {num_skipped} clusters with population < {min_population}")
 
     return {
@@ -608,13 +688,17 @@ def compute_intrinsic_dims_from_shards(
         "max_samples": max_samples,
         "assignments_path": str(assignments_path),
         "K": K,
-        "rank": mfa.q,
-        "D": mfa.D,
+        "rank": model_metadata["rank"],
+        "D": model_metadata["D"],
+        "model_kind": model_metadata["model_kind"],
+        "model_path": model_metadata["model_path"],
+        "assignment_metadata": assignment_metadata,
+        "subset_spec": effective_subset_spec,
     }
 
 
 def compute_intrinsic_dims_from_loader(
-    model_path: Path,
+    model_path: Path | None,
     loader: Any,
     *,
     assignments_path: Path | None = None,
@@ -646,7 +730,7 @@ def compute_intrinsic_dims_from_loader(
 
 
 def compute_intrinsic_dims(
-    model_path: Path,
+    model_path: Path | None,
     act_path: Path,
     tok_path: Path | None = None,
     *,
@@ -690,14 +774,19 @@ def compute_intrinsic_dims(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Intrinsic dimensionality per MFA cluster from saved assignments"
+        description="Intrinsic dimensionality per cluster from saved assignments"
     )
-    parser.add_argument("--model-path", type=Path, required=True, help="Path to mfa_model.pt")
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        default=None,
+        help="Optional path to mfa_model.pt for K validation and MFA rank metadata",
+    )
     parser.add_argument(
         "--assignments-path",
         type=Path,
         default=None,
-        help="Path to mfa_model_assignments.pt (default: next to --model-path)",
+        help="Path to an assignments .pt file (default: next to --model-path)",
     )
     parser.add_argument("--shard-dir", type=Path, default=None, help="Shard directory from extract-windows")
     parser.add_argument("--layer", type=int, default=None, help="Layer index for --shard-dir")
@@ -720,6 +809,9 @@ def main() -> None:
         help="Dtype used to store sampled activations before PCA",
     )
     args = parser.parse_args()
+
+    if args.model_path is None and args.assignments_path is None:
+        raise SystemExit("--assignments-path is required when --model-path is omitted.")
 
     if args.shard_dir is not None:
         if args.layer is None:
@@ -758,7 +850,15 @@ def main() -> None:
             seed=args.seed,
         )
 
-    save_path = args.save_path or args.model_path.parent / "intrinsic_dims.pt"
+    if args.save_path is not None:
+        save_path = args.save_path
+    elif args.model_path is not None:
+        save_path = args.model_path.parent / "intrinsic_dims.pt"
+    elif args.assignments_path is not None:
+        save_path = args.assignments_path.parent / "intrinsic_dims.pt"
+    else:
+        raise SystemExit("--assignments-path is required when --model-path is omitted.")
+
     torch.save(results, save_path)
     print(f"Results saved to {save_path}")
 

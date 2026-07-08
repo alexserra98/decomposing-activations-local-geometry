@@ -8,45 +8,92 @@
 #SBATCH --gres=gpu:H100:1
 #SBATCH --mem=640G
 #SBATCH --time=1-02:00:00
-#SBATCH --job-name=mfa_metric_cluster
+#SBATCH --job-name=intrinsic_dim
 ##SBATCH --begin=now+4hours
-#SBATCH --array=5
-#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/experiments/mfa_metric_cluster_%A_%a.out
+#SBATCH --array=5,17
+#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/experiments/intrinsic_dim_%x_%A_%a.out
+
+set -euo pipefail
 
 REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
-K=1000
-RANK=337
+K=${K:-1000}
+RANK=${RANK:-10}
+METRIC_TARGET=${METRIC_TARGET:-mfa}
+OUTPUT_FILENAME=${OUTPUT_FILENAME:-intrinsic_dims.pt}
 LAYER=$SLURM_ARRAY_TASK_ID
 
 SHARD_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations
 LAYER_TAG="layer$(printf '%02d' "$LAYER")"
-DATA_DIR="$SHARD_DIR/${LAYER_TAG}_${K}_${RANK}_component_sharded_mfa"
-OUT_DIR="$REPO_ROOT/output/experiments/${K}_$(printf '%02d' "$LAYER")_${RANK}"
-
-mkdir -p "$OUT_DIR"
 cd "$REPO_ROOT" || exit 1
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
 # Step 1: compute cluster assignments (required by intrinsic-dim)
 # load_mfa falls back to mfa_model_shards.json when mfa_model.pt is absent
-uv run python -m dalg.analysis.cluster_assignments \
-  --model-path "$DATA_DIR/mfa_model.pt" \
-  --shard-dir "$SHARD_DIR" \
-  --layer "$LAYER" \
-  --device cuda --num-workers 4
-
-# # Step 2: intrinsic dimensionality per cluster
-# uv run dalg-run-metrics intrinsic-dim \
-#   --data-dir "$DATA_DIR" \
+# uv run python -m dalg.analysis.cluster_assignments \
+#   --model-path "$DATA_DIR/mfa_model.pt" \
 #   --shard-dir "$SHARD_DIR" \
 #   --layer "$LAYER" \
-#   --out-dir "$OUT_DIR" \
-#   --device cuda --max-samples-per-cluster 2000
+#   --device cuda --num-workers 4
+
+case "$METRIC_TARGET" in
+  mfa)
+    DATA_DIR="$SHARD_DIR/${LAYER_TAG}_${K}_${RANK}_component_sharded_mfa"
+    OUT_DIR="$REPO_ROOT/output/experiments/${K}_$(printf '%02d' "$LAYER")_${RANK}"
+    mkdir -p "$OUT_DIR"
+    RUN_OUT_DIR="$OUT_DIR"
+    if [[ "$OUTPUT_FILENAME" != "intrinsic_dims.pt" ]]; then
+      RUN_OUT_DIR="$OUT_DIR/.tmp_${OUTPUT_FILENAME%.pt}_${SLURM_JOB_ID}_${LAYER}"
+      mkdir -p "$RUN_OUT_DIR"
+    fi
+
+    uv run dalg-run-metrics intrinsic-dim \
+      --data-dir "$DATA_DIR" \
+      ${ASSIGNMENTS_PATH:+--assignments-path "$ASSIGNMENTS_PATH"} \
+      --shard-dir "$SHARD_DIR" \
+      --layer "$LAYER" \
+      --out-dir "$RUN_OUT_DIR" \
+      --device cuda --max-samples-per-cluster 2000
+
+    if [[ "$OUTPUT_FILENAME" != "intrinsic_dims.pt" ]]; then
+      mv "$RUN_OUT_DIR/intrinsic_dims.pt" "$OUT_DIR/$OUTPUT_FILENAME"
+      rmdir "$RUN_OUT_DIR"
+    fi
+    ;;
+
+  centroids)
+    CENTROID_DIR="$SHARD_DIR/centroids/k${K}_L$(printf '%02d' "$LAYER")"
+    ASSIGNMENTS_PATH="${ASSIGNMENTS_PATH:-$CENTROID_DIR/kmeans_centroid_assignments.pt}"
+    OUT_DIR="$REPO_ROOT/dalg-cache/output/experiments/centroids_${K}_$(printf '%02d' "$LAYER")"
+    mkdir -p "$OUT_DIR"
+    RUN_OUT_DIR="$OUT_DIR"
+    if [[ "$OUTPUT_FILENAME" != "intrinsic_dims.pt" ]]; then
+      RUN_OUT_DIR="$OUT_DIR/.tmp_${OUTPUT_FILENAME%.pt}_${SLURM_JOB_ID}_${LAYER}"
+      mkdir -p "$RUN_OUT_DIR"
+    fi
+
+    uv run dalg-run-metrics intrinsic-dim \
+      --assignments-path "$ASSIGNMENTS_PATH" \
+      --shard-dir "$SHARD_DIR" \
+      --layer "$LAYER" \
+      --out-dir "$RUN_OUT_DIR" \
+      --device cuda --max-samples-per-cluster 2000
+
+    if [[ "$OUTPUT_FILENAME" != "intrinsic_dims.pt" ]]; then
+      mv "$RUN_OUT_DIR/intrinsic_dims.pt" "$OUT_DIR/$OUTPUT_FILENAME"
+      rmdir "$RUN_OUT_DIR"
+    fi
+    ;;
+
+  *)
+    echo "Unknown METRIC_TARGET=$METRIC_TARGET; expected 'mfa' or 'centroids'." >&2
+    exit 2
+    ;;
+esac
 
 # Step 3: pairwise component overlap
 # batch_pairs=512: peak GPU ≈ 10 GB (7 W-type tensors × 512 × D × q × 4 bytes)
 # default 4096 OOMs because W-chunk (4096, 2048, 337) alone exceeds H100 memory
-uv run dalg-run-metrics overlap \
-  --data-dir "$DATA_DIR" \
-  --out-dir "$OUT_DIR" \
-  --device cuda --batch-pairs 512
+# uv run dalg-run-metrics overlap \
+#   --data-dir "$DATA_DIR" \
+#   --out-dir "$OUT_DIR" \
+#   --device cuda --batch-pairs 512

@@ -17,6 +17,7 @@ dependencies = [
     "openai>=2.33.0",
     "pandas>=3.0.2",
     "plotly>=6.8.0",
+    "pytest>=9.1.1",
     "scikit-learn>=1.9.0",
     "scikit-learn-extra>=0.3.0",
     "scipy>=1.17.1",

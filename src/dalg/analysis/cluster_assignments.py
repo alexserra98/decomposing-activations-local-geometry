@@ -158,7 +158,7 @@ def main() -> None:
     loader = DataLoader(
         ds,
         batch_size=None,
-        num_workers=0,
+        num_workers=0, # for iterable-style dataset, num_workers>0 can break the ordering of samples - they are interleaved across workers
         pin_memory=(device.type == "cuda"),
     )
 
