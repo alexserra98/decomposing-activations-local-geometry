@@ -13,52 +13,52 @@
 
 # SLURM stages this script into /var/spool/slurm/, so don't rely on
 # BASH_SOURCE — hardcode the repo root.
-# REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
-# LAYER=5
-# LAYER=$(printf "%02d" "$LAYER")
-# Q=394
-# K=1000
+REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
+LAYER=5
+LAYER=$(printf "%02d" "$LAYER")
+Q=394
+K=1000
 
 
 # MFA_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations/layer${LAYER}_${K}_${Q}_component_sharded_mfa
-# #MFA_DIR=dalg-cache/pile_gemma2b_activations/layer05_1000_10_mfa_1epoch_20260703_1538
-# SHARD_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations
+MFA_DIR=dalg-cache/pile_gemma2b_activations/layer05_1000_10_mfa_1epoch_20260703_1538
+SHARD_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations
 
-# cd "$REPO_ROOT" || exit 1
-# export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+cd "$REPO_ROOT" || exit 1
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
-# echo "Cluster assignments: K=$K  layer=$LAYER  layer_tag=layer$LAYER_PADDED"
-# echo "MFA dir: $MFA_DIR"
+echo "Cluster assignments: K=$K  layer=$LAYER  layer_tag=layer$LAYER_PADDED"
+echo "MFA dir: $MFA_DIR"
 
-# # ---------------------------------------------------------------------------
-# # MFA responsibility assignments
-# # Writes <MFA_DIR>/mfa_model_assignments.pt by default.
-# uv run python -m dalg.analysis.cluster_assignments \
-#     --model-path "$MFA_DIR/mfa_model.pt" \
-#     --shard-dir "$SHARD_DIR" \
-#     --layer "$LAYER" \
-#     --batch-size 1024 \
-#     --device cuda
+# ---------------------------------------------------------------------------
+# MFA responsibility assignments
+# Writes <MFA_DIR>/mfa_model_assignments.pt by default.
+uv run python -m dalg.analysis.cluster_assignments \
+    --model-path "$MFA_DIR/mfa_model.pt" \
+    --shard-dir "$SHARD_DIR" \
+    --layer "$LAYER" \
+    --batch-size 1024 \
+    --device cuda
 
 # ---------------------------------------------------------------------------
 # KMeans-centroid assignments
 # Uncomment this section, and comment the MFA section above, to assign each
 # activation to its nearest saved KMeans centroid instead of the trained MFA.
 #
-SHARD_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations
-K=1000
-LAYER=5
-LAYER=$(printf "%02d" "$LAYER")
-KMEANS_CENTROIDS_PATH="$SHARD_DIR/centroids/k${K}_L${LAYER}/centroids.pt"
-KMEANS_ASSIGNMENTS_PATH="$SHARD_DIR/centroids/k${K}_L${LAYER}/kmeans_centroid_assignments.pt"
+# SHARD_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations
+# K=1000
+# LAYER=5
+# LAYER=$(printf "%02d" "$LAYER")
+# KMEANS_CENTROIDS_PATH="$SHARD_DIR/centroids/k${K}_L${LAYER}/centroids.pt"
+# KMEANS_ASSIGNMENTS_PATH="$SHARD_DIR/centroids/k${K}_L${LAYER}/kmeans_centroid_assignments.pt"
 
-echo "KMeans centroid path: $KMEANS_CENTROIDS_PATH"
-echo "KMeans assignments output: $KMEANS_ASSIGNMENTS_PATH"
+# echo "KMeans centroid path: $KMEANS_CENTROIDS_PATH"
+# echo "KMeans assignments output: $KMEANS_ASSIGNMENTS_PATH"
 
-uv run python -m dalg.analysis.nearest_centroid_assignments \
-   --centroids-path "$KMEANS_CENTROIDS_PATH" \
-   --shard-dir "$SHARD_DIR" \
-   --layer "$LAYER" \
-   --batch-size 8192 \
-   --device cuda \
-   --save-path "$KMEANS_ASSIGNMENTS_PATH"
+# uv run python -m dalg.analysis.nearest_centroid_assignments \
+#    --centroids-path "$KMEANS_CENTROIDS_PATH" \
+#    --shard-dir "$SHARD_DIR" \
+#    --layer "$LAYER" \
+#    --batch-size 8192 \
+#    --device cuda \
+#    --save-path "$KMEANS_ASSIGNMENTS_PATH"
