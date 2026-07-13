@@ -20,6 +20,7 @@
 # BASH_SOURCE — hardcode the repo root.
 REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
 SHARD_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations
+MODELS_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_models
 
 cd "$REPO_ROOT" || exit 1
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
@@ -33,7 +34,7 @@ RUNS=(
 )
 
 for entry in "${RUNS[@]}"; do
-  run_dir="$SHARD_DIR/${entry%%:*}"
+  run_dir="$MODELS_DIR/${entry%%:*}"
   layer="${entry##*:}"
   save_path="$run_dir/mfa_model_nearest_centroid_assignments.pt"
 

@@ -19,6 +19,7 @@
 # ─────────────────────────────────────────────────
 
 SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations}
+MODELS_DIR=${MODELS_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_models}
 LAYER=$SLURM_ARRAY_TASK_ID
 
 K=${K:-1000}
@@ -36,7 +37,7 @@ SEED=${SEED:-42}
 VAL_ON_GPU=${VAL_ON_GPU:-0}                # 1 = preload val tensor on GPU (faster eval, more GPU RAM)
 MAX_STEPS=${MAX_STEPS:-}
 
-OUT_DIR=${OUT_DIR:-"$SHARD_DIR/layer$(printf '%02d' "$LAYER")_$(printf "$K")_$(printf "$RANK")_mfa"}
+OUT_DIR=${OUT_DIR:-"$MODELS_DIR/layer$(printf '%02d' "$LAYER")_${K}_${RANK}_mfa"}
 CENTROIDS_FROM=${CENTROIDS_FROM:-}                # optional: reuse centroids from an existing K-matched run
 
 POOL_FLAG=""

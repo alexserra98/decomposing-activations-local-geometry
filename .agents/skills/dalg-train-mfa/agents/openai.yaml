@@ -1,0 +1,4 @@
+interface:
+  display_name: "Train DALG MFA"
+  short_description: "Extract activations and train DALG MFA models"
+  default_prompt: "Use $dalg-train-mfa to prepare activations or train an MFA model for this repository."

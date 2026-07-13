@@ -11,7 +11,7 @@
 #   TOP_N=100 MAX_EXAMPLES=40 LLM_WORKERS=4 sbatch scripts/slurm/sbatch_label_mfa_clusters.sh
 #
 # Outputs:
-#   output/experiments/<K>_<layer>/cluster_labels/
+#   <model_dir>/cluster_labels/
 #     top_activations.pt
 #     cluster_examples.json
 #     cluster_labels.json
@@ -31,6 +31,7 @@ set -euo pipefail
 
 REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
 SHARD_DIR=${SHARD_DIR:-"$REPO_ROOT/dalg-cache/pile_gemma2b_activations"}
+MODELS_DIR=${MODELS_DIR:-"$REPO_ROOT/dalg-cache/pile_gemma2b_models"}
 WINDOWS_DATASET=${WINDOWS_DATASET:-"$REPO_ROOT/dalg-cache/pile_gemma2b_100M_windows/merged"}
 TOKENIZER=${TOKENIZER:-google/gemma-2b}
 
@@ -53,9 +54,9 @@ CONFIGS=(
 
 IFS=":" read -r K LAYER <<< "${CONFIGS[$SLURM_ARRAY_TASK_ID]}"
 LAYER_TAG=$(printf "%02d" "$LAYER")
-MFA_DIR="$SHARD_DIR/layer${LAYER_TAG}_${K}_mfa"
+MFA_DIR="$MODELS_DIR/layer${LAYER_TAG}_${K}_mfa"
 ASSIGNMENTS_PATH="$MFA_DIR/mfa_model_assignments.pt"
-OUT_DIR="$REPO_ROOT/output/experiments/${K}_${LAYER_TAG}/cluster_labels"
+OUT_DIR="$MFA_DIR/cluster_labels"
 
 mkdir -p "$REPO_ROOT/logs/jobs" "$OUT_DIR"
 cd "$REPO_ROOT" || exit 1

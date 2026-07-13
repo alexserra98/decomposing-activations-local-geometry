@@ -23,6 +23,8 @@ OUTPUT_FILENAME=${OUTPUT_FILENAME:-intrinsic_dims.pt}
 LAYER=$SLURM_ARRAY_TASK_ID
 
 SHARD_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations
+MODELS_DIR=${MODELS_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_models}
+CENTROIDS_DIR=${CENTROIDS_DIR:-"$MODELS_DIR/centroids"}
 LAYER_TAG="layer$(printf '%02d' "$LAYER")"
 cd "$REPO_ROOT" || exit 1
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
@@ -37,8 +39,8 @@ export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
 case "$METRIC_TARGET" in
   mfa)
-    DATA_DIR="$SHARD_DIR/${LAYER_TAG}_${K}_${RANK}_component_sharded_mfa"
-    OUT_DIR="$REPO_ROOT/output/experiments/${K}_$(printf '%02d' "$LAYER")_${RANK}"
+    DATA_DIR="$MODELS_DIR/${LAYER_TAG}_${K}_${RANK}_component_sharded_mfa"
+    OUT_DIR="$DATA_DIR"
     mkdir -p "$OUT_DIR"
     RUN_OUT_DIR="$OUT_DIR"
     if [[ "$OUTPUT_FILENAME" != "intrinsic_dims.pt" ]]; then
@@ -61,9 +63,9 @@ case "$METRIC_TARGET" in
     ;;
 
   centroids)
-    CENTROID_DIR="$SHARD_DIR/centroids/k${K}_L$(printf '%02d' "$LAYER")"
+    CENTROID_DIR="$CENTROIDS_DIR/k${K}_L$(printf '%02d' "$LAYER")"
     ASSIGNMENTS_PATH="${ASSIGNMENTS_PATH:-$CENTROID_DIR/kmeans_centroid_assignments.pt}"
-    OUT_DIR="$REPO_ROOT/dalg-cache/output/experiments/centroids_${K}_$(printf '%02d' "$LAYER")"
+    OUT_DIR="$CENTROID_DIR"
     mkdir -p "$OUT_DIR"
     RUN_OUT_DIR="$OUT_DIR"
     if [[ "$OUTPUT_FILENAME" != "intrinsic_dims.pt" ]]; then

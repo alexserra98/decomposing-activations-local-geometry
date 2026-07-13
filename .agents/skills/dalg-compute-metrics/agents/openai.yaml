@@ -1,0 +1,4 @@
+interface:
+  display_name: "Compute DALG Metrics"
+  short_description: "Measure arbitrary partitions or MFA geometry"
+  default_prompt: "Use $dalg-compute-metrics to compute only the requested metric from its assignment, model, or label inputs."

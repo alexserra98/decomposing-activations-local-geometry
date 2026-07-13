@@ -11,7 +11,7 @@
 
 # ── Config (edit to taste) ───────────────────────────────────────────────
 DATASET="/orfeo/scratch/dssc/zenocosini/pile_gemma2b_100M_windows/merged"
-OUT_DIR="/orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations"
+OUT_DIR="/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations"
 MODEL="google/gemma-2b"
 LAYERS="5 17"
 DTYPE="float16"

@@ -15,7 +15,8 @@ set -euo pipefail
 
 REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
 SHARD_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations
-ARCHIVE_DIR="$SHARD_DIR/archived"
+MODELS_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_models
+ARCHIVE_DIR="$MODELS_DIR/archived"
 ASSIGN_BATCH_SIZE=${ASSIGN_BATCH_SIZE:-1024}
 
 CONFIGS=(

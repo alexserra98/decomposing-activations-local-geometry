@@ -37,11 +37,22 @@ scripts/slurm/    Cluster job scripts for extraction, training, metrics, labels
 scripts/          Temporary/profiling/synthetic-analysis scripts
 tests/            Unit/smoke tests and synthetic shard fixtures
 notebooks/        Exploratory notebooks
+docs/experiments/ Attachable context for temporary experiment workflows
+.agents/skills/   Canonical recurring workflow skills for Codex and Claude
+.claude/skills/   Symlinks exposing the canonical skills to Claude Code
 outputs/          Generated local artifacts; may contain untracked reports
 logs/             Slurm logs in current scripts
 dalg-cache/       Symlink to scratch cache
-output/           Symlink to scratch output artifacts
 ```
+
+The main Gemma 2B scratch data is split by responsibility:
+
+- `dalg-cache/pile_gemma2b_activations/` contains activation shards, tokens,
+  and metadata.
+- `dalg-cache/pile_gemma2b_models/` contains trained MFA run directories,
+  centroid collections under `centroids/`, and derived metrics.
+- `dalg-cache/output/` contains legacy metric outputs. Leave these existing
+  files in place, but do not use this directory for new model metrics.
 
 Important top-level files:
 
@@ -171,468 +182,34 @@ distributed-aware:
 - component-sharded training saves per-rank checkpoints and synchronizes
   gradients for replicated parameters via `sync_replicated_grads()`
 
-## Recurring Workflow: Train a New MFA
-
-Most training starts from an existing activation shard directory. If activations
-do not exist yet, build token windows first and run extraction:
-
-```bash
-uv run dalg-run-extraction \
-  --dataset /path/to/windows_dataset \
-  --out-dir /path/to/activation_shards \
-  --model google/gemma-2b \
-  --layers 5 17 \
-  --mode residual \
-  --extract-batch-size 16 \
-  --shard-size 512 \
-  --dtype float16 \
-  --drop-prefix 32 \
-  --device cuda
-```
-
-Extraction writes `config.json`, per-layer activation shards, token shards, and
-metadata. It is designed to be resume-safe.
-
-### Vanilla Training
-
-Use vanilla mode for one process holding the full MFA on one GPU:
-
-```bash
-uv run dalg-run-training \
-  --shard-dir /path/to/activation_shards \
-  --layer 5 \
-  --out-dir /path/to/activation_shards/layer05_1000_10_mfa \
-  --K 1000 \
-  --rank 10 \
-  --epochs 20 \
-  --refine-epochs 10 \
-  --batch-size 2048 \
-  --num-workers 2 \
-  --val-frac 0.008 \
-  --split-seed 42 \
-  --device cuda \
-  --seed 42 \
-  --training-mode vanilla
-```
-
-Relevant Slurm script:
-
-- `scripts/slurm/sbatch_train_shards.sh`
-
-Vanilla outputs usually include:
-
-- `config.json`
-- `val_indices.json`
-- `centroids.pt`
-- `checkpoint.pt`
-- `mfa_model.pt`
-
-Notes:
-
-- Do not launch vanilla mode under `torchrun`; `validate_args` rejects
-  `WORLD_SIZE > 1`.
-- `--centroids-path` can reuse an existing `centroids.pt` or directory
-  containing one.
-- If `--out-dir` is omitted, the default is under `--shard-dir` with a
-  layer/K-based name.
-- W&B is opt-in with `--wandb --wandb-project ... --wandb-name ...`.
-
-### Component-Sharded Training
-
-Use component-sharded mode when the full K x D x q model is too large for one
-GPU. This is model parallelism over mixture components, not data parallelism:
-every rank sees the same activation batch, and each rank owns a contiguous
-component slice.
-
-```bash
-uv run python -m torch.distributed.run --standalone --nproc_per_node=2 \
-  -m dalg.cli.run_training \
-  --shard-dir /path/to/activation_shards \
-  --layer 5 \
-  --out-dir /path/to/activation_shards/layer05_8000_10_component_sharded_mfa \
-  --K 8000 \
-  --rank 10 \
-  --epochs 15 \
-  --refine-epochs 10 \
-  --batch-size 8192 \
-  --num-workers 4 \
-  --val-frac 0.05 \
-  --split-seed 42 \
-  --early-stop-delta 1e-3 \
-  --device cuda \
-  --seed 42 \
-  --training-mode component_shard \
-  --compile
-```
-
-Relevant Slurm script:
-
-- `scripts/slurm/sbatch_train_component_shards.sh`
-
-Component-sharded outputs include:
-
-- `config.json`
-- `val_indices.json`
-- `centroids.pt`
-- `checkpoint_rank0000.pt`, `checkpoint_rank0001.pt`, ...
-- `checkpoint_shards.json`
-- `mfa_model_rank0000.pt`, `mfa_model_rank0001.pt`, ...
-- `mfa_model_shards.json`
-
-Notes:
-
-- Launch with `torchrun`; `--device cuda` and `WORLD_SIZE > 1` are required.
-- Increasing GPUs reduces per-rank component memory. It does not increase the
-  logical batch size.
-- `_ComponentShardLoader` broadcasts rank-0 training batches so all ranks train
-  on identical data.
-- Validation currently uses a deterministic `val_loader` on every rank, so each
-  rank participates in the same distributed likelihood calls.
-- `load_mfa(<run_dir>/mfa_model.pt)` falls back to assembling from
-  `<run_dir>/mfa_model_shards.json` when the `.pt` file is absent. This can be
-  memory-heavy for large K.
-- Do not gather and save a single full checkpoint for large component-sharded
-  runs.
-
-Useful smoke test:
-
-```bash
-PYTHONPATH=src python -m torch.distributed.run --standalone --nproc_per_node=2 \
-  tests/component_sharded_mfa_equivalence.py --device cpu --optimizer adam --steps 4
-```
-
-## Recurring Workflow: Compute Metrics
-
-Use `dalg-run-metrics` for current metric workflows. `--data-dir` accepts either
-a run directory containing `mfa_model.pt` / `mfa_model_shards.json`, or a direct
-path to a `.pt` model file.
-
-### Overlap
-
-```bash
-uv run dalg-run-metrics overlap \
-  --data-dir /path/to/mfa_run \
-  --out-dir /path/to/output_dir \
-  --device cuda \
-  --batch-pairs 512
-```
-
-Output:
-
-- `overlap.pt`
-
-For high-rank models, reduce `--batch-pairs` to avoid GPU OOM. The Slurm metrics
-script uses `512` for large `q`.
-
-### Intrinsic Dimension
-
-Intrinsic dimension can stream from activation shards and can optionally reuse
-precomputed assignments:
-
-```bash
-uv run dalg-run-metrics intrinsic-dim \
-  --data-dir /path/to/mfa_run \
-  --shard-dir /path/to/activation_shards \
-  --layer 5 \
-  --out-dir /path/to/output_dir \
-  --device cuda \
-  --pca-device cpu \
-  --pca-workers 8 \
-  --assignments-path /path/to/mfa_model_assignments.pt \
-  --variance-threshold 0.90 \
-  --min-population 100 \
-  --max-samples-per-cluster 2000
-```
-
-Output:
-
-- `intrinsic_dims.pt`
-
-Relevant Slurm script:
-
-- `scripts/slurm/sbatch_metrics.sh`
-
-### Description Metrics
-
-After clusters have labels, `dalg-run-metrics` can score or compare label text:
-
-```bash
-uv run dalg-run-metrics description-fit \
-  --labels-path /path/to/cluster_labels.json \
-  --out-dir /path/to/cluster_labels \
-  --positive-examples 8 \
-  --negative-examples 8 \
-  --judge-workers 4
-
-uv run dalg-run-metrics description-semantics \
-  --labels-path /path/to/cluster_labels.json \
-  --out-dir /path/to/cluster_labels \
-  --embedding-device cpu \
-  --top-k 25 \
-  --similarity-threshold 0.70
-```
-
-Outputs:
-
-- `description_fit.json`
-- `description_semantics.pt` and related JSON summaries
-
-## Recurring Workflow: Compute Assignments
-
-Assignments stream activation shards through a trained MFA, compute
-responsibilities, store the hard argmax cluster for each token, and accumulate
-cluster sizes plus responsibility-peakedness statistics.
-
-Preferred current command:
-
-```bash
-uv run dalg-run-metrics assignments \
-  --data-dir /path/to/mfa_run \
-  --shard-dir /path/to/activation_shards \
-  --layer 5 \
-  --batch-size 1024 \
-  --device cuda
-```
-
-Equivalent direct module:
-
-```bash
-uv run python -m dalg.analysis.cluster_assignments \
-  --model-path /path/to/mfa_run/mfa_model.pt \
-  --shard-dir /path/to/activation_shards \
-  --layer 5 \
-  --batch-size 1024 \
-  --device cuda
-```
-
-Default output:
-
-- `<run_dir>/mfa_model_assignments.pt`
-
-Saved fields:
-
-- `cluster_sizes`: `(K,)`
-- `assignments`: `(N,)` hard cluster id for each streamed token
-- `max_responsibilities`: `(N,)`
-- `peakedness`: per-cluster means for entropy, one-minus-max, and top1-minus-top2
-- `K`
-
-Relevant Slurm scripts:
-
-- `scripts/slurm/sbatch_assignments.sh`
-- `scripts/slurm/sbatch_epoch_assignments.sh`
-
-Notes:
-
-- `--drop-prefix` defaults to the value in `<shard-dir>/config.json`.
-- Use `--max-batches` for smoke tests.
-- Assignments are useful before intrinsic-dim and required by the preferred
-  label workflow.
-
-### Nearest-Medoid / Nearest-Centroid Assignments
-
-`dalg-run-metrics assignments` also supports non-MFA centroids/medoids. Pass
-`--medoids-path` (alias `--centroids-path`) instead of `--data-dir`; the command
-streams the same activation shards but assigns each activation to the nearest
-Euclidean centroid.
-
-```bash
-PYTHONPATH=src .venv/bin/python -m dalg.cli.run_metrics assignments \
-  --medoids-path outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/k12/medoids.npy \
-  --shard-dir /orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations#pile_wikipedia_100K \
-  --layer 5 \
-  --batch-size 8192 \
-  --device cuda \
-  --save-path outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/k12/run_metrics_nearest_centroid_assignments.pt
-```
-
-Implementation:
-
-- `src/dalg/analysis/nearest_centroid_assignments.py` contains
-  `compute_nearest_centroid_assignments(...)` and the direct CLI.
-- `src/dalg/cli/run_metrics.py::cmd_assignments` chooses the MFA path when
-  `--data-dir` is passed and the nearest-centroid path when `--medoids-path` is
-  passed.
-
-Saved nearest-centroid fields:
-
-- `cluster_sizes`: `(K,)`
-- `assignments`: `(N,)`
-- `min_distances`: `(N,)`
-- `K`
-- `centroids_path`
-- `subset_spec`
-- `source`
-
-## Temporary Workflow: Wikipedia KMedoids Slice
-
-This workflow materializes the deterministic Wikipedia slice and runs KMedoids
-on it. It is experimental analysis code, not core library API.
-
-The native subset-suffix path is still streaming: `#pile_wikipedia_100K`
-resolves row positions and `ActivationBatchDataset` emits flattened activation
-batches from the original shards. `activations.npy` is only a derived,
-random-access cache for KMedoids/CLARA.
-
-Files:
-
-- `scripts/materialize_subset_activations.py`: streams a subset-spec shard
-  selection to the derived cache `activations.npy`.
-- `scripts/run_kmedoids.py`: runs CLARA-style KMedoids and saves medoids,
-  labels, medoid indices, distances, and config. `labels.npy` is the
-  nearest-medoid assignment for each row of `activations.npy`.
-- `tests/test_nearest_centroid_assignments.py`: unit tests for nearest-centroid
-  assignment.
-
-Clean 100K run:
-
-- Run root:
-  `outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/full_100k_clean`
-- Logs:
-  `full_100k_clean/logs/materialize.log` and
-  `full_100k_clean/logs/run_kmedoids.log`
-
-Commands that were run:
-
-```bash
-mkdir -p outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/full_100k_clean/logs
-
-PYTHONPATH=src .venv/bin/python scripts/materialize_subset_activations.py \
-  --shard-dir /orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations#pile_wikipedia_100K \
-  --layer 5 \
-  --out-dir outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/full_100k_clean/data \
-  > outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/full_100k_clean/logs/materialize.log 2>&1
-
-PYTHONPATH=src .venv/bin/python scripts/run_kmedoids.py \
-  --activations-path outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/full_100k_clean/data/activations.npy \
-  --K 12 \
-  --out-dir outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/full_100k_clean/k12 \
-  --device cuda \
-  > outputs/experiments/pile_wikipedia_100K_layer05_kmedoids/full_100k_clean/logs/run_kmedoids.log 2>&1
-```
-
-Verified outputs:
-
-- `full_100k_clean/data/metadata.json`: `subset_spec=pile_wikipedia_100K`,
-  `resolved_rows=447`, `resolved_items=100128`,
-  `materialized_items=100128`, `shape=[100128, 2048]`
-- `full_100k_clean/data/activations.npy`: `(100128, 2048)`, `float32`
-- `full_100k_clean/k12/medoids.npy`: `(12, 2048)`, `float32`
-- `full_100k_clean/k12/labels.npy`: `(100128,)`
-- `full_100k_clean/k12/config.json`: backend, cluster sizes, paths, and any
-  sklearn-extra fallback error
-
-Do not recompute assignments with `dalg-run-metrics assignments --medoids-path`
-after `run_kmedoids.py` unless a later step specifically needs the `.pt`
-assignment-bundle format. For the materialized-array workflow, `labels.npy` is
-already the assignment output.
-
-KMedoids package note:
-
-- `pyproject.toml` includes `scikit-learn-extra>=0.3.0`.
-- In this environment, `sklearn_extra.cluster.CLARA` installs but fails to
-  import with NumPy 2.4 ABI errors.
-- `scripts/run_kmedoids.py` therefore tries `sklearn-extra` first and falls
-  back to a small local CLARA-style implementation. The backend and import error
-  are recorded in `full_100k_clean/k12/config.json`.
-
-## Recurring Workflow: Label MFA Gaussians
-
-The preferred labeling path starts from assignments, finds the top activation
-examples per cluster, recovers token-window contexts from the HF windows
-dataset, and optionally calls the Orfeo-hosted LLM to produce labels.
-
-```bash
-uv run dalg-label-mfa-clusters \
-  --assignments-path /path/to/mfa_run/mfa_model_assignments.pt \
-  --shard-dir /path/to/activation_shards \
-  --layer 5 \
-  --windows-dataset /path/to/windows_dataset/merged \
-  --tokenizer google/gemma-2b \
-  --out-dir /path/to/output_dir/cluster_labels \
-  --top-n 50 \
-  --max-examples-per-cluster 25 \
-  --pad 10 \
-  --chunk-size 2000000 \
-  --llm-workers 4 \
-  --llm-temperature 0.0 \
-  --llm-max-tokens 512
-```
-
-Outputs:
-
-- `top_activations.pt`
-- `cluster_examples.json`
-- `cluster_labels.json`
-
-Relevant Slurm script:
-
-- `scripts/slurm/sbatch_label_mfa_clusters.sh`
-
-Useful options:
-
-- `--skip-llm`: build top activations and context examples without calling the LLM
-- `--clusters 1 2 3`: label specific clusters
-- `--max-clusters N`: debug on first N clusters
-- `--top-index-path`: reuse or control the cached top-activation index path
-
-`dalg-interpret-mfa` is an older/more integrated interpretation CLI. It can use
-an assignments file when present, otherwise it falls back to scanning the model
-for top responsibilities. Prefer `dalg-label-mfa-clusters` when assignments have
-already been computed.
-
-## Temporary Workflow: Synthetic MFA Analyses
-
-There is an active temporary research workflow under `scripts/` and
-`notebooks/` for synthetic MFA experiments. Treat it as analysis code, not core
-library API.
-
-Main script:
-
-- `scripts/synthetic_mfa_qk_sweep.py`
-
-Purpose:
-
-- generate data from a known MFA
-- fit MFA models over a grid of fitted `K` and `q`
-- record responsibility peakiness and label-recovery metrics
-- collect results and plots
-
-Typical commands:
-
-```bash
-PYTHONPATH=src python scripts/synthetic_mfa_qk_sweep.py generate-dataset \
-  --dataset-path /orfeo/scratch/dssc/zenocosini/dalg-cache/assets/synthetic_mfa_Ktrue1000_qtrue20_D500_seed0.pt \
-  --D 500 --K-true 1000 --q-true 20 \
-  --n-train 500000 --n-test 10000 --seed 0
-
-PYTHONPATH=src python scripts/synthetic_mfa_qk_sweep.py fit-one \
-  --dataset-path /path/to/synthetic_dataset.pt \
-  --model-root dalg-cache/qk_sweep_exploration \
-  --run-name Ktrue1000_qtrue20 \
-  --K-fit 1250 --q-fit 20 \
-  --device cuda
-
-PYTHONPATH=src python scripts/synthetic_mfa_qk_sweep.py collect-results \
-  --model-root dalg-cache/qk_sweep_exploration \
-  --run-name Ktrue1000_qtrue20
-```
-
-Related scripts:
-
-- `scripts/slurm/sbatch_synthetic_qk_sweep.sh`: Slurm array over fitted K, with
-  an inner loop over q values
-- `scripts/synthetic_mfa_bhattacharyya_by_q.py`: post-hoc overlap/Bhattacharyya
-  summaries across q for a fixed fitted K
-- `scripts/synthetic_mfa_feature_splitting.py`: feature-splitting and covariance
-  reconstruction analysis over fitted sweep models
-- `scripts/slurm/sbatch_feature_splitting.sh`: Slurm wrapper for feature
-  splitting
-- `notebooks/synthetic_mfa_qk_sweep_results.ipynb`: exploratory result notebook
-- `outputs/experiments/synthetic_qk_sweep_report/`: offline report artifacts
-
-Generated synthetic models can be very large and live under `dalg-cache/`.
-Do not delete or overwrite them unless the user explicitly asks.
+## Workflow Skills
+
+Recurring operational procedures live in project skills so they are loaded only
+when relevant. Codex discovers the canonical skills under `.agents/skills/`;
+Claude Code reaches the same directories through `.claude/skills/` symlinks.
+
+- `dalg-train-mfa`: activation extraction, vanilla training,
+  component-sharded training, checkpoint/resume behavior, and training launch
+  scripts.
+- `dalg-compute-assignments`: source-agnostic hard partitions using either MFA
+  responsibility argmax or nearest Euclidean centroids/medoids, plus stream
+  alignment and assignment-bundle validation.
+- `dalg-compute-metrics`: assignment-source-agnostic intrinsic dimension, MFA
+  geometric overlap, description metrics, devices, and output policy.
+- `dalg-label-mfa-clusters`: top activation contexts, selective or no-LLM
+  labeling, cached indexes, and label validation.
+
+Use only the skill relevant to the requested stage. Missing upstream artifacts
+are prerequisites to report, not permission to run additional pipeline stages.
+
+## Attachable Experimental Context
+
+Temporary experiment workflows are intentionally not always-loaded guidance or
+automatically triggered skills. Attach or read the relevant file only when the
+user places that experiment in scope:
+
+- `docs/experiments/wikipedia-kmedoids.md`
+- `docs/experiments/synthetic-mfa.md`
 
 ## Cluster and Scratch Notes
 
@@ -645,16 +222,17 @@ Common locations:
 - `logs/jobs/` and `logs/experiments/`: current Slurm log targets
 - `outputs/experiments/`: generated local/repo artifacts
 - `dalg-cache/`: symlink to `/orfeo/scratch/dssc/zenocosini/dalg-cache/`
-- `output/`: symlink to scratch output artifacts
 
 Large data generally belongs on scratch, not home storage. Prefer writing new
-large artifacts under `dalg-cache/` or `output/`. Do not delete scratch data or
-large experiment outputs unless explicitly asked.
+large artifacts under `dalg-cache/`. Existing legacy outputs under
+`dalg-cache/output/` should remain untouched unless the user explicitly asks to
+move or delete them.
 
 Useful known scratch contents include:
 
 - `dalg-cache/pile_gemma2b_100M_windows/merged/`
 - `dalg-cache/pile_gemma2b_activations/`
+- `dalg-cache/pile_gemma2b_models/`
 - `dalg-cache/pile_gemma2b_activations_debug/`
 - `dalg-cache/qk_sweep_exploration/`
 
@@ -708,3 +286,4 @@ PYTHONPATH=src python -m torch.distributed.run --standalone --nproc_per_node=2 \
   changes.
 - Avoid generated outputs inside source folders.
 - When I ask you to implement an experimental module the guiding principle is: **implement something easy to add and easy to remove**. Avoid overengineering or overgeneralizing.
+- If you need to create scripts custom for a execute a specific experiment put under either scripts/temporary of scripts/slurm/temporary. Avoid cluttering the main scripts/ folder with one-off scripts.

@@ -13,7 +13,7 @@ The script is intentionally conservative:
 
 Typical usage:
     PYTHONPATH=src .venv/bin/python scripts/benchmark_shard_io.py \
-        --shard-dir /orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations \
+        --shard-dir /orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations \
         --layer 17
 """
 

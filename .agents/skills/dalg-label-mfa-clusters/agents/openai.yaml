@@ -1,0 +1,4 @@
+interface:
+  display_name: "Label DALG MFA Clusters"
+  short_description: "Build examples and labels for MFA clusters"
+  default_prompt: "Use $dalg-label-mfa-clusters to build examples or label the requested MFA clusters."

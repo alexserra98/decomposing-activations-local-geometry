@@ -25,6 +25,8 @@
 
 # ── Config (override with sbatch --export=ALL,KEY=value) ─────────────────
 SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations}
+MODELS_DIR=${MODELS_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_models}
+CENTROIDS_DIR=${CENTROIDS_DIR:-"$MODELS_DIR/centroids"}
 # SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/newsgroups_gemma2b_activations}
 LAYER=$SLURM_ARRAY_TASK_ID
 
@@ -65,10 +67,10 @@ SEED=${SEED:-42}
 LAYER_TAG="layer$(printf '%02d' "$LAYER")"
 CENTROID_TAG="k${K}_L$(printf '%02d' "$LAYER")"
 if [[ "$SMOKE" -eq 1 ]]; then
-  OUT_DIR=${OUT_DIR:-"$SHARD_DIR/${LAYER_TAG}_${K}_${RANK}_smoke_component_sharded_mfa"}
+  OUT_DIR=${OUT_DIR:-"$MODELS_DIR/${LAYER_TAG}_${K}_${RANK}_smoke_component_sharded_mfa"}
 else
-  OUT_DIR=${OUT_DIR:-"$SHARD_DIR/${LAYER_TAG}_${K}_${RANK}_component_sharded_mfa"}
-  CENTROIDS_PATH=${CENTROIDS_PATH:-"$SHARD_DIR/centroids/${CENTROID_TAG}/centroids.pt"}
+  OUT_DIR=${OUT_DIR:-"$MODELS_DIR/${LAYER_TAG}_${K}_${RANK}_component_sharded_mfa"}
+  CENTROIDS_PATH=${CENTROIDS_PATH:-"$CENTROIDS_DIR/${CENTROID_TAG}/centroids.pt"}
 fi
 
 EXTRA_ARGS=()

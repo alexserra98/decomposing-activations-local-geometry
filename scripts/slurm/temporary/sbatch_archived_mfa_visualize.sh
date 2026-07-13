@@ -12,24 +12,26 @@
 set -euo pipefail
 
 REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
-OUT_ROOT="$REPO_ROOT/output/experiments"
+ARCHIVE_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_models/archived
 VIS_MAX_COMPONENTS=${VIS_MAX_COMPONENTS:-4000}
 
-EXPERIMENTS=(
-  "1000_05"
-  "8000_05"
-  "32000_05"
-  "1000_17"
-  "8000_17"
-  "32000_17"
+RUNS=(
+  "layer05_1000_10_mfa:1000_05"
+  "layer05_8000_mfa:8000_05"
+  "layer05_32000_mfa:32000_05"
+  "layer17_1000_mfa:1000_17"
+  "layer17_8000_mfa:8000_17"
+  "layer17_32000_mfa:32000_17"
 )
 
 cd "$REPO_ROOT" || exit 1
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 export MPLBACKEND=Agg
 
-for experiment_name in "${EXPERIMENTS[@]}"; do
-  out_dir="$OUT_ROOT/$experiment_name"
+for entry in "${RUNS[@]}"; do
+  run_name="${entry%%:*}"
+  experiment_name="${entry##*:}"
+  out_dir="$ARCHIVE_DIR/$run_name"
   echo "Visualizing $experiment_name from $out_dir"
   test -f "$out_dir/intrinsic_dims.pt"
   test -f "$out_dir/overlap.pt"

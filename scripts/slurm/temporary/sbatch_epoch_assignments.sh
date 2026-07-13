@@ -18,10 +18,9 @@
 # vectors are index-aligned for the cross-epoch comparison.
 
 REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
-RUN_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations/layer05_1000_10_component_sharded_mfa
+RUN_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_models/layer05_1000_10_component_sharded_mfa
 SHARD_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations
 LAYER=5
-OUT_DIR=$REPO_ROOT/output/experiments/layer05_1000_10_epoch_evolution
 
 EPOCHS=(epoch_0001 epoch_0005 epoch_0010 epoch_0015 62_epoch)
 EPNUM=(1 5 10 15 62)
@@ -29,7 +28,7 @@ EPOCH_DIR=${EPOCHS[$SLURM_ARRAY_TASK_ID]}
 N=${EPNUM[$SLURM_ARRAY_TASK_ID]}
 
 DATA_DIR=$RUN_DIR/$EPOCH_DIR
-EPOCH_OUT=$OUT_DIR/epoch_${N}
+EPOCH_OUT=$DATA_DIR
 
 mkdir -p "$EPOCH_OUT"
 cd "$REPO_ROOT" || exit 1

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Compute DALG Assignments"
+  short_description: "Build MFA or nearest-centroid partitions"
+  default_prompt: "Use $dalg-compute-assignments to compute only the requested MFA or nearest-centroid assignments."

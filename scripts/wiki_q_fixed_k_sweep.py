@@ -47,8 +47,8 @@ LAYER = 17
 RANK = 337                       # q, fixed
 K_LIST = [200, 400, 600, 800, 1000]   # default full grid; override per-run with --k-list
 # Folder carries the dataset size and fixed q, e.g.
-# pile_wikipedia_gemma2b_mfa_1m/q337_k_sweep.
-OUT_ROOT = Path(f"dalg-cache/pile_wikipedia_gemma2b_mfa_{SUBSET_TOKENS.lower()}/q{RANK}_k_sweep")
+# pile_gemma2b_models/pile_wikipedia_1m/q337_k_sweep.
+OUT_ROOT = Path(f"dalg-cache/pile_gemma2b_models/pile_wikipedia_{SUBSET_TOKENS.lower()}/q{RANK}_k_sweep")
 
 # ── Training hyperparameters ───────────────────────────────────────────────
 EPOCHS = 1000

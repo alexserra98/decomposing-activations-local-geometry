@@ -20,9 +20,9 @@ K=8000
 LAYER=$SLURM_ARRAY_TASK_ID
 LAYER_TAG=$(printf '%02d' "$LAYER")
 
-MFA_DIR=/orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations/layer${LAYER_TAG}_${K}_mfa
-SHARD_DIR=/orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations
-PROFILE_DIR=/u/dssc/zenocosini/decomposing-activations-local-geometry/outputs/experiments/${K}_${LAYER_TAG}_assignments_only
+MFA_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_models/layer${LAYER_TAG}_${K}_mfa
+SHARD_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations
+PROFILE_DIR="$MFA_DIR/assignment_profile"
 
 mkdir -p "$PROFILE_DIR"
 cd "$REPO_ROOT" || exit 1
