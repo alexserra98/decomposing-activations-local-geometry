@@ -2,7 +2,8 @@
 CLI for cluster-level metrics on a trained MFA.
 
 Subcommands:
-    overlap        Pairwise overlap metrics between MFA components.
+    gaussian-overlap
+                   Pairwise Gaussian-overlap metrics between MFA components.
     intrinsic-dim  PCA-based intrinsic dimensionality per cluster.
     assignments    Hard cluster assignments. With an MFA, streams activations
                    through responsibilities; with medoids, assigns by nearest
@@ -22,7 +23,7 @@ from the interpretation pipeline.
 
 Example::
 
-    dalg-run-metrics overlap \
+    dalg-run-metrics gaussian-overlap \
         --data-dir /path/to/layer05_mfa --device cuda --batch-pairs 512
 
     dalg-run-metrics intrinsic-dim \
@@ -50,19 +51,23 @@ def _resolve_model_path(data_dir: str) -> tuple[Path, Path]:
     return run_dir / "mfa_model.pt", run_dir
 
 
-def cmd_overlap(args) -> None:
-    """Compute pairwise overlap metrics between MFA components."""
-    from dalg.analysis.cluster_overlap import compute_overlap
+def cmd_gaussian_overlap(args) -> None:
+    """Compute pairwise Gaussian-overlap metrics between MFA components."""
+    from dalg.analysis.gaussian_overlap import compute_gaussian_overlap
 
     model_path, run_dir = _resolve_model_path(args.data_dir)
     out_dir = Path(args.out_dir or run_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    results = compute_overlap(model_path, device=args.device, batch_pairs=args.batch_pairs)
+    results = compute_gaussian_overlap(
+        model_path,
+        device=args.device,
+        batch_pairs=args.batch_pairs,
+    )
 
-    save_path = out_dir / "overlap.pt"
+    save_path = out_dir / "gaussian_overlap.pt"
     torch.save(results, save_path)
-    print(f"Overlap saved to {save_path}")
+    print(f"Gaussian overlap saved to {save_path}")
 
 #TODO remove monolithic option
 def cmd_intrinsic_dim(args) -> None:
@@ -360,7 +365,7 @@ def cmd_description_semantics(args) -> None:
 
 
 def cmd_gaussian_group_semantics(args) -> None:
-    """Cluster Gaussians by overlap distance and score label coherence."""
+    """Cluster Gaussians by distributional distance and score label coherence."""
     import csv
     import json
 
@@ -369,7 +374,7 @@ def cmd_gaussian_group_semantics(args) -> None:
     out_dir = _description_out_dir(args)
     output = compute_gaussian_group_label_coherence(
         args.labels_path,
-        args.overlap_path,
+        args.gaussian_overlap_path,
         model_name=args.embedding_model,
         device=args.embedding_device,
         batch_size=args.embedding_batch_size,
@@ -404,7 +409,7 @@ def cmd_gaussian_group_semantics(args) -> None:
 
 
 def validate_args(args) -> None:
-    if args.command == "overlap":
+    if args.command == "gaussian-overlap":
         if args.data_dir is None:
             raise SystemExit(f"{args.command}: --data-dir is required")
     if args.command == "intrinsic-dim":
@@ -443,11 +448,14 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--out-dir", default=None,
                         help="Where to save the result (default: same as --data-dir)")
 
-    sp = sub.add_parser("overlap", help="Compute pairwise overlap metrics")
+    sp = sub.add_parser(
+        "gaussian-overlap",
+        help="Compute pairwise Gaussian-overlap metrics",
+    )
     add_common(sp)
     sp.add_argument("--batch-pairs", type=int, default=4096,
-                    help="Pairs per batch for vectorized overlap")
-    sp.set_defaults(func=cmd_overlap)
+                    help="Pairs per batch for vectorized Gaussian overlap")
+    sp.set_defaults(func=cmd_gaussian_overlap)
 
     sp = sub.add_parser("intrinsic-dim", help="Compute intrinsic dim per cluster")
     add_common(sp)
@@ -561,12 +569,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument("--labels-path", required=True,
                     help="Path to cluster_labels.json from dalg-label-mfa-clusters")
-    sp.add_argument("--overlap-path", required=True,
-                    help="Path to overlap.pt containing a square Gaussian distance matrix")
+    sp.add_argument(
+        "--gaussian-overlap-path",
+        required=True,
+        help="Path to gaussian_overlap.pt containing a square Gaussian distance matrix",
+    )
     sp.add_argument("--out-dir", default=None,
                     help="Where to save gaussian_group_label_coherence.json and CSV")
-    sp.add_argument("--distance-key", default="db",
-                    help="Distance matrix key inside overlap.pt, usually db")
+    sp.add_argument(
+        "--distance-key",
+        default="db",
+        help="Distance matrix key inside gaussian_overlap.pt, usually db",
+    )
     sp.add_argument("--distance-threshold", type=float, required=True,
                     help="Hierarchical clustering distance cutoff")
     sp.add_argument("--linkage", choices=("average", "complete", "single"), default="average")

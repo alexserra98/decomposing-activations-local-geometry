@@ -1,4 +1,4 @@
-"""Sanity checks for MFA overlap and responsibility peakiness diagnostics."""
+"""Sanity checks for MFA Gaussian overlap and responsibility peakiness."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT))
 
 from dalg.analysis.cluster_assignments import compute_assignments  # noqa: E402
-from dalg.analysis.cluster_overlap import compute_overlap  # noqa: E402
+from dalg.analysis.gaussian_overlap import compute_gaussian_overlap  # noqa: E402
 from dalg.models.mfa import MFA, save_mfa  # noqa: E402
 
 
@@ -71,7 +71,7 @@ class OverlapAndAssignmentSanityTests(unittest.TestCase):
         tmp, model_path = _save_temp_model(model)
         self.addCleanup(tmp.cleanup)
 
-        overlap = compute_overlap(model_path, batch_pairs=16)
+        overlap = compute_gaussian_overlap(model_path, batch_pairs=16)
         self.assertTrue(torch.allclose(overlap["kl_sym"], torch.zeros(K, K), atol=1e-5))
         self.assertTrue(torch.allclose(overlap["db"], torch.zeros(K, K), atol=1e-5))
         self.assertTrue(torch.allclose(overlap["db_mean"], torch.zeros(K, K), atol=1e-5))
@@ -116,7 +116,7 @@ class OverlapAndAssignmentSanityTests(unittest.TestCase):
         tmp, model_path = _save_temp_model(model)
         self.addCleanup(tmp.cleanup)
 
-        overlap = compute_overlap(model_path, batch_pairs=16)
+        overlap = compute_gaussian_overlap(model_path, batch_pairs=16)
         maha = torch.cdist(mu, mu) ** 2
         expected_db = maha / 8.0
         expected_kl_sym = maha / 2.0

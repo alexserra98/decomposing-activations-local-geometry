@@ -13,7 +13,7 @@ activations:
 
 - each component is a local activation region with centroid `mu_k`
 - each component has a local low-rank subspace `W_k`
-- the model supports cluster/region analysis, overlap metrics, intrinsic
+- the model supports cluster/region analysis, Gaussian overlap metrics, intrinsic
   dimension estimates, interpretation from top token contexts, and steering
 
 This is research code. Prefer clear, direct implementations over general
@@ -30,7 +30,7 @@ src/dalg/
   init/           Reservoir KMeans centroid initialization
   data/           Window builders and activation-shard streaming
   llm/            TransformerLens activation extraction wrapper
-  analysis/       Overlap, intrinsic dim, assignments, labels, description metrics
+  analysis/       Gaussian overlap, intrinsic dim, assignments, labels, description metrics
   intervention/   Region/subspace steering code
 
 scripts/slurm/    Cluster job scripts for extraction, training, metrics, labels
@@ -70,7 +70,7 @@ Preferred CLI entrypoints are defined in `pyproject.toml`:
 - `dalg-run-metrics`
 - `dalg-interpret-mfa`
 - `dalg-label-mfa-clusters`
-- `dalg-cluster-overlap`
+- `dalg-gaussian-overlap`
 - `dalg-cluster-intrinsic-dim`
 - `dalg-build-pile-windows`
 - `dalg-build-newsgroups-windows`
@@ -82,7 +82,7 @@ token windows dataset
   -> activation shards
   -> centroid init
   -> MFA training
-  -> assignments / overlap / intrinsic dim
+  -> assignments / Gaussian overlap / intrinsic dim
   -> cluster examples and LLM labels
   -> optional description metrics / steering / notebooks
 ```
@@ -146,7 +146,8 @@ Two functions form the whole surface:
 
 The suffix is honored end-to-end: training, `dalg-run-metrics assignments` /
 `intrinsic-dim`, the standalone `cluster_assignments`, and
-`dalg-label-mfa-clusters`. `overlap` needs no filter (pure model geometry).
+`dalg-label-mfa-clusters`. `gaussian-overlap` needs no filter (pure model
+geometry).
 Assignments save the resolved `subset_spec`, and labeling falls back to that
 recorded value when `--shard-dir` carries no suffix, so positions are always
 inverted through the same filtered meta. When no `#<spec>` is present behavior is
@@ -195,7 +196,7 @@ Claude Code reaches the same directories through `.claude/skills/` symlinks.
   responsibility argmax or nearest Euclidean centroids/medoids, plus stream
   alignment and assignment-bundle validation.
 - `dalg-compute-metrics`: assignment-source-agnostic intrinsic dimension, MFA
-  geometric overlap, description metrics, devices, and output policy.
+  Gaussian overlap, description metrics, devices, and output policy.
 - `dalg-label-mfa-clusters`: top activation contexts, selective or no-LLM
   labeling, cached indexes, and label validation.
 

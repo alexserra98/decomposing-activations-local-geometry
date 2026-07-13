@@ -1,11 +1,11 @@
-"""Empirical probes for MFA overlap, factor rank, and assignment peakiness.
+"""Empirical probes for MFA Gaussian overlap, factor rank, and assignment peakiness.
 
 Run directly, for example:
 
-    PYTHONPATH=src python tests/empirical_overlap_assignment_sweep.py
+    PYTHONPATH=src python tests/empirical_gaussian_overlap_assignment_sweep.py
 
 The script writes plots and raw results under
-``outputs/experiments/overlap_assignment_sweep`` by default.
+``outputs/experiments/gaussian_overlap_assignment_sweep`` by default.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT))
 
 from dalg.analysis.cluster_assignments import compute_assignments  # noqa: E402
-from dalg.analysis.cluster_overlap import compute_overlap  # noqa: E402
+from dalg.analysis.gaussian_overlap import compute_gaussian_overlap  # noqa: E402
 from dalg.models.mfa import MFA, save_mfa  # noqa: E402
 
 
@@ -139,7 +139,7 @@ def summarize_run(
 ) -> dict[str, float | int | str]:
     tmp, path = save_model_to_tmp(model)
     try:
-        overlap = compute_overlap(path, batch_pairs=16)
+        overlap = compute_gaussian_overlap(path, batch_pairs=16)
         sizes, _assignments, max_resp, peakedness = compute_assignments(
             path,
             [x],
@@ -318,7 +318,7 @@ def save_plots(rows: list[dict[str, float | int | str]], out_dir: Path) -> None:
     format_q_axis(ax)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(out_dir / "overlap_vs_q.png", dpi=160)
+    fig.savefig(out_dir / "gaussian_overlap_vs_q.png", dpi=160)
     plt.close(fig)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
@@ -365,8 +365,12 @@ def save_plots(rows: list[dict[str, float | int | str]], out_dir: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Empirical MFA overlap/assignment sweep")
-    parser.add_argument("--out-dir", type=Path, default=REPO_ROOT / "outputs/experiments/overlap_assignment_sweep")
+    parser = argparse.ArgumentParser(description="Empirical MFA Gaussian-overlap/assignment sweep")
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=REPO_ROOT / "outputs/experiments/gaussian_overlap_assignment_sweep",
+    )
     parser.add_argument("--n-samples", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--close-mean-distance", type=float, default=CLOSE_MEAN_DISTANCE)

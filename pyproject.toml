@@ -9,6 +9,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "dadapy",
     "datasets>=4.8.4",
     "dotenv>=0.9.9",
     "huggingface-hub>=1.5.0,<2.0",
@@ -31,7 +32,7 @@ dalg-run-metrics = "dalg.cli.run_metrics:main"
 dalg-run-training = "dalg.cli.run_training:main"
 dalg-interpret-mfa = "dalg.cli.interpret_mfa:main"
 dalg-label-mfa-clusters = "dalg.cli.label_mfa_clusters:main"
-dalg-cluster-overlap = "dalg.analysis.cluster_overlap:main"
+dalg-gaussian-overlap = "dalg.analysis.gaussian_overlap:main"
 dalg-cluster-intrinsic-dim = "dalg.analysis.cluster_intrinsic_dim:main"
 dalg-build-pile-windows = "dalg.data.build_pile_windows:main"
 dalg-build-newsgroups-windows = "dalg.data.build_newsgroups_windows:main"
@@ -41,3 +42,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.uv.sources]
+dadapy = { git = "https://github.com/sissa-data-science/DADApy" }

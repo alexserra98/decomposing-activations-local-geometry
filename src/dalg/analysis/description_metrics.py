@@ -736,7 +736,7 @@ def _condensed_distance(distance: torch.Tensor) -> torch.Tensor:
 
 def compute_gaussian_group_label_coherence(
     labels_path: str | Path,
-    overlap_path: str | Path,
+    gaussian_overlap_path: str | Path,
     *,
     embedder: TransformerTextEmbedder | Any | None = None,
     model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
@@ -751,14 +751,16 @@ def compute_gaussian_group_label_coherence(
     from scipy.cluster.hierarchy import fcluster, linkage as scipy_linkage
 
     labels_path = Path(labels_path)
-    overlap_path = Path(overlap_path)
+    gaussian_overlap_path = Path(gaussian_overlap_path)
     loaded = load_labeled_clusters(labels_path)
     clusters = loaded["clusters"]
 
-    overlap = torch.load(overlap_path, map_location="cpu")
-    if distance_key not in overlap:
-        raise ValueError(f"{overlap_path} is missing distance key {distance_key!r}")
-    distance = overlap[distance_key].float().cpu()
+    gaussian_overlap = torch.load(gaussian_overlap_path, map_location="cpu")
+    if distance_key not in gaussian_overlap:
+        raise ValueError(
+            f"{gaussian_overlap_path} is missing distance key {distance_key!r}"
+        )
+    distance = gaussian_overlap[distance_key].float().cpu()
     if distance.ndim != 2 or distance.shape[0] != distance.shape[1]:
         raise ValueError(f"{distance_key} must be a square matrix, got shape {tuple(distance.shape)}")
 
@@ -766,7 +768,10 @@ def compute_gaussian_group_label_coherence(
     wanted = list(range(K))
     missing = [cluster_id for cluster_id in wanted if cluster_id not in clusters]
     if missing:
-        raise ValueError(f"labels are missing component ids from overlap matrix: {missing[:10]}")
+        raise ValueError(
+            "labels are missing component ids from Gaussian-overlap matrix: "
+            f"{missing[:10]}"
+        )
 
     if embedder is None:
         embedder = TransformerTextEmbedder(model_name, device=device)
@@ -837,7 +842,7 @@ def compute_gaussian_group_label_coherence(
     return {
         "metadata": {
             "labels_path": str(labels_path),
-            "overlap_path": str(overlap_path),
+            "gaussian_overlap_path": str(gaussian_overlap_path),
             "distance_key": distance_key,
             "distance_threshold": float(distance_threshold),
             "linkage": linkage,

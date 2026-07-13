@@ -10,18 +10,25 @@
 
 Do not force every metric through a model directory. Model-geometric metrics need a model; assignment-derived metrics can use an explicit assignment bundle without `--data-dir`.
 
-## Component overlap
+## Gaussian overlap
 
 ```bash
-uv run dalg-run-metrics overlap \
+uv run dalg-run-metrics gaussian-overlap \
   --data-dir /path/to/mfa_run \
   --device cuda \
   --batch-pairs 512
 ```
 
-Output: `<model_dir>/overlap.pt` when `--out-dir` is omitted.
+Standalone equivalent: `uv run dalg-gaussian-overlap ...`.
 
-Overlap is pure MFA Gaussian geometry and needs no assignment bundle, shard directory, or subset filtering. It is not currently a metric over arbitrary hard partitions. For high latent rank, reduce `--batch-pairs`; large pair batches can create tensors proportional to `batch_pairs x D x q` and cause GPU OOM.
+Output: `<model_dir>/gaussian_overlap.pt` when `--out-dir` is omitted.
+
+Gaussian overlap is pure MFA distribution geometry and needs no assignment
+bundle, shard directory, or subset filtering. It is distinct from neighbor
+overlap, which compares neighborhoods. Gaussian overlap is not a metric over
+arbitrary hard partitions. For high latent rank, reduce `--batch-pairs`; large
+pair batches can create tensors proportional to `batch_pairs x D x q` and cause
+GPU OOM.
 
 Relevant launcher: `scripts/slurm/sbatch_metrics.sh`.
 
@@ -80,4 +87,4 @@ Outputs include `description_semantics.pt` and JSON summaries. Other label-coher
 - Inspect `K`, matrix or vector shapes, finite values, and configuration metadata when present.
 - For label JSON, verify cluster coverage and referenced example structure.
 - Do not treat successful file creation as proof that assignments or subset alignment were correct.
-- Report clearly that overlap is model-geometric, while intrinsic dimension is assignment-partition based.
+- Report clearly that Gaussian overlap is model-geometric, while intrinsic dimension is assignment-partition based. Do not abbreviate it to "overlap" where it could be confused with neighbor overlap.

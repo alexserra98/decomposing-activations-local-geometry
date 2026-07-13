@@ -16,7 +16,7 @@ set -euo pipefail
 REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
 MODELS_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_models
 SHARD_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations
-STAGE=${STAGE:?Submit with STAGE=assignments, intrinsic_dim, or overlap}
+STAGE=${STAGE:?Submit with STAGE=assignments, intrinsic_dim, or gaussian_overlap}
 
 # Keep this explicit: the two 32,000-component runs are intentionally excluded.
 RUN_SPECS=(
@@ -74,21 +74,21 @@ case "$STAGE" in
     mv "$TMP_DIR/intrinsic_dims.pt" "$RUN_DIR/intrinsic_dims.pt"
     ;;
 
-  overlap)
+  gaussian_overlap)
     BATCH_PAIRS=4096
     if (( RANK >= 300 )); then
       BATCH_PAIRS=512
     fi
-    .venv/bin/python -u -m dalg.cli.run_metrics overlap \
+    .venv/bin/python -u -m dalg.cli.run_metrics gaussian-overlap \
       --data-dir "$RUN_DIR" \
       --out-dir "$TMP_DIR" \
       --device cuda \
       --batch-pairs "$BATCH_PAIRS"
-    mv "$TMP_DIR/overlap.pt" "$RUN_DIR/overlap.pt"
+    mv "$TMP_DIR/gaussian_overlap.pt" "$RUN_DIR/gaussian_overlap.pt"
     ;;
 
   *)
-    echo "Unknown STAGE=$STAGE; expected assignments, intrinsic_dim, or overlap." >&2
+    echo "Unknown STAGE=$STAGE; expected assignments, intrinsic_dim, or gaussian_overlap." >&2
     exit 2
     ;;
 esac

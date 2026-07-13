@@ -92,10 +92,10 @@ case "$METRIC_TARGET" in
     ;;
 esac
 
-# Step 3: pairwise component overlap
+# Step 3: pairwise Gaussian overlap between MFA components
 # batch_pairs=512: peak GPU ≈ 10 GB (7 W-type tensors × 512 × D × q × 4 bytes)
 # default 4096 OOMs because W-chunk (4096, 2048, 337) alone exceeds H100 memory
-# uv run dalg-run-metrics overlap \
+# uv run dalg-run-metrics gaussian-overlap \
 #   --data-dir "$DATA_DIR" \
 #   --out-dir "$OUT_DIR" \
 #   --device cuda --batch-pairs 512

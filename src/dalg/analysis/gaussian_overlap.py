@@ -1,5 +1,5 @@
 # %% [markdown]
-# ## Analytical Overlap Between MFA Components
+# ## Analytical Gaussian Overlap Between MFA Components
 #
 # Each MFA component $k$ defines a Gaussian $\mathcal{N}(\mu_k, C_k)$ where
 # $C_k = W_k W_k^\top + \Psi_k$ (low-rank plus diagonal). We compute three
@@ -31,10 +31,10 @@ from tqdm import tqdm
 from dalg.models.mfa import load_mfa
 
 
-OverlapResults = dict[str, torch.Tensor]
+GaussianOverlapResults = dict[str, torch.Tensor]
 
 
-# ── Vectorized overlap computation ──────────────────────────────────────
+# ── Vectorized Gaussian-overlap computation ───────────────────────────
 
 
 def _cholesky_with_jitter(M: torch.Tensor, eps: float) -> torch.Tensor:
@@ -170,14 +170,14 @@ def _batched_bhattacharyya(
     return db_mean, db_cov, db, bc
 
 
-def compute_overlap(
+def compute_gaussian_overlap(
     model_path: Path,
     *,
     device: str | torch.device = "cpu",
     batch_pairs: int = 4096,
-) -> OverlapResults:
+) -> GaussianOverlapResults:
     """
-    Compute pairwise overlap metrics between all MFA components.
+    Compute pairwise Gaussian-overlap metrics between all MFA components.
 
     Args:
         model_path: Path to saved MFA model (.pt file).
@@ -223,7 +223,7 @@ def compute_overlap(
     bc_flat      = torch.zeros(n_pairs)
 
     with torch.no_grad():
-        for start in tqdm(range(0, n_pairs, batch_pairs), desc="pairwise overlap"):
+        for start in tqdm(range(0, n_pairs, batch_pairs), desc="pairwise Gaussian overlap"):
             end = min(start + batch_pairs, n_pairs)
             idx_i = pairs[0, start:end]
             idx_j = pairs[1, start:end]
@@ -302,7 +302,7 @@ def compute_overlap(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Pairwise overlap metrics for MFA components")
+    parser = argparse.ArgumentParser(description="Pairwise Gaussian-overlap metrics for MFA components")
     parser.add_argument("--model-path", type=Path, required=True, help="Path to mfa_model.pt")
     parser.add_argument("--save-path", type=Path, default=None, help="Where to save results (default: next to model)")
     parser.add_argument("--device", default="cpu")
@@ -310,9 +310,9 @@ def main() -> None:
                         help="Pairs per batch (tune for GPU memory)")
     args = parser.parse_args()
 
-    results = compute_overlap(args.model_path, device=args.device, batch_pairs=args.batch_pairs)
+    results = compute_gaussian_overlap(args.model_path, device=args.device, batch_pairs=args.batch_pairs)
 
-    save_path = args.save_path or args.model_path.parent / "overlap.pt"
+    save_path = args.save_path or args.model_path.parent / "gaussian_overlap.pt"
     torch.save(results, save_path)
     print(f"Saved to {save_path}")
 
@@ -330,7 +330,7 @@ if __name__ == "__main__":
 # %%
 # To use the visualization cells, load results:
 #
-#   results = torch.load("overlap.pt")
+#   results = torch.load("gaussian_overlap.pt")
 #   kl_sym, db, db_mean, db_cov, bc = (
 #       results["kl_sym"], results["db"], results["db_mean"],
 #       results["db_cov"], results["bc"],
@@ -364,6 +364,6 @@ if __name__ == "__main__":
 #     ax.set_xlabel("component j")
 #     ax.set_ylabel("component i")
 #     plt.colorbar(im, ax=ax)
-# plt.suptitle("Pairwise overlap — reordered by hierarchical clustering", y=1.02)
+# plt.suptitle("Pairwise Gaussian overlap — reordered by hierarchical clustering", y=1.02)
 # plt.tight_layout()
 # plt.show()

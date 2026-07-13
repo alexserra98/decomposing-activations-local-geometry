@@ -2,10 +2,11 @@
 
 Heavy post-hoc analysis extracted from
 ``notebooks/synthetic_mfa_qk_sweep_results.ipynb`` so it can run outside
-Jupyter. For one fitted K and seed, it computes or loads the pairwise overlap
-matrices for every available q value:
+Jupyter. For one fitted K and seed, it computes or loads the pairwise Gaussian
+overlap matrices for every available q value:
 
-* ``<fit_dir>/overlap.pt`` - full output from ``compute_overlap`` for each fit
+* ``<fit_dir>/gaussian_overlap.pt`` - full output from
+  ``compute_gaussian_overlap`` for each fit
 * ``<run_dir>/bhattacharyya_by_q_K####_seed####.csv`` - scalar summary
 * ``<run_dir>/bhattacharyya_by_q_K####_seed####.pt`` - summary plus metadata
 
@@ -34,7 +35,7 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from dalg.analysis.cluster_overlap import compute_overlap  # noqa: E402
+from dalg.analysis.gaussian_overlap import compute_gaussian_overlap  # noqa: E402
 
 DEFAULT_RUN_DIR = REPO_ROOT / "dalg-cache/qk_sweep_exploration/Ktrue1000_qtrue20"
 FIT_DIR_RE = re.compile(r"^K(\d+)_q(\d+)_seed(\d+)$")
@@ -136,7 +137,7 @@ def save_summary(
     return rows
 
 
-def load_or_compute_overlap(
+def load_or_compute_gaussian_overlap(
     fit_dir: Path,
     *,
     device: str,
@@ -144,21 +145,26 @@ def load_or_compute_overlap(
     force: bool,
     require_existing: bool,
 ) -> tuple[dict[str, torch.Tensor], str]:
-    """Return overlap matrices and whether they came from cache or compute."""
-    overlap_path = fit_dir / "overlap.pt"
-    if overlap_path.exists() and not force:
-        return torch.load(overlap_path, map_location="cpu", weights_only=False), "cached"
+    """Return Gaussian-overlap matrices and their cache/compute status."""
+    gaussian_overlap_path = fit_dir / "gaussian_overlap.pt"
+    if gaussian_overlap_path.exists() and not force:
+        return torch.load(
+            gaussian_overlap_path, map_location="cpu", weights_only=False
+        ), "cached"
     if require_existing:
         raise FileNotFoundError(
-            f"{overlap_path} not found. Re-run without --require-existing to compute it."
+            f"{gaussian_overlap_path} not found. Re-run without --require-existing "
+            "to compute it."
         )
 
-    overlap = compute_overlap(fit_dir / "mfa_model.pt", device=device, batch_pairs=batch_pairs)
-    torch.save(overlap, overlap_path)
-    return overlap, "computed"
+    gaussian_overlap = compute_gaussian_overlap(
+        fit_dir / "mfa_model.pt", device=device, batch_pairs=batch_pairs
+    )
+    torch.save(gaussian_overlap, gaussian_overlap_path)
+    return gaussian_overlap, "computed"
 
 
-def summarize_overlap(
+def summarize_gaussian_overlap(
     fit_dir: Path,
     K: int,
     q: int,
@@ -170,16 +176,16 @@ def summarize_overlap(
     force: bool,
     require_existing: bool,
 ) -> dict:
-    """Compute/load one overlap matrix and summarize its off-diagonal values."""
+    """Compute/load one Gaussian-overlap matrix and summarize it."""
     t0 = time.time()
-    overlap, status = load_or_compute_overlap(
+    gaussian_overlap, status = load_or_compute_gaussian_overlap(
         fit_dir,
         device=device,
         batch_pairs=batch_pairs,
         force=force,
         require_existing=require_existing,
     )
-    mat = overlap[metric].detach().cpu()
+    mat = gaussian_overlap[metric].detach().cpu()
     off_diag = mat[~torch.eye(mat.shape[0], dtype=torch.bool)]
     if off_diag.numel():
         mean_offdiag = float(off_diag.mean().item())
@@ -197,7 +203,7 @@ def summarize_overlap(
         "mean_offdiag": mean_offdiag,
         "min_offdiag": min_offdiag,
         "max_offdiag": max_offdiag,
-        "overlap_path": str(fit_dir / "overlap.pt"),
+        "gaussian_overlap_path": str(fit_dir / "gaussian_overlap.pt"),
         "status": status,
         "seconds": time.time() - t0,
     }
@@ -206,13 +212,13 @@ def summarize_overlap(
 def _cap_worker_threads(n_threads: int) -> None:
     """Process-pool initializer: cap each worker to a small torch thread count.
 
-    ``compute_overlap`` works on small per-pair tensors (D and q are small), so
-    its torch ops stop getting faster past roughly 8 threads and actively slow
-    down with many more (thread-launch overhead dominates the tiny matmuls /
-    cholesky). torch defaults ``num_threads`` to the full core count, which is
-    the wrong regime here. Pinning each worker to a small slice both keeps every
-    worker in its fast regime and leaves cores free for other workers, so a
-    high-core machine can run many fits at once.
+    ``compute_gaussian_overlap`` works on small per-pair tensors (D and q are
+    small), so its torch ops stop getting faster past roughly 8 threads and
+    actively slow down with many more (thread-launch overhead dominates the tiny
+    matmuls / cholesky). torch defaults ``num_threads`` to the full core count,
+    which is the wrong regime here. Pinning each worker to a small slice both
+    keeps every worker in its fast regime and leaves cores free for other
+    workers, so a high-core machine can run many fits at once.
     """
     torch.set_num_threads(max(1, n_threads))
 
@@ -228,7 +234,7 @@ def _summarize_fit(
 ) -> dict:
     """Module-level worker so it is picklable for ProcessPoolExecutor."""
     fit_dir, K, q, seed = fit
-    return summarize_overlap(
+    return summarize_gaussian_overlap(
         fit_dir,
         K,
         q,
@@ -254,9 +260,10 @@ def main() -> None:
     parser.add_argument("--metric", choices=METRICS, default="db",
                         help="Metric to summarize in the CSV/PT output.")
     parser.add_argument("--device", default="cpu",
-                        help="Device used by compute_overlap when overlap.pt is missing.")
+                        help="Device used by compute_gaussian_overlap when "
+                             "gaussian_overlap.pt is missing.")
     parser.add_argument("--batch-pairs", type=int, default=4096,
-                        help="Pairs per overlap batch (tune for memory).")
+                        help="Pairs per Gaussian-overlap batch (tune for memory).")
     parser.add_argument("--parallel", action="store_true", default=_env_flag("PARALLEL"),
                         help="Compute q values concurrently (CPU only). Can also be enabled with PARALLEL=1.")
     parser.add_argument("--workers", type=int, default=int(os.environ.get("PARALLEL_WORKERS", "0")),
@@ -264,13 +271,14 @@ def main() -> None:
                              "0 (default) auto-picks cpu_count // threads-per-worker.")
     parser.add_argument("--threads-per-worker", type=int,
                         default=int(os.environ.get("PARALLEL_THREADS_PER_WORKER", "8")),
-                        help="torch threads each worker may use. compute_overlap stops "
+                        help="torch threads each worker may use. compute_gaussian_overlap stops "
                              "speeding up past ~8 threads (small D/q ops), so keeping this "
                              "low lets many workers run on a high-core machine.")
     parser.add_argument("--force", action="store_true",
-                        help="Recompute overlap.pt even if it already exists.")
+                        help="Recompute gaussian_overlap.pt even if it already exists.")
     parser.add_argument("--require-existing", action="store_true",
-                        help="Only summarize existing overlap.pt files; do not compute missing ones.")
+                        help="Only summarize existing gaussian_overlap.pt files; do not "
+                             "compute missing ones.")
     args = parser.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():

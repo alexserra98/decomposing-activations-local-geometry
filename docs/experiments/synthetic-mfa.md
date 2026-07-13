@@ -38,7 +38,9 @@ PYTHONPATH=src python scripts/synthetic_dataset/synthetic_mfa_qk_sweep.py collec
 ## Related analysis
 
 - `scripts/slurm/sbatch_synthetic_qk_sweep.sh`: Slurm array over fitted `K`, with an inner loop over `q` values.
-- `scripts/synthetic_dataset/synthetic_mfa_bhattacharyya_by_q.py`: post-hoc overlap and Bhattacharyya summaries across `q` for a fixed fitted `K`.
+- `scripts/synthetic_dataset/synthetic_mfa_bhattacharyya_by_q.py`: post-hoc
+  Gaussian overlap and Bhattacharyya summaries across `q` for a fixed fitted
+  `K`.
 - `scripts/synthetic_dataset/synthetic_mfa_feature_splitting.py`: feature-splitting and covariance-reconstruction analysis over fitted sweep models.
 - `scripts/slurm/sbatch_feature_splitting.sh`: Slurm wrapper for feature splitting.
 - `notebooks/archived/synthetic_mfa_qk_sweep_results.ipynb`: exploratory result notebook.

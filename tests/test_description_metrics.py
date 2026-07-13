@@ -210,7 +210,7 @@ class DescriptionMetricsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             labels_path = root / "cluster_labels.json"
-            overlap_path = root / "overlap.pt"
+            gaussian_overlap_path = root / "gaussian_overlap.pt"
             _write_labels(labels_path)
             torch.save({
                 "db": torch.tensor([
@@ -218,11 +218,11 @@ class DescriptionMetricsTests(unittest.TestCase):
                     [4.0, 0.0, 5.0],
                     [0.1, 5.0, 0.0],
                 ])
-            }, overlap_path)
+            }, gaussian_overlap_path)
 
             out = compute_gaussian_group_label_coherence(
                 labels_path,
-                overlap_path,
+                gaussian_overlap_path,
                 embedder=FakeEmbedder(),
                 distance_threshold=0.2,
                 linkage="average",
@@ -235,9 +235,22 @@ class DescriptionMetricsTests(unittest.TestCase):
         self.assertEqual(out["groups"][0]["label_cosine"]["count"], 1)
         self.assertGreater(out["groups"][0]["label_cosine"]["mean"], 0.99)
         self.assertAlmostEqual(out["groups"][0]["distance"]["mean"], 0.1, places=6)
+        self.assertEqual(
+            out["metadata"]["gaussian_overlap_path"],
+            str(gaussian_overlap_path),
+        )
 
-    def test_run_metrics_parser_accepts_description_commands(self):
+    def test_run_metrics_parser_accepts_gaussian_overlap_and_description_commands(self):
         parser = build_parser()
+
+        args = parser.parse_args([
+            "gaussian-overlap",
+            "--data-dir",
+            "mfa_run",
+        ])
+        validate_args(args)
+        self.assertEqual(args.command, "gaussian-overlap")
+
         args = parser.parse_args([
             "description-fit",
             "--labels-path",
@@ -271,8 +284,8 @@ class DescriptionMetricsTests(unittest.TestCase):
             "gaussian-group-semantics",
             "--labels-path",
             "cluster_labels.json",
-            "--overlap-path",
-            "overlap.pt",
+            "--gaussian-overlap-path",
+            "gaussian_overlap.pt",
             "--distance-threshold",
             "0.5",
         ])

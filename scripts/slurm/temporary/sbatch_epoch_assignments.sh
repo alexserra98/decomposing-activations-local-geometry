@@ -37,7 +37,8 @@ export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 echo "epoch=$N  data_dir=$DATA_DIR  out=$EPOCH_OUT"
 
 # load_mfa falls back to mfa_model_shards.json when mfa_model.pt is absent.
-# --save-path keeps each epoch's assignments in its own output subdir alongside overlap.pt.
+# --save-path keeps each epoch's assignments in its own output subdir alongside
+# gaussian_overlap.pt.
 uv run python -m dalg.analysis.cluster_assignments \
     --model-path "$DATA_DIR/mfa_model.pt" \
     --shard-dir "$SHARD_DIR" \

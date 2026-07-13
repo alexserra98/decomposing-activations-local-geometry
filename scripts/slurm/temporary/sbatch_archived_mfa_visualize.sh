@@ -34,7 +34,7 @@ for entry in "${RUNS[@]}"; do
   out_dir="$ARCHIVE_DIR/$run_name"
   echo "Visualizing $experiment_name from $out_dir"
   test -f "$out_dir/intrinsic_dims.pt"
-  test -f "$out_dir/overlap.pt"
+  test -f "$out_dir/gaussian_overlap.pt"
 
   DALG_VIS_EXPERIMENT_NAME="$experiment_name" \
   DALG_VIS_OUT="$out_dir" \
