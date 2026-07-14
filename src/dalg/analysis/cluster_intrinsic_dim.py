@@ -170,30 +170,39 @@ def intrinsic_dim_pca(
     *,
     threshold: float = 0.90,
     device: str | torch.device | None = None,
-) -> tuple[int, torch.Tensor]:
+    top_pcs: int | None = None,
+) -> tuple[int, torch.Tensor, torch.Tensor | None]:
     """
     Number of PCA directions needed to explain `threshold` of total variance.
 
-    Returns `(intrinsic_dim, variances)` where `variances` is the descending
-    variance spectrum estimated from the singular values of the centered data.
+    Returns `(intrinsic_dim, variances, components)` where `variances` is the
+    descending variance spectrum estimated from the singular values of the
+    centered data. `components` is `None` unless `top_pcs` is set, in which
+    case it holds up to `top_pcs` principal directions as a `(n_pcs, D)`
+    float32 tensor (fewer rows when the cluster has less effective rank).
     """
     if X_cluster.shape[0] < 2:
-        return 0, torch.zeros(0)
+        return 0, torch.zeros(0), None
 
     if device is not None:
         X_cluster = X_cluster.to(device, non_blocking=True)
 
     X = X_cluster.float()
     X_c = X - X.mean(dim=0, keepdim=True)
-    S = torch.linalg.svdvals(X_c)
+    if top_pcs is not None:
+        _, S, Vh = torch.linalg.svd(X_c, full_matrices=False)
+        components = Vh[:top_pcs].float().cpu()
+    else:
+        S = torch.linalg.svdvals(X_c)
+        components = None
     var = (S ** 2).clamp(min=0)
     total = var.sum()
     if total <= 0:
-        return 0, var
+        return 0, var, components
     cumvar = var.cumsum(0) / total
     above = (cumvar >= threshold).nonzero(as_tuple=True)[0]
     dim = int(above[0].item()) + 1 if len(above) > 0 else int(var.numel())
-    return dim, var
+    return dim, var, components
 
 
 def _load_assignments(assignments_path: Path) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], int, dict[str, Any]]:
@@ -414,10 +423,12 @@ def _run_cluster_pca(
     min_population: int,
     pca_device: str | torch.device | None,
     pca_workers: int,
-) -> tuple[torch.Tensor, list[torch.Tensor], int]:
+    top_pcs: int | None = None,
+) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor | None], int]:
     K = len(buffers)
     dims = torch.zeros(K, dtype=torch.long)
     cluster_variances: list[torch.Tensor] = [torch.zeros(0) for _ in range(K)]
+    cluster_top_pcs: list[torch.Tensor | None] = [None for _ in range(K)]
 
     valid_clusters = [
         k for k in range(K)
@@ -425,13 +436,14 @@ def _run_cluster_pca(
     ]
     num_skipped = K - len(valid_clusters)
 
-    def _one(k: int) -> tuple[int, int, torch.Tensor]:
-        d, var = intrinsic_dim_pca(
+    def _one(k: int) -> tuple[int, int, torch.Tensor, torch.Tensor | None]:
+        d, var, components = intrinsic_dim_pca(
             buffers[k],
             threshold=threshold,
             device=pca_device,
+            top_pcs=top_pcs,
         )
-        return k, d, var.cpu()
+        return k, d, var.cpu(), components
 
     use_threads = (
         pca_workers > 1
@@ -451,9 +463,10 @@ def _run_cluster_pca(
                     mininterval=_TQDM_MININTERVAL,
                     maxinterval=_TQDM_MAXINTERVAL,
                 ):
-                    k, d, var = fut.result()
+                    k, d, var, components = fut.result()
                     dims[k] = d
                     cluster_variances[k] = var
+                    cluster_top_pcs[k] = components
         finally:
             torch.set_num_threads(old_threads)
     else:
@@ -464,11 +477,12 @@ def _run_cluster_pca(
             mininterval=_TQDM_MININTERVAL,
             maxinterval=_TQDM_MAXINTERVAL,
         ):
-            _, d, var = _one(k)
+            _, d, var, components = _one(k)
             dims[k] = d
             cluster_variances[k] = var
+            cluster_top_pcs[k] = components
 
-    return dims, cluster_variances, num_skipped
+    return dims, cluster_variances, cluster_top_pcs, num_skipped
 
 
 def compute_intrinsic_dims_from_assignments(
@@ -484,6 +498,7 @@ def compute_intrinsic_dims_from_assignments(
     pca_device: str | torch.device | None = None,
     pca_workers: int = 1,
     seed: int = 0,
+    top_pcs: int | None = None,
     **_legacy,
 ) -> IntrinsicDimResults:
     """
@@ -533,13 +548,14 @@ def compute_intrinsic_dims_from_assignments(
         store_dtype=store_dtype,
     )
 
-    dims, cluster_variances, num_skipped = _run_cluster_pca(
+    dims, cluster_variances, cluster_top_pcs, num_skipped = _run_cluster_pca(
         buffers,
         sizes,
         threshold=variance_threshold,
         min_population=min_population,
         pca_device=pca_device,
         pca_workers=pca_workers,
+        top_pcs=top_pcs,
     )
 
     valid = dims > 0
@@ -553,7 +569,7 @@ def compute_intrinsic_dims_from_assignments(
             print(f"  MFA rank (q) = {model_metadata['rank']}  (reference)")
     print(f"Skipped {num_skipped} clusters with population < {min_population}")
 
-    return {
+    results = {
         "intrinsic_dims": dims,
         "cluster_variances": cluster_variances,
         "cluster_sizes": sizes,
@@ -569,6 +585,10 @@ def compute_intrinsic_dims_from_assignments(
         "model_path": model_metadata["model_path"],
         "assignment_metadata": assignment_metadata,
     }
+    if top_pcs is not None:
+        results["cluster_top_pcs"] = cluster_top_pcs
+        results["top_pcs"] = int(top_pcs)
+    return results
 
 #TODO remove model dead code
 def compute_intrinsic_dims_from_shards(
@@ -587,6 +607,7 @@ def compute_intrinsic_dims_from_shards(
     pca_device: str | torch.device | None = None,
     pca_workers: int = 1,
     seed: int = 0,
+    top_pcs: int | None = None,
     **_legacy,
 ) -> IntrinsicDimResults:
     from dalg.data.shard_activations import load_meta_index
@@ -658,13 +679,14 @@ def compute_intrinsic_dims_from_shards(
         store_dtype=store_dtype,
     )
 
-    dims, cluster_variances, num_skipped = _run_cluster_pca(
+    dims, cluster_variances, cluster_top_pcs, num_skipped = _run_cluster_pca(
         buffers,
         sizes,
         threshold=variance_threshold,
         min_population=min_population,
         pca_device=pca_device,
         pca_workers=pca_workers,
+        top_pcs=top_pcs,
     )
 
     valid = dims > 0
@@ -678,7 +700,7 @@ def compute_intrinsic_dims_from_shards(
             print(f"  MFA rank (q) = {model_metadata['rank']}  (reference)")
     print(f"Skipped {num_skipped} clusters with population < {min_population}")
 
-    return {
+    results = {
         "intrinsic_dims": dims,
         "cluster_variances": cluster_variances,
         "cluster_sizes": sizes,
@@ -695,6 +717,10 @@ def compute_intrinsic_dims_from_shards(
         "assignment_metadata": assignment_metadata,
         "subset_spec": effective_subset_spec,
     }
+    if top_pcs is not None:
+        results["cluster_top_pcs"] = cluster_top_pcs
+        results["top_pcs"] = int(top_pcs)
+    return results
 
 
 def compute_intrinsic_dims_from_loader(
@@ -710,6 +736,7 @@ def compute_intrinsic_dims_from_loader(
     pca_device: str | torch.device | None = None,
     pca_workers: int = 1,
     seed: int = 0,
+    top_pcs: int | None = None,
     **legacy,
 ) -> IntrinsicDimResults:
     """Backward-compatible wrapper around the assignment-file implementation."""
@@ -725,6 +752,7 @@ def compute_intrinsic_dims_from_loader(
         pca_device=pca_device,
         pca_workers=pca_workers,
         seed=seed,
+        top_pcs=top_pcs,
         **legacy,
     )
 
@@ -744,6 +772,7 @@ def compute_intrinsic_dims(
     pca_device: str | torch.device | None = None,
     pca_workers: int = 1,
     seed: int = 0,
+    top_pcs: int | None = None,
     **legacy,
 ) -> IntrinsicDimResults:
     """Monolithic-layout wrapper for activations.pt plus precomputed assignments."""
@@ -768,8 +797,32 @@ def compute_intrinsic_dims(
         pca_device=pca_device,
         pca_workers=pca_workers,
         seed=seed,
+        top_pcs=top_pcs,
         **legacy,
     )
+
+
+def pop_and_save_top_pcs(results: IntrinsicDimResults, out_dir: Path) -> Path | None:
+    """
+    Move top-PC tensors out of `results` into `<out_dir>/cluster_top_pcs.pt`.
+
+    Returns the side-car path, or None when the run did not compute PCs. Keeps
+    `intrinsic_dims.pt` small: the PC tensors dominate the results dict size.
+    """
+    if "cluster_top_pcs" not in results:
+        return None
+
+    sidecar = {
+        "cluster_top_pcs": results.pop("cluster_top_pcs"),
+        "top_pcs": results["top_pcs"],
+        "K": results["K"],
+        "assignments_path": results["assignments_path"],
+        "variance_threshold": results["variance_threshold"],
+        "max_samples": results["max_samples"],
+    }
+    save_path = Path(out_dir) / "cluster_top_pcs.pt"
+    torch.save(sidecar, save_path)
+    return save_path
 
 
 def main() -> None:
@@ -803,6 +856,13 @@ def main() -> None:
     parser.add_argument("--pca-workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--top-pcs",
+        type=int,
+        default=None,
+        help="Also save up to this many top principal components per cluster "
+             "to cluster_top_pcs.pt beside the results (default: off)",
+    )
+    parser.add_argument(
         "--store-dtype",
         choices=("float16", "bfloat16", "float32"),
         default="float16",
@@ -830,6 +890,7 @@ def main() -> None:
             pca_device=args.pca_device,
             pca_workers=args.pca_workers,
             seed=args.seed,
+            top_pcs=args.top_pcs,
         )
     else:
         if args.act_path is None:
@@ -848,6 +909,7 @@ def main() -> None:
             pca_device=args.pca_device,
             pca_workers=args.pca_workers,
             seed=args.seed,
+            top_pcs=args.top_pcs,
         )
 
     if args.save_path is not None:
@@ -858,6 +920,10 @@ def main() -> None:
         save_path = args.assignments_path.parent / "intrinsic_dims.pt"
     else:
         raise SystemExit("--assignments-path is required when --model-path is omitted.")
+
+    pcs_path = pop_and_save_top_pcs(results, save_path.parent)
+    if pcs_path is not None:
+        print(f"Top PCs saved to {pcs_path}")
 
     torch.save(results, save_path)
     print(f"Results saved to {save_path}")

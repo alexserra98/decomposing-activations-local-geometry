@@ -80,6 +80,7 @@ def cmd_intrinsic_dim(args) -> None:
     """
     from dalg.analysis.cluster_intrinsic_dim import (
         compute_intrinsic_dims, compute_intrinsic_dims_from_shards,
+        pop_and_save_top_pcs,
     )
     from dalg.data.subset_spec import split_shard_dir_spec
 
@@ -105,6 +106,7 @@ def cmd_intrinsic_dim(args) -> None:
             pca_device=args.pca_device,
             pca_workers=args.pca_workers,
             seed=(args.seed or 0),
+            top_pcs=args.top_pcs,
         )
     else:
         act_dir = Path(args.act_dir or run_dir)
@@ -119,7 +121,12 @@ def cmd_intrinsic_dim(args) -> None:
             pca_device=args.pca_device,
             pca_workers=args.pca_workers,
             seed=(args.seed or 0),
+            top_pcs=args.top_pcs,
         )
+
+    pcs_path = pop_and_save_top_pcs(results, out_dir)
+    if pcs_path is not None:
+        print(f"Top PCs saved to {pcs_path}")
 
     save_path = out_dir / "intrinsic_dims.pt"
     torch.save(results, save_path)
@@ -478,6 +485,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--variance-threshold", type=float, default=0.90)
     sp.add_argument("--min-population", type=int, default=100)
     sp.add_argument("--max-samples-per-cluster", type=int, default=10000)
+    sp.add_argument("--top-pcs", type=int, default=None,
+                    help="Also save up to this many top principal components "
+                         "per cluster to cluster_top_pcs.pt in the output dir "
+                         "(default: off)")
     sp.set_defaults(func=cmd_intrinsic_dim)
 
     sp = sub.add_parser("assignments",

@@ -51,6 +51,16 @@ Output: `intrinsic_dims.pt` beside the assignment bundle when both `--data-dir` 
 
 The assignment bundle may come from MFA responsibility argmax, nearest-centroid KMeans or KMedoids assignments, shuffled labels, or another source. Intrinsic dimension only requires a compatible `.pt` bundle containing at least `assignments` and `cluster_sizes`; provenance metadata is used for validation and reporting, not to select the algorithm. Confirm that the subset specification, item count, and stream order match the selected shards. PCA can run on CPU even when activation work uses CUDA.
 
+Optional top principal components: add `--top-pcs 100` to also save the top
+principal directions of each cluster to `cluster_top_pcs.pt` beside
+`intrinsic_dims.pt`. The side-car file holds a `cluster_top_pcs` list of
+per-cluster `(n_pcs, D)` float32 tensors (`None` for skipped clusters; fewer
+rows when a cluster's sample rank is below the request) plus provenance
+metadata. The default is off: without `--top-pcs`, no components are computed
+or saved and `intrinsic_dims.pt` is unchanged. Enabling it switches the PCA
+phase from singular values only to a full SVD, which is slower and uses more
+memory. For K=1000 and D≈2304, 100 PCs per cluster is roughly 0.9 GB.
+
 For shuffled or nearest-centroid variants, use a model-local subdirectory rather than overwriting the responsibility-based `intrinsic_dims.pt`.
 
 ## Description fit

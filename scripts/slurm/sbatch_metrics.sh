@@ -20,6 +20,9 @@ K=${K:-1000}
 RANK=${RANK:-10}
 METRIC_TARGET=${METRIC_TARGET:-mfa}
 OUTPUT_FILENAME=${OUTPUT_FILENAME:-intrinsic_dims.pt}
+MAX_SAMPLES=${MAX_SAMPLES:-2000}
+MIN_POPULATION=${MIN_POPULATION:-}
+TOP_PCS=${TOP_PCS:-}
 LAYER=$SLURM_ARRAY_TASK_ID
 
 SHARD_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations
@@ -54,7 +57,10 @@ case "$METRIC_TARGET" in
       --shard-dir "$SHARD_DIR" \
       --layer "$LAYER" \
       --out-dir "$RUN_OUT_DIR" \
-      --device cuda --max-samples-per-cluster 2000
+      --device cuda \
+      --max-samples-per-cluster "$MAX_SAMPLES" \
+      ${MIN_POPULATION:+--min-population "$MIN_POPULATION"} \
+      ${TOP_PCS:+--top-pcs "$TOP_PCS"}
 
     if [[ "$OUTPUT_FILENAME" != "intrinsic_dims.pt" ]]; then
       mv "$RUN_OUT_DIR/intrinsic_dims.pt" "$OUT_DIR/$OUTPUT_FILENAME"
@@ -78,7 +84,10 @@ case "$METRIC_TARGET" in
       --shard-dir "$SHARD_DIR" \
       --layer "$LAYER" \
       --out-dir "$RUN_OUT_DIR" \
-      --device cuda --max-samples-per-cluster 2000
+      --device cuda \
+      --max-samples-per-cluster "$MAX_SAMPLES" \
+      ${MIN_POPULATION:+--min-population "$MIN_POPULATION"} \
+      ${TOP_PCS:+--top-pcs "$TOP_PCS"}
 
     if [[ "$OUTPUT_FILENAME" != "intrinsic_dims.pt" ]]; then
       mv "$RUN_OUT_DIR/intrinsic_dims.pt" "$OUT_DIR/$OUTPUT_FILENAME"
