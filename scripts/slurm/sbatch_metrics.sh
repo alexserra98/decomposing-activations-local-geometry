@@ -20,10 +20,16 @@ K=${K:-1000}
 RANK=${RANK:-10}
 METRIC_TARGET=${METRIC_TARGET:-mfa}
 OUTPUT_FILENAME=${OUTPUT_FILENAME:-intrinsic_dims.pt}
-MAX_SAMPLES=${MAX_SAMPLES:-2000}
+MAX_SAMPLES=${MAX_SAMPLES:-10000}
 MIN_POPULATION=${MIN_POPULATION:-}
 TOP_PCS=${TOP_PCS:-}
+GRIDE_RANGE_MAX=${GRIDE_RANGE_MAX:-8192}
 LAYER=$SLURM_ARRAY_TASK_ID
+
+GRIDE_ARGS=(--gride-range-max "$GRIDE_RANGE_MAX")
+if [[ "${COMPUTE_GRIDE:-1}" == "0" ]]; then
+  GRIDE_ARGS+=(--no-gride)
+fi
 
 SHARD_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations
 MODELS_DIR=${MODELS_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_models}
@@ -59,6 +65,7 @@ case "$METRIC_TARGET" in
       --out-dir "$RUN_OUT_DIR" \
       --device cuda \
       --max-samples-per-cluster "$MAX_SAMPLES" \
+      "${GRIDE_ARGS[@]}" \
       ${MIN_POPULATION:+--min-population "$MIN_POPULATION"} \
       ${TOP_PCS:+--top-pcs "$TOP_PCS"}
 
@@ -86,6 +93,7 @@ case "$METRIC_TARGET" in
       --out-dir "$RUN_OUT_DIR" \
       --device cuda \
       --max-samples-per-cluster "$MAX_SAMPLES" \
+      "${GRIDE_ARGS[@]}" \
       ${MIN_POPULATION:+--min-population "$MIN_POPULATION"} \
       ${TOP_PCS:+--top-pcs "$TOP_PCS"}
 

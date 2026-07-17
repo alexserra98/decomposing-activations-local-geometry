@@ -42,6 +42,7 @@ uv run dalg-run-metrics intrinsic-dim \
   --device cuda \
   --pca-device cpu \
   --pca-workers 8 \
+  --gride-range-max 2048 \
   --variance-threshold 0.90 \
   --min-population 100 \
   --max-samples-per-cluster 2000
@@ -50,6 +51,14 @@ uv run dalg-run-metrics intrinsic-dim \
 Output: `intrinsic_dims.pt` beside the assignment bundle when both `--data-dir` and `--out-dir` are omitted.
 
 The assignment bundle may come from MFA responsibility argmax, nearest-centroid KMeans or KMedoids assignments, shuffled labels, or another source. Intrinsic dimension only requires a compatible `.pt` bundle containing at least `assignments` and `cluster_sizes`; provenance metadata is used for validation and reporting, not to select the algorithm. Confirm that the subset specification, item count, and stream order match the selected shards. PCA can run on CPU even when activation work uses CUDA.
+
+By default the result contains both the PCA estimate and DADApy GRIDE curves.
+GRIDE saves a length-`K` list for each of `gride_intrinsic_dims`,
+`gride_intrinsic_dim_errors`, and `gride_scales`; every list item contains all
+scales returned for that cluster. `--gride-range-max` defaults to 2048 and is
+capped at one less than the sampled cluster size. Add `--no-gride` to run only
+PCA. Undefined GRIDE estimates are stored as one-element NaN tensors so the
+lists remain aligned with cluster IDs.
 
 Optional top principal components: add `--top-pcs 100` to also save the top
 principal directions of each cluster to `cluster_top_pcs.pt` beside

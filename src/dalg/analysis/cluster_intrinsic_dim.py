@@ -205,6 +205,58 @@ def intrinsic_dim_pca(
     return dim, var, components
 
 
+def _undefined_gride_result() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the on-disk sentinel for a cluster where GRIDE is undefined."""
+    return tuple(
+        torch.full((1,), float("nan"), dtype=torch.float64) for _ in range(3)
+    )
+
+
+def intrinsic_dim_gride(
+    X_cluster: torch.Tensor,
+    *,
+    range_max: int = 2048,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return DADApy GRIDE IDs, errors, and distance scales for one cluster.
+
+    GRIDE needs at least two non-self neighbour ranks, hence at least three
+    distinct, finite observations. Undefined inputs use a one-element NaN
+    sentinel in each returned tensor so cluster-index alignment is preserved.
+    """
+    if range_max < 2:
+        raise ValueError("range_max must be at least 2")
+    if X_cluster.ndim != 2:
+        raise ValueError(
+            f"X_cluster must have shape (samples, features), got {tuple(X_cluster.shape)}"
+        )
+
+    X = X_cluster.detach().float().cpu().contiguous()
+    if X.shape[0] < 3 or not torch.isfinite(X).all():
+        return _undefined_gride_result()
+    if not torch.any(X != X[:1]):
+        return _undefined_gride_result()
+
+    # Import lazily so --no-gride avoids DADApy and its optional import stack.
+    from dadapy.data import Data
+
+    effective_range_max = min(int(range_max), int(X.shape[0]) - 1)
+    ids, errors, scales = Data(
+        coordinates=X.numpy(),
+        n_jobs=1,
+    ).return_id_scaling_gride(range_max=effective_range_max)
+
+    outputs = tuple(
+        torch.as_tensor(values, dtype=torch.float64).reshape(-1).clone()
+        for values in (ids, errors, scales)
+    )
+    lengths = {int(values.numel()) for values in outputs}
+    if lengths == {0} or len(lengths) != 1:
+        return _undefined_gride_result()
+    if not all(torch.isfinite(values).all() for values in outputs):
+        return _undefined_gride_result()
+    return outputs
+
+
 def _load_assignments(assignments_path: Path) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], int, dict[str, Any]]:
     data = torch.load(assignments_path, map_location="cpu", weights_only=True)
     if "assignments" not in data or "cluster_sizes" not in data:
@@ -485,6 +537,48 @@ def _run_cluster_pca(
     return dims, cluster_variances, cluster_top_pcs, num_skipped
 
 
+def _run_cluster_gride(
+    buffers: list[torch.Tensor | None],
+    sizes: torch.Tensor,
+    *,
+    min_population: int,
+    range_max: int,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], int]:
+    """Compute multiscale GRIDE outputs while preserving cluster order."""
+    K = len(buffers)
+    cluster_ids: list[torch.Tensor] = []
+    cluster_errors: list[torch.Tensor] = []
+    cluster_scales: list[torch.Tensor] = []
+
+    for k in tqdm(
+        range(K),
+        desc="per-cluster GRIDE (cpu)",
+        mininterval=_TQDM_MININTERVAL,
+        maxinterval=_TQDM_MAXINTERVAL,
+    ):
+        buffer = buffers[k]
+        if (
+            int(sizes[k]) < min_population
+            or buffer is None
+            or buffer.shape[0] < 3
+        ):
+            ids, errors, scales = _undefined_gride_result()
+        else:
+            ids, errors, scales = intrinsic_dim_gride(
+                buffer,
+                range_max=range_max,
+            )
+        cluster_ids.append(ids)
+        cluster_errors.append(errors)
+        cluster_scales.append(scales)
+
+    num_undefined = sum(
+        bool(values.numel() == 1 and torch.isnan(values[0]))
+        for values in cluster_ids
+    )
+    return cluster_ids, cluster_errors, cluster_scales, num_undefined
+
+
 def compute_intrinsic_dims_from_assignments(
     model_path: Path | None,
     loader: Any,
@@ -499,6 +593,8 @@ def compute_intrinsic_dims_from_assignments(
     pca_workers: int = 1,
     seed: int = 0,
     top_pcs: int | None = None,
+    compute_gride: bool = True,
+    gride_range_max: int = 2048,
     **_legacy,
 ) -> IntrinsicDimResults:
     """
@@ -537,7 +633,7 @@ def compute_intrinsic_dims_from_assignments(
         min_population=min_population,
         seed=seed,
     )
-    print(f"Selected {sample_positions.numel():,} activation vectors for PCA.")
+    print(f"Selected {sample_positions.numel():,} activation vectors for intrinsic dimension.")
 
     buffers = _collect_sampled_activations(
         loader,
@@ -569,6 +665,19 @@ def compute_intrinsic_dims_from_assignments(
             print(f"  MFA rank (q) = {model_metadata['rank']}  (reference)")
     print(f"Skipped {num_skipped} clusters with population < {min_population}")
 
+    gride_results = None
+    if compute_gride:
+        gride_results = _run_cluster_gride(
+            buffers,
+            sizes,
+            min_population=min_population,
+            range_max=gride_range_max,
+        )
+        print(
+            f"GRIDE computed for {K - gride_results[3]} clusters; "
+            f"{gride_results[3]} undefined."
+        )
+
     results = {
         "intrinsic_dims": dims,
         "cluster_variances": cluster_variances,
@@ -584,7 +693,13 @@ def compute_intrinsic_dims_from_assignments(
         "model_kind": model_metadata["model_kind"],
         "model_path": model_metadata["model_path"],
         "assignment_metadata": assignment_metadata,
+        "gride_enabled": bool(compute_gride),
+        "gride_range_max": int(gride_range_max),
     }
+    if gride_results is not None:
+        results["gride_intrinsic_dims"] = gride_results[0]
+        results["gride_intrinsic_dim_errors"] = gride_results[1]
+        results["gride_scales"] = gride_results[2]
     if top_pcs is not None:
         results["cluster_top_pcs"] = cluster_top_pcs
         results["top_pcs"] = int(top_pcs)
@@ -608,6 +723,8 @@ def compute_intrinsic_dims_from_shards(
     pca_workers: int = 1,
     seed: int = 0,
     top_pcs: int | None = None,
+    compute_gride: bool = True,
+    gride_range_max: int = 2048,
     **_legacy,
 ) -> IntrinsicDimResults:
     from dalg.data.shard_activations import load_meta_index
@@ -659,7 +776,7 @@ def compute_intrinsic_dims_from_shards(
         min_population=min_population,
         seed=seed,
     )
-    print(f"Selected {sample_positions.numel():,} activation vectors for PCA.")
+    print(f"Selected {sample_positions.numel():,} activation vectors for intrinsic dimension.")
 
     requests = _sample_positions_to_shard_requests(
         sample_positions,
@@ -700,6 +817,19 @@ def compute_intrinsic_dims_from_shards(
             print(f"  MFA rank (q) = {model_metadata['rank']}  (reference)")
     print(f"Skipped {num_skipped} clusters with population < {min_population}")
 
+    gride_results = None
+    if compute_gride:
+        gride_results = _run_cluster_gride(
+            buffers,
+            sizes,
+            min_population=min_population,
+            range_max=gride_range_max,
+        )
+        print(
+            f"GRIDE computed for {K - gride_results[3]} clusters; "
+            f"{gride_results[3]} undefined."
+        )
+
     results = {
         "intrinsic_dims": dims,
         "cluster_variances": cluster_variances,
@@ -716,7 +846,13 @@ def compute_intrinsic_dims_from_shards(
         "model_path": model_metadata["model_path"],
         "assignment_metadata": assignment_metadata,
         "subset_spec": effective_subset_spec,
+        "gride_enabled": bool(compute_gride),
+        "gride_range_max": int(gride_range_max),
     }
+    if gride_results is not None:
+        results["gride_intrinsic_dims"] = gride_results[0]
+        results["gride_intrinsic_dim_errors"] = gride_results[1]
+        results["gride_scales"] = gride_results[2]
     if top_pcs is not None:
         results["cluster_top_pcs"] = cluster_top_pcs
         results["top_pcs"] = int(top_pcs)
@@ -737,6 +873,8 @@ def compute_intrinsic_dims_from_loader(
     pca_workers: int = 1,
     seed: int = 0,
     top_pcs: int | None = None,
+    compute_gride: bool = True,
+    gride_range_max: int = 2048,
     **legacy,
 ) -> IntrinsicDimResults:
     """Backward-compatible wrapper around the assignment-file implementation."""
@@ -753,6 +891,8 @@ def compute_intrinsic_dims_from_loader(
         pca_workers=pca_workers,
         seed=seed,
         top_pcs=top_pcs,
+        compute_gride=compute_gride,
+        gride_range_max=gride_range_max,
         **legacy,
     )
 
@@ -773,6 +913,8 @@ def compute_intrinsic_dims(
     pca_workers: int = 1,
     seed: int = 0,
     top_pcs: int | None = None,
+    compute_gride: bool = True,
+    gride_range_max: int = 2048,
     **legacy,
 ) -> IntrinsicDimResults:
     """Monolithic-layout wrapper for activations.pt plus precomputed assignments."""
@@ -798,6 +940,8 @@ def compute_intrinsic_dims(
         pca_workers=pca_workers,
         seed=seed,
         top_pcs=top_pcs,
+        compute_gride=compute_gride,
+        gride_range_max=gride_range_max,
         **legacy,
     )
 
@@ -856,6 +1000,17 @@ def main() -> None:
     parser.add_argument("--pca-workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--no-gride",
+        action="store_true",
+        help="Disable the default DADApy GRIDE intrinsic-dimension computation",
+    )
+    parser.add_argument(
+        "--gride-range-max",
+        type=int,
+        default=2048,
+        help="Maximum GRIDE neighbour rank before capping at cluster_size - 1",
+    )
+    parser.add_argument(
         "--top-pcs",
         type=int,
         default=None,
@@ -872,6 +1027,8 @@ def main() -> None:
 
     if args.model_path is None and args.assignments_path is None:
         raise SystemExit("--assignments-path is required when --model-path is omitted.")
+    if args.gride_range_max < 2:
+        raise SystemExit("--gride-range-max must be at least 2.")
 
     if args.shard_dir is not None:
         if args.layer is None:
@@ -891,6 +1048,8 @@ def main() -> None:
             pca_workers=args.pca_workers,
             seed=args.seed,
             top_pcs=args.top_pcs,
+            compute_gride=not args.no_gride,
+            gride_range_max=args.gride_range_max,
         )
     else:
         if args.act_path is None:
@@ -910,6 +1069,8 @@ def main() -> None:
             pca_workers=args.pca_workers,
             seed=args.seed,
             top_pcs=args.top_pcs,
+            compute_gride=not args.no_gride,
+            gride_range_max=args.gride_range_max,
         )
 
     if args.save_path is not None:

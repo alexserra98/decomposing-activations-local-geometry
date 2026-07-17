@@ -4,7 +4,7 @@ CLI for cluster-level metrics on a trained MFA.
 Subcommands:
     gaussian-overlap
                    Pairwise Gaussian-overlap metrics between MFA components.
-    intrinsic-dim  PCA-based intrinsic dimensionality per cluster.
+    intrinsic-dim  PCA- and GRIDE-based intrinsic dimensionality per cluster.
     assignments    Hard cluster assignments. With an MFA, streams activations
                    through responsibilities; with medoids, assigns by nearest
                    Euclidean centroid.
@@ -107,6 +107,8 @@ def cmd_intrinsic_dim(args) -> None:
             pca_workers=args.pca_workers,
             seed=(args.seed or 0),
             top_pcs=args.top_pcs,
+            compute_gride=not args.no_gride,
+            gride_range_max=args.gride_range_max,
         )
     else:
         act_dir = Path(args.act_dir or run_dir)
@@ -122,6 +124,8 @@ def cmd_intrinsic_dim(args) -> None:
             pca_workers=args.pca_workers,
             seed=(args.seed or 0),
             top_pcs=args.top_pcs,
+            compute_gride=not args.no_gride,
+            gride_range_max=args.gride_range_max,
         )
 
     pcs_path = pop_and_save_top_pcs(results, out_dir)
@@ -426,6 +430,8 @@ def validate_args(args) -> None:
             raise SystemExit("intrinsic-dim: --shard-dir and --act-dir are mutually exclusive")
         if args.shard_dir is not None and args.layer is None:
             raise SystemExit("intrinsic-dim: --layer is required with --shard-dir")
+        if args.gride_range_max < 2:
+            raise SystemExit("intrinsic-dim: --gride-range-max must be at least 2")
     if args.command == "assignments":
         if args.data_dir is None and args.medoids_path is None:
             raise SystemExit("assignments: pass either --data-dir for MFA or --medoids-path for nearest-medoid assignment")
@@ -485,6 +491,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--variance-threshold", type=float, default=0.90)
     sp.add_argument("--min-population", type=int, default=100)
     sp.add_argument("--max-samples-per-cluster", type=int, default=10000)
+    sp.add_argument("--no-gride", action="store_true",
+                    help="Disable the default DADApy GRIDE intrinsic-dimension computation")
+    sp.add_argument("--gride-range-max", type=int, default=2048,
+                    help="Maximum GRIDE neighbour rank before capping at cluster_size - 1")
     sp.add_argument("--top-pcs", type=int, default=None,
                     help="Also save up to this many top principal components "
                          "per cluster to cluster_top_pcs.pt in the output dir "
