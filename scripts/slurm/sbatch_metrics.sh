@@ -8,21 +8,21 @@
 #SBATCH --gres=gpu:H100:1
 #SBATCH --mem=640G
 #SBATCH --time=1-02:00:00
-#SBATCH --job-name=intrinsic_dim
+#SBATCH --job-name=metrics_computation
 ##SBATCH --begin=now+4hours
-#SBATCH --array=5,17
-#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/experiments/intrinsic_dim_%x_%A_%a.out
+#SBATCH --array=5
+#SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/experiments/to%x_%A_%a.out
 
 set -euo pipefail
 
 REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
 K=${K:-1000}
-RANK=${RANK:-10}
+RANK=${RANK:-394}
 METRIC_TARGET=${METRIC_TARGET:-mfa}
 OUTPUT_FILENAME=${OUTPUT_FILENAME:-intrinsic_dims.pt}
 MAX_SAMPLES=${MAX_SAMPLES:-10000}
-MIN_POPULATION=${MIN_POPULATION:-}
-TOP_PCS=${TOP_PCS:-}
+MIN_POPULATION=${MIN_POPULATION:-10000}
+TOP_PCS=${TOP_PCS:-400}
 GRIDE_RANGE_MAX=${GRIDE_RANGE_MAX:-8192}
 LAYER=$SLURM_ARRAY_TASK_ID
 
@@ -33,18 +33,20 @@ fi
 
 SHARD_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations
 MODELS_DIR=${MODELS_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_models}
-CENTROIDS_DIR=${CENTROIDS_DIR:-"$MODELS_DIR/centroids"}
 LAYER_TAG="layer$(printf '%02d' "$LAYER")"
+DATA_DIR="$MODELS_DIR/${LAYER_TAG}_${K}_${RANK}_component_sharded_mfa"
+CENTROIDS_DIR=${CENTROIDS_DIR:-"$MODELS_DIR/centroids"}
 cd "$REPO_ROOT" || exit 1
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
 # Step 1: compute cluster assignments (required by intrinsic-dim)
 # load_mfa falls back to mfa_model_shards.json when mfa_model.pt is absent
-# uv run python -m dalg.analysis.cluster_assignments \
-#   --model-path "$DATA_DIR/mfa_model.pt" \
-#   --shard-dir "$SHARD_DIR" \
-#   --layer "$LAYER" \
-#   --device cuda --num-workers 4
+uv run python -m dalg.analysis.cluster_assignments \
+  --model-path "$DATA_DIR/mfa_model.pt" \
+  --shard-dir "$SHARD_DIR" \
+  --layer "$LAYER" \
+  --batch-size 1024 \
+  --device cuda
 
 case "$METRIC_TARGET" in
   mfa)
@@ -112,7 +114,9 @@ esac
 # Step 3: pairwise Gaussian overlap between MFA components
 # batch_pairs=512: peak GPU ≈ 10 GB (7 W-type tensors × 512 × D × q × 4 bytes)
 # default 4096 OOMs because W-chunk (4096, 2048, 337) alone exceeds H100 memory
-# uv run dalg-run-metrics gaussian-overlap \
-#   --data-dir "$DATA_DIR" \
-#   --out-dir "$OUT_DIR" \
-#   --device cuda --batch-pairs 512
+# DATA_DIR="$MODELS_DIR/${LAYER_TAG}_${K}_${RANK}_component_sharded_mfa"
+OUT_DIR="$DATA_DIR"
+uv run dalg-run-metrics gaussian-overlap \
+  --data-dir "$DATA_DIR" \
+  --out-dir "$OUT_DIR" \
+  --device cuda --batch-pairs 512

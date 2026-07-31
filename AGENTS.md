@@ -26,7 +26,7 @@ The repo uses a `src/` layout.
 ```text
 src/dalg/
   cli/            Main runnable entrypoints
-  models/         MFA model, component-sharded MFA, training loop
+  models/         MFA model, component-sharded MFA, adaptive-rank ARD MFA, training loops
   init/           Reservoir KMeans centroid initialization
   data/           Window builders and activation-shard streaming
   llm/            TransformerLens activation extraction wrapper
@@ -67,6 +67,7 @@ Preferred CLI entrypoints are defined in `pyproject.toml`:
 
 - `dalg-run-extraction`
 - `dalg-run-training`
+- `dalg-run-training-ard`
 - `dalg-run-metrics`
 - `dalg-interpret-mfa`
 - `dalg-label-mfa-clusters`
@@ -183,6 +184,43 @@ distributed-aware:
 - component-sharded training saves per-rank checkpoints and synchronizes
   gradients for replicated parameters via `sync_replicated_grads()`
 
+No optimizer in this repo applies weight decay; `Adam` is constructed with its
+default `weight_decay=0`. Shrinkage on `W` comes only from the ARD path below.
+
+### Adaptive-rank (ARD) training path
+
+A second, deliberately redundant stack learns a per-component rank `q_k` instead
+of fixing it at `--rank`. It leaves the files above untouched, so both paths can
+evolve independently:
+
+- `src/dalg/models/mfa_ard.py`: `MFA_ARD(MFA)`, plus `save_mfa_ard` /
+  `load_mfa_ard`
+- `src/dalg/models/train_ard.py`: `train_nll_ard`, `ard_beta_schedule`
+- `src/dalg/cli/run_training_ard.py`: `dalg-run-training-ard` (vanilla only)
+- `scripts/slurm/sbatch_train_ard.sh`
+
+Invariants that matter when editing this path:
+
+- Because `_dir_hat()` normalizes columns over `D`, `||w_j^k|| == scale_rho`
+  exactly, so the ARD penalty is a function of `scale_rho` alone.
+- `nu` is eliminated in closed form and detached each forward pass. This adds no
+  parameters, so an `MFA_ARD` `state_dict` is identical to an `MFA` one and
+  `load_mfa` reads ARD checkpoints unchanged — every downstream analysis works
+  on ARD runs with no code changes.
+- The ARD penalty is a prior over parameters while the loss is a per-sample
+  mean, so the applied weight is `--ard-lambda / n_train_tokens`.
+- Selection and early stopping use *validation NLL alone*, never the penalty, so
+  ARD runs stay comparable to baseline MFA runs.
+- Effective rank counts columns whose variance exceeds `--rank-threshold x
+  mean(Psi_k)`. Do not switch this to a peak-relative cutoff: under column
+  collapse every scale sits at the same floor, and a relative measure reports
+  full rank exactly when the model is degenerate.
+- Full ARD pressure from a cold start collapses all columns irrecoverably, so
+  `ard_beta` ramps in over epochs. The horizon is stored in the checkpoint and a
+  resume that changes it is rejected.
+- Pruning is a post-training step only (`MFA_ARD.prune_columns`); the training
+  loop never calls it.
+
 ## Workflow Skills
 
 Recurring operational procedures live in project skills so they are loaded only
@@ -190,8 +228,8 @@ when relevant. Codex discovers the canonical skills under `.agents/skills/`;
 Claude Code reaches the same directories through `.claude/skills/` symlinks.
 
 - `dalg-train-mfa`: activation extraction, vanilla training,
-  component-sharded training, checkpoint/resume behavior, and training launch
-  scripts.
+  component-sharded training, adaptive-rank ARD training, checkpoint/resume
+  behavior, and training launch scripts.
 - `dalg-compute-assignments`: source-agnostic hard partitions using either MFA
   responsibility argmax or nearest Euclidean centroids/medoids, plus stream
   alignment and assignment-bundle validation.

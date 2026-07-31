@@ -31,6 +31,7 @@ dependencies = [
 dalg-run-extraction = "dalg.cli.run_extraction:main"
 dalg-run-metrics = "dalg.cli.run_metrics:main"
 dalg-run-training = "dalg.cli.run_training:main"
+dalg-run-training-ard = "dalg.cli.run_training_ard:main"
 dalg-interpret-mfa = "dalg.cli.interpret_mfa:main"
 dalg-label-mfa-clusters = "dalg.cli.label_mfa_clusters:main"
 dalg-gaussian-overlap = "dalg.analysis.gaussian_overlap:main"
