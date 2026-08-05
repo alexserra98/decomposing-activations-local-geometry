@@ -12,20 +12,23 @@
 #SBATCH --mem=80G
 #SBATCH --time=23:00:00
 #SBATCH --job-name=mfa_train_ard
-#SBATCH --array=5
+#SBATCH --array=0
 #SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/mfa_train_ard_%A_%a.out
+
+set -euo pipefail
 
 # ─────────────────────────────────────────────────
 
-SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations}
-MODELS_DIR=${MODELS_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_models}
+SHARD_DIR=${SHARD_DIR:-/u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/assets/toy_manifolds_8types_2each_D128_150K_shards}
+MODELS_DIR=${MODELS_DIR:-/u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/toy_manifold_models}
 LAYER=$SLURM_ARRAY_TASK_ID
 
-K=${K:-1000}
-RANK=${RANK:-64}                           # maximum q per component
+K=${K:-100}
+RANK=${RANK:-32}                           # maximum q per component
 EPOCHS=${EPOCHS:-20}
 REFINE_EPOCHS=${REFINE_EPOCHS:-10}
 BATCH=${BATCH:-2048}
+ASSIGN_BATCH=${ASSIGN_BATCH:-1024}
 NUM_WORKERS=${NUM_WORKERS:-2}
 POOL_SIZE=${POOL_SIZE:-}                   # default heuristic if empty
 VAL_FRAC=${VAL_FRAC:-0.008}
@@ -82,7 +85,7 @@ echo "ard schedule: warmup=$WARMUP_FRAC  ramp=$RAMP_FRAC  prune_at_end=$PRUNE"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 # ── Run ─────────────────────────────────────────────────────────────────
-uv run python -m dalg.cli.run_training_ard \
+uv run python -m dalg.cli.adaptive_q.run_training_ard \
     --shard-dir "$SHARD_DIR" --layer "$LAYER" --out-dir "$OUT_DIR" \
     --K "$K" --rank "$RANK" --epochs "$EPOCHS" \
     --alpha0 "$ALPHA0" --b0 "$B0" --ard-lambda "$ARD_LAMBDA" \
@@ -96,4 +99,14 @@ uv run python -m dalg.cli.run_training_ard \
     --wandb --wandb-project dalg-mfa --wandb-name "ard_L${LAYER}_K${K}_q${RANK}_lam${ARD_LAMBDA}_$(date +%H%M%S)" \
     $POOL_FLAG $VAL_ON_GPU_FLAG $MAX_STEPS_FLAG
 
-echo "=== $(date) === done ==="
+echo "=== $(date) === training done; computing assignments (batch=$ASSIGN_BATCH) ==="
+uv run dalg-run-metrics assignments \
+    --data-dir "$OUT_DIR" \
+    --shard-dir "$SHARD_DIR" \
+    --layer "$LAYER" \
+    --batch-size "$ASSIGN_BATCH" \
+    --device cuda \
+    --seed "$SEED" \
+    --save-path "$OUT_DIR/mfa_model_assignments.pt"
+
+echo "=== $(date) === training + assignments done ==="

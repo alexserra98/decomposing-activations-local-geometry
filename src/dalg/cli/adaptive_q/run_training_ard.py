@@ -393,8 +393,8 @@ def _finish_wandb(run) -> None:
 
 def cmd_train_ard(args):
     """Single-process ARD-MFA training on activation shards."""
-    from dalg.models.mfa_ard import MFA_ARD, save_mfa_ard
-    from dalg.models.train_ard import train_nll_ard
+    from dalg.models.adaptive_q.mfa_ard import MFA_ARD, save_mfa_ard
+    from dalg.models.adaptive_q.train_ard import train_nll_ard
 
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
@@ -485,8 +485,8 @@ def cmd_train_ard(args):
 
 def _prune_and_save(raw_model, out_dir: Path, *, args, val_tensor) -> None:
     """Zero sub-threshold columns, then save both the pruned and raw models."""
-    from dalg.models.mfa_ard import save_mfa_ard
-    from dalg.models.train_ard import _eval_nll_tensor
+    from dalg.models.adaptive_q.mfa_ard import save_mfa_ard
+    from dalg.models.adaptive_q.train_ard import _eval_nll_tensor
 
     unpruned_path = out_dir / "mfa_model_unpruned.pt"
     save_mfa_ard(raw_model, str(unpruned_path))

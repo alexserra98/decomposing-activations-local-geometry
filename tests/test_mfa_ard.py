@@ -1,4 +1,4 @@
-"""Unit tests for the ARD-regularized MFA in src/dalg/models/mfa_ard.py.
+"""Unit tests for the ARD-regularized MFA in src/dalg/models/adaptive_q/mfa_ard.py.
 
 Coverage:
 - the closed-form nu makes `ard_penalty` equal the profiled penalty
@@ -26,8 +26,8 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT))
 
 from dalg.models.mfa import MFA, load_mfa  # noqa: E402
-from dalg.models.mfa_ard import MFA_ARD, load_mfa_ard, save_mfa_ard  # noqa: E402
-from dalg.models.train_ard import ard_beta_schedule, train_nll_ard  # noqa: E402
+from dalg.models.adaptive_q.mfa_ard import MFA_ARD, load_mfa_ard, save_mfa_ard  # noqa: E402
+from dalg.models.adaptive_q.train_ard import ard_beta_schedule, train_nll_ard  # noqa: E402
 
 
 # Most tests exercise the penalty itself, so they disable the beta schedule and

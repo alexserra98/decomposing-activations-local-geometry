@@ -1,5 +1,13 @@
 """Dataset loading and sharded activation utilities."""
 
-from .manifold_dataset import ToyManifoldConfig, make_toy_manifold_datasets
+from .manifold_dataset import (
+    ToyManifoldConfig,
+    make_toy_manifold_datasets,
+    save_toy_manifold_shards,
+)
 
-__all__ = ["ToyManifoldConfig", "make_toy_manifold_datasets"]
+__all__ = [
+    "ToyManifoldConfig",
+    "make_toy_manifold_datasets",
+    "save_toy_manifold_shards",
+]

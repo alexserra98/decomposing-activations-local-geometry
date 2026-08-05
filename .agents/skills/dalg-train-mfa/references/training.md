@@ -95,8 +95,9 @@ Expected outputs include per-rank checkpoints and models plus `checkpoint_shards
 Use when the per-component rank `q_k` should be learned instead of fixed. The
 model is `MFA_ARD`, which adds an ARD prior on the columns of each `W_k`; the
 stack is deliberately redundant with the baseline one and lives in
-`src/dalg/models/mfa_ard.py`, `src/dalg/models/train_ard.py`, and
-`src/dalg/cli/run_training_ard.py`. Single-process only — there is no
+`src/dalg/models/adaptive_q/mfa_ard.py`,
+`src/dalg/models/adaptive_q/train_ard.py`, and
+`src/dalg/cli/adaptive_q/run_training_ard.py`. Single-process only — there is no
 component-sharded ARD variant.
 
 ```bash
@@ -117,7 +118,7 @@ uv run dalg-run-training-ard \
   --seed 42
 ```
 
-Use `scripts/slurm/sbatch_train_ard.sh` for the cluster.
+Use `scripts/slurm/adaptive_q/sbatch_train_ard.sh` for the cluster.
 
 `--rank` is the **maximum** rank per component; ARD prunes below it, so set it
 generously and read the learned rank off the `q_eff` logs.

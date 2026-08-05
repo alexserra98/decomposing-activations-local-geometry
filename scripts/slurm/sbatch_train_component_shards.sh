@@ -23,6 +23,8 @@
 #SBATCH --array=5
 #SBATCH --output=/u/dssc/zenocosini/decomposing-activations-local-geometry/logs/jobs/mfa_train_component_shards_%A_%a.out
 
+set -euo pipefail
+
 # ── Config (override with sbatch --export=ALL,KEY=value) ─────────────────
 SHARD_DIR=${SHARD_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations}
 MODELS_DIR=${MODELS_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_models}
@@ -63,6 +65,7 @@ else
 fi
 SPLIT_SEED=${SPLIT_SEED:-42}
 SEED=${SEED:-42}
+ASSIGN_BATCH=${ASSIGN_BATCH:-1024}
 
 LAYER_TAG="layer$(printf '%02d' "$LAYER")"
 CENTROID_TAG="k${K}_L$(printf '%02d' "$LAYER")"
@@ -119,4 +122,14 @@ uv run python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=
     --training-mode component_shard \
     "${EXTRA_ARGS[@]}"
 
-echo "=== $(date) === done ==="
+echo "=== $(date) === training done; computing assignments (batch=$ASSIGN_BATCH) ==="
+uv run dalg-run-metrics assignments \
+    --data-dir "$OUT_DIR" \
+    --shard-dir "$SHARD_DIR" \
+    --layer "$LAYER" \
+    --batch-size "$ASSIGN_BATCH" \
+    --device cuda \
+    --seed "$SEED" \
+    --save-path "$OUT_DIR/mfa_model_assignments.pt"
+
+echo "=== $(date) === training + assignments done ==="

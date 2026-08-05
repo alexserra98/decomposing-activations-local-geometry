@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Callable
 
 import torch
@@ -426,8 +428,141 @@ def make_toy_manifold_datasets(
     return train_dataset, val_dataset, metadata
 
 
+def save_toy_manifold_shards(
+    output_dir: str | Path,
+    config: ToyManifoldConfig | None = None,
+    *,
+    shard_size: int = 50_000,
+    layer: int = 0,
+) -> Path:
+    """Write toy points in the activation-shard layout used by MFA training.
+
+    Every point is represented as a one-position activation window, so layer
+    shards have shape ``(rows, 1, ambient_dim)`` and ``drop_prefix`` is zero.
+    The independently sampled train and validation tensors from
+    :func:`make_toy_manifold_datasets` are concatenated into one canonical
+    stream; downstream training creates its own split with the standard
+    ``val_frac`` and ``split_seed`` arguments.
+
+    Per-row JSON metadata records the manifold instance and type. The larger
+    tensors describing embeddings, offsets, and point labels are stored in
+    ``manifold_metadata.pt``. Token shards are intentionally omitted because
+    synthetic points have no textual token identity.
+
+    The destination must be absent or empty to avoid mixing shards from
+    different generator configurations.
+    """
+    if not isinstance(shard_size, int) or isinstance(shard_size, bool):
+        raise TypeError("shard_size must be an integer")
+    if shard_size <= 0:
+        raise ValueError("shard_size must be positive")
+    if not isinstance(layer, int) or isinstance(layer, bool):
+        raise TypeError("layer must be an integer")
+    if layer < 0:
+        raise ValueError("layer must be non-negative")
+
+    root = Path(output_dir)
+    if root.exists():
+        if not root.is_dir():
+            raise FileExistsError(f"output path exists and is not a directory: {root}")
+        if any(root.iterdir()):
+            raise FileExistsError(f"output directory is not empty: {root}")
+
+    config = ToyManifoldConfig() if config is None else config
+    train_dataset, val_dataset, metadata = make_toy_manifold_datasets(config)
+    manifold_type_ids = metadata["manifold_type_ids"]
+
+    root.mkdir(parents=True, exist_ok=True)
+    layer_dir = root / f"layer{layer:02d}"
+    meta_dir = root / "meta"
+    layer_dir.mkdir()
+    meta_dir.mkdir()
+
+    global_row = 0
+    shard_id = 0
+    row_manifold_ids = []
+    for dataset in (train_dataset, val_dataset):
+        points, manifold_ids = dataset.tensors
+        row_manifold_ids.append(manifold_ids)
+        for start in range(0, len(dataset), shard_size):
+            end = min(start + shard_size, len(dataset))
+            shard_points = points[start:end].clone().unsqueeze(1)
+            shard_manifold_ids = manifold_ids[start:end].tolist()
+            row_indices = list(range(global_row, global_row + len(shard_points)))
+
+            rows = []
+            for manifold_id in shard_manifold_ids:
+                type_id = int(manifold_type_ids[manifold_id])
+                rows.append(
+                    {
+                        "subset": MANIFOLD_NAMES[type_id],
+                        "manifold_id": int(manifold_id),
+                        "manifold_type_id": type_id,
+                        "intrinsic_dim": INTRINSIC_DIMS[type_id],
+                    }
+                )
+
+            shard_path = layer_dir / f"shard_{shard_id:05d}.pt"
+            shard_tmp = shard_path.with_suffix(".pt.tmp")
+            torch.save(shard_points, shard_tmp)
+            shard_tmp.replace(shard_path)
+
+            meta_path = meta_dir / f"shard_{shard_id:05d}.json"
+            meta_tmp = meta_path.with_suffix(".json.tmp")
+            meta_tmp.write_text(
+                json.dumps(
+                    {
+                        "start": global_row,
+                        "end": global_row + len(shard_points),
+                        "row_indices": row_indices,
+                        "rows": rows,
+                    }
+                )
+            )
+            meta_tmp.replace(meta_path)
+
+            global_row += len(shard_points)
+            shard_id += 1
+
+    saved_metadata = dict(metadata)
+    saved_metadata.update(
+        {
+            "row_manifold_ids": torch.cat(row_manifold_ids),
+            "canonical_order": "generated_train_then_generated_val",
+            "layer": layer,
+        }
+    )
+    metadata_path = root / "manifold_metadata.pt"
+    metadata_tmp = metadata_path.with_suffix(".pt.tmp")
+    torch.save(saved_metadata, metadata_tmp)
+    metadata_tmp.replace(metadata_path)
+
+    shard_config = {
+        "model": "synthetic/toy_manifolds",
+        "mode": "synthetic_observations",
+        "source_kind": "toy_manifolds",
+        "layers": [layer],
+        "window": 1,
+        "d_model": config.ambient_dim,
+        "dtype": "float32",
+        "prepend_bos": False,
+        "shard_size": shard_size,
+        "drop_prefix": 0,
+        "num_rows": global_row,
+        "num_shards": shard_id,
+        "generator_config": asdict(config),
+        "manifold_metadata": metadata_path.name,
+    }
+    config_path = root / "config.json"
+    config_tmp = config_path.with_suffix(".json.tmp")
+    config_tmp.write_text(json.dumps(shard_config, indent=2) + "\n")
+    config_tmp.replace(config_path)
+    return root
+
+
 __all__ = [
     "MANIFOLD_NAMES",
     "ToyManifoldConfig",
     "make_toy_manifold_datasets",
+    "save_toy_manifold_shards",
 ]

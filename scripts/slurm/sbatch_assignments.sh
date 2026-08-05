@@ -14,16 +14,19 @@
 # SLURM stages this script into /var/spool/slurm/, so don't rely on
 # BASH_SOURCE — hardcode the repo root.
 REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
-LAYER=5
+LAYER=00
 LAYER_TAG=$(printf "%02d" "$LAYER")
-Q=394
-K=1000
+Q=32
+K=100
 
 
 # MFA_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_models/layer${LAYER_TAG}_${K}_${Q}_component_sharded_mfa
-MFA_DIR=dalg-cache/pile_gemma2b_models/layer05_1000_10_mfa_1epoch_20260703_1538
-SHARD_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations
-MODELS_DIR=${MODELS_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_models}
+# MFA_DIR=dalg-cache/pile_gemma2b_models/layer05_1000_10_mfa_1epoch_20260703_1538
+MFA_DIR=/u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/toy_manifold_models/toy_manifolds_8types_2each_D128_150K_K100_q32_mfa_hddc
+# SHARD_DIR=/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_activations
+SHARD_DIR=/u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/assets/toy_manifolds_8types_2each_D128_150K_shards
+#MODELS_DIR=${MODELS_DIR:-/orfeo/scratch/dssc/zenocosini/dalg-cache/pile_gemma2b_models}
+MODELS_DIR=/u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/toy_manifold_models
 CENTROIDS_DIR=${CENTROIDS_DIR:-"$MODELS_DIR/centroids"}
 
 cd "$REPO_ROOT" || exit 1
@@ -37,6 +40,7 @@ echo "MFA dir: $MFA_DIR"
 # Writes <MFA_DIR>/mfa_model_assignments.pt by default.
 uv run python -m dalg.analysis.cluster_assignments \
     --model-path "$MFA_DIR/mfa_model.pt" \
+    --model-type hddc \
     --shard-dir "$SHARD_DIR" \
     --layer "$LAYER" \
     --batch-size 1024 \

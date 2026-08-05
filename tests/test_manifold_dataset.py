@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from dalg.data import ToyManifoldConfig, make_toy_manifold_datasets
+from dalg.data import (
+    ToyManifoldConfig,
+    make_toy_manifold_datasets,
+    save_toy_manifold_shards,
+)
+from dalg.data.shard_activations import ActivationBatchDataset, load_meta_index
 from dalg.data.manifold_dataset import (
     EMBEDDING_DIMS,
     INTRINSIC_DIMS,
@@ -186,6 +192,92 @@ def test_tensor_dataset_runs_through_train_nll() -> None:
         early_stop_delta=None,
     )
     assert all(torch.isfinite(parameter).all() for parameter in model.parameters())
+
+
+def test_shard_writer_matches_activation_training_protocol(tmp_path) -> None:
+    config = _tiny_config(n_train=83, n_val=41)
+    expected_train, expected_val, expected_metadata = make_toy_manifold_datasets(config)
+    root = save_toy_manifold_shards(
+        tmp_path / "toy_manifold_shards",
+        config,
+        shard_size=25,
+        layer=0,
+    )
+
+    shard_config = json.loads((root / "config.json").read_text())
+    assert shard_config["source_kind"] == "toy_manifolds"
+    assert shard_config["layers"] == [0]
+    assert shard_config["window"] == 1
+    assert shard_config["drop_prefix"] == 0
+    assert shard_config["d_model"] == 16
+    assert shard_config["dtype"] == "float32"
+    assert shard_config["num_rows"] == 124
+    assert shard_config["num_shards"] == 6
+    assert not (root / "tokens").exists()
+
+    shard_paths = sorted((root / "layer00").glob("shard_*.pt"))
+    assert len(shard_paths) == shard_config["num_shards"]
+    assert all(
+        torch.load(path, mmap=True, weights_only=True).ndim == 3
+        for path in shard_paths
+    )
+    assert all(
+        torch.load(path, mmap=True, weights_only=True).shape[1:] == (1, 16)
+        for path in shard_paths
+    )
+    for path in shard_paths:
+        shard = torch.load(path, mmap=True, weights_only=True)
+        assert shard.untyped_storage().nbytes() == shard.numel() * shard.element_size()
+
+    meta_index = load_meta_index(root, layer=0)
+    assert len(meta_index) == 124
+    assert [row["global_row"] for row in meta_index] == list(range(124))
+    assert {row["subset"] for row in meta_index} == set(MANIFOLD_NAMES)
+
+    first_meta = json.loads((root / "meta" / "shard_00000.json").read_text())
+    assert set(first_meta["rows"][0]) == {
+        "subset",
+        "manifold_id",
+        "manifold_type_id",
+        "intrinsic_dim",
+    }
+
+    dataset = ActivationBatchDataset(
+        root,
+        layer=0,
+        batch_size=17,
+        drop_prefix=None,
+        shuffle_shards=False,
+        shuffle_within_shard=False,
+    )
+    streamed = torch.cat(list(dataset))
+    expected_points = torch.cat(
+        (expected_train.tensors[0], expected_val.tensors[0])
+    )
+    assert dataset.num_items == 124
+    assert torch.equal(streamed, expected_points)
+
+    saved_metadata = torch.load(
+        root / "manifold_metadata.pt", map_location="cpu", weights_only=True
+    )
+    expected_ids = torch.cat(
+        (expected_train.tensors[1], expected_val.tensors[1])
+    )
+    assert torch.equal(saved_metadata["row_manifold_ids"], expected_ids)
+    assert torch.equal(
+        saved_metadata["manifold_type_ids"],
+        expected_metadata["manifold_type_ids"],
+    )
+
+
+def test_shard_writer_rejects_nonempty_output(tmp_path) -> None:
+    output_dir = tmp_path / "existing"
+    output_dir.mkdir()
+    (output_dir / "keep.txt").write_text("user data")
+
+    with pytest.raises(FileExistsError, match="not empty"):
+        save_toy_manifold_shards(output_dir, _tiny_config())
+    assert (output_dir / "keep.txt").read_text() == "user data"
 
 
 @pytest.mark.parametrize(

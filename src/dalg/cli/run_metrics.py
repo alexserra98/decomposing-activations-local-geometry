@@ -231,6 +231,7 @@ def cmd_assignments(args) -> None:
             device=device,
             max_batches=args.max_batches,
             use_inference_cache=args.use_inference_cache,
+            model_type=args.model_type,
         )
         payload = {
             "cluster_sizes": sizes,
@@ -238,6 +239,7 @@ def cmd_assignments(args) -> None:
             "max_responsibilities": max_responsibilities,
             "peakedness": peakedness,
             "K": int(sizes.numel()),
+            "model_type": args.model_type,
             "subset_spec": subset_spec,
         }
         default_dir = run_dir
@@ -518,6 +520,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Stop after this many batches (for smoke tests)")
     sp.add_argument("--save-path", default=None,
                     help="Explicit save path (overrides --out-dir-based default)")
+    sp.add_argument("--model-type", choices=("mfa", "hddc"), default="mfa",
+                    help="Checkpoint implementation to load (ARD uses the mfa default)")
     sp.add_argument("--no-inference-cache", "--slow-responsibilities",
                     dest="use_inference_cache",
                     action="store_false", default=True,

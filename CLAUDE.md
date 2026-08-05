@@ -29,3 +29,4 @@ in scope:
 
 - `docs/experiments/wikipedia-kmedoids.md`
 - `docs/experiments/synthetic-mfa.md`
+- `docs/experiments/hddc-rank-surgery.md`

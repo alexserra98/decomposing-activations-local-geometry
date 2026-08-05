@@ -26,7 +26,9 @@ The repo uses a `src/` layout.
 ```text
 src/dalg/
   cli/            Main runnable entrypoints
-  models/         MFA model, component-sharded MFA, adaptive-rank ARD MFA, training loops
+  models/         MFA model, component-sharded MFA, training loops
+  models/adaptive_q/  Per-component-rank variants: ARD prior and HDDC surgery
+  cli/adaptive_q/     Their entrypoints
   init/           Reservoir KMeans centroid initialization
   data/           Window builders and activation-shard streaming
   llm/            TransformerLens activation extraction wrapper
@@ -35,6 +37,8 @@ src/dalg/
 
 scripts/slurm/    Cluster job scripts for extraction, training, metrics, labels
 scripts/          Temporary/profiling/synthetic-analysis scripts
+scripts/adaptive_q/       Runners for the per-component-rank experiments
+scripts/slurm/adaptive_q/ Their cluster job scripts
 tests/            Unit/smoke tests and synthetic shard fixtures
 notebooks/        Exploratory notebooks
 docs/experiments/ Attachable context for temporary experiment workflows
@@ -68,6 +72,7 @@ Preferred CLI entrypoints are defined in `pyproject.toml`:
 - `dalg-run-extraction`
 - `dalg-run-training`
 - `dalg-run-training-ard`
+- `dalg-run-training-hddc`
 - `dalg-run-metrics`
 - `dalg-interpret-mfa`
 - `dalg-label-mfa-clusters`
@@ -92,6 +97,22 @@ There is no current `dalg-run-layer` entrypoint in `pyproject.toml`. If old
 docs or logs mention it, treat that path as stale.
 
 ## Data Layout
+
+### Toy manifold dataset generator
+
+`src/dalg/data/manifold_dataset.py` provides `ToyManifoldConfig` and
+`make_toy_manifold_datasets` for deterministic synthetic local-geometry data.
+It defines eight manifold types and creates `manifolds_per_type` independently
+embedded instances of each type in `ambient_dim`. The function returns balanced
+train and validation `TensorDataset`s containing `(points, manifold_id)`, plus
+metadata with type IDs, intrinsic dimensions, embeddings, and offsets.
+
+Set `offset_radius=0` for instances centered at the origin; use a positive
+radius for separated/non-centered instances. Generate paired conditions with
+the same seed and configuration except for `offset_radius` so they differ only
+by the recorded per-instance offsets. There is no dedicated CLI or workflow
+skill; import the module directly. Store large generated `.pt` artifacts under
+`dalg-cache/assets/`, not in source directories.
 
 Large runs use activation shards produced by `dalg-run-extraction`.
 
@@ -187,17 +208,39 @@ distributed-aware:
 No optimizer in this repo applies weight decay; `Adam` is constructed with its
 default `weight_decay=0`. Shrinkage on `W` comes only from the ARD path below.
 
-### Adaptive-rank (ARD) training path
+## Adaptive q
 
-A second, deliberately redundant stack learns a per-component rank `q_k` instead
-of fixing it at `--rank`. It leaves the files above untouched, so both paths can
-evolve independently:
+Two deliberately redundant stacks learn a **per-component rank** instead of
+fixing it at `--rank`. Both leave `mfa.py`, `train.py`, and `run_training.py`
+untouched, so each can evolve independently, and both are collected under
+`adaptive_q/` subdirectories:
 
-- `src/dalg/models/mfa_ard.py`: `MFA_ARD(MFA)`, plus `save_mfa_ard` /
+```text
+src/dalg/models/adaptive_q/   mfa_ard, train_ard, mfa_hddc, hddc_surgery, train_hddc
+src/dalg/cli/adaptive_q/      run_training_ard, run_training_hddc
+scripts/adaptive_q/           toy-manifold runners
+scripts/slurm/adaptive_q/     sbatch_train_ard.sh, sbatch_train_hddc.sh
+```
+
+These directories have no `__init__.py` and work as implicit namespace packages;
+console scripts resolve through the full dotted path
+(`dalg.cli.adaptive_q.run_training_hddc:main`). This is a temporary arrangement:
+the intent is to converge on a single adaptive-rank model, at which point one of
+the two stacks is deleted and the other folds back into `models/` and `cli/`.
+
+### ARD prior path
+
+Learns a per-component rank `q_k` through an ARD prior that shrinks whole
+columns of `W_k`:
+
+- `src/dalg/models/adaptive_q/mfa_ard.py`: `MFA_ARD(MFA)`, plus `save_mfa_ard` /
   `load_mfa_ard`
-- `src/dalg/models/train_ard.py`: `train_nll_ard`, `ard_beta_schedule`
-- `src/dalg/cli/run_training_ard.py`: `dalg-run-training-ard` (vanilla only)
-- `scripts/slurm/sbatch_train_ard.sh`
+- `src/dalg/models/adaptive_q/train_ard.py`: `train_nll_ard`, `ard_beta_schedule`
+- `src/dalg/cli/adaptive_q/run_training_ard.py`: `dalg-run-training-ard`
+  (vanilla only)
+- `scripts/slurm/adaptive_q/sbatch_train_ard.sh`
+- `scripts/adaptive_q/train_ard_toy_manifolds.py`: the same model on toy-manifold
+  `.pt` datasets, which the CLI cannot read because it expects activation shards
 
 Invariants that matter when editing this path:
 
@@ -220,6 +263,74 @@ Invariants that matter when editing this path:
   resume that changes it is rejected.
 - Pruning is a post-training step only (`MFA_ARD.prune_columns`); the training
   loop never calls it.
+
+### HDDC covariance-surgery path
+
+A second route to a per-component rank, independent of ARD. SGD training is
+unchanged; every `T` epochs the closed-form covariance update of the HDDC model
+`[a_ij b_i Q_i d_i]` (Bouveyron, Girard & Schmid, arXiv:math/0604064)
+re-estimates each component's covariance at an adaptive rank `d_k <= q_max` and
+rewrites it in MFA parameters. Three phases: an E-pass accumulating the
+responsibility-weighted second moment in float64, then per component an `eigh`
+plus a scale-free Cattell scree test that picks `d_k` and the noise level
+`b_k = (Tr(S_k) - sum_{j<=d_k} lam_j) / (D - d_k)`, then an Adam-state reset for
+the rewritten tensors.
+
+- `src/dalg/models/adaptive_q/mfa_hddc.py`: `MFA_HDDC` /
+  `ComponentShardedMFA_HDDC` plus `save_mfa_hddc` / `load_mfa_hddc` and the
+  component-shard pair. Unlike `MFA_ARD`, this is a self-contained fork of
+  `mfa.py` rather than a subclass, because it changes the parameter shapes: it
+  adds `isotropic_psi` (a `(K, 1)` `psi_rho`), a non-trainable `rank_mask`
+  buffer `(K, q_max)`, and a `component_ranks` property returning
+  `rank_mask.sum(-1)`. `EncodedBatch` / `MFAEncoderDecoder` are deliberately
+  *not* forked; they call public methods only, so `mfa.MFAEncoderDecoder`
+  accepts an `MFA_HDDC`.
+- `src/dalg/models/adaptive_q/hddc_surgery.py`: `SurgeryConfig`, `hddc_surgery`,
+  `accumulate_statistics`, `reconstruct_components`, `surgery_params`,
+  `reset_optimizer_state`, `parameter_count`
+- `src/dalg/models/adaptive_q/train_hddc.py`: `train_nll_hddc`, a copy of
+  `train_nll` whose only difference is the `surgery=` argument and the block it
+  gates
+- `src/dalg/cli/adaptive_q/run_training_hddc.py`: `dalg-run-training-hddc`,
+  adding `--isotropic-psi`, `--surgery-every-epochs`, `--surgery-threshold`,
+  `--surgery-min-count`, `--surgery-warmup-steps`; `--rank` doubles as `--q-max`
+- `scripts/slurm/adaptive_q/sbatch_train_hddc.sh`
+- `tests/test_hddc_surgery.py`
+
+Invariants that matter when editing this path:
+
+- Surgery rewrites covariances only (`dir_raw`, `scale_rho`, `psi_rho`,
+  `rank_mask`). `mu` and `pi_logits` keep whatever SGD made them, and their Adam
+  state is preserved while the rewritten tensors' state is dropped.
+- Statistics are centered on the *current* `mu_k`, never on the empirical
+  responsibility-weighted mean. Pairing a covariance centered at `mu_hat_k` with
+  a retained `mu_k` is inconsistent and leaks the mean shift into the spectrum,
+  inflating apparent rank whenever the SGD means lag the data.
+- `isotropic_psi` is required: the reconstruction `Sigma_k = W_k W_k^T + b_k I`
+  is exact only for isotropic noise. The CLI rejects `--surgery-every-epochs`
+  without `--isotropic-psi`.
+- Masking is multiplicative, so masked columns get exactly zero gradient and no
+  stop-gradient machinery is needed. All `q_max` columns are rewritten at every
+  surgery and only the mask records `d_k`, so a rank *increase* needs no revival
+  logic.
+- Surgery is a partial M-step, so it competes for best-model selection on the
+  same validation metric; otherwise a surgery landing on the final epoch would
+  be discarded by the end-of-run rollback.
+- `rank_mask` is part of the `state_dict`, sharded like the other per-component
+  tensors. It and the `(K, 1)` psi_rho make an `MFA_HDDC` checkpoint unreadable
+  by `mfa.load_mfa`, so downstream analyses do not consume HDDC runs — unlike the
+  ARD path, whose `state_dict` is identical to a plain MFA one.
+- Only D=128-scale data is supported: phase A accumulates an explicit
+  `(K, D, D)` scatter. There is a TODO for the large-D sketching path.
+
+To remove the feature: delete `models/adaptive_q/{mfa_hddc,hddc_surgery,train_hddc}.py`,
+`cli/adaptive_q/run_training_hddc.py`, `scripts/slurm/adaptive_q/sbatch_train_hddc.sh`,
+`tests/test_hddc_surgery.py`, and the `dalg-run-training-hddc` entry in
+`pyproject.toml`. Nothing outside those files imports them.
+
+`--surgery-every-epochs 0` gives a fixed-q baseline on the same stack, which is
+the comparison an adaptive-rank claim needs. Validation data comes from the toy
+manifold generator above; see `docs/experiments/hddc-rank-surgery.md`.
 
 ## Workflow Skills
 
@@ -249,6 +360,7 @@ user places that experiment in scope:
 
 - `docs/experiments/wikipedia-kmedoids.md`
 - `docs/experiments/synthetic-mfa.md`
+- `docs/experiments/hddc-rank-surgery.md`
 
 ## Cluster and Scratch Notes
 
@@ -324,5 +436,6 @@ PYTHONPATH=src python -m torch.distributed.run --standalone --nproc_per_node=2 \
 - Comments and docstrings should explain what the code does, not narrate recent
   changes.
 - Avoid generated outputs inside source folders.
-- When I ask you to implement an experimental module the guiding principle is: **implement something easy to add and easy to remove**. Avoid overengineering or overgeneralizing.
+- When I ask you to implement an experimental module the guiding principle is: **implement something easy to add and easy to remove**. Avoid overengineering or overgeneralizing. I prefere code redundacy rather than chaning the codebase to support a single experiment. 
 - If you need to create scripts custom for a execute a specific experiment put under either scripts/temporary of scripts/slurm/temporary. Avoid cluttering the main scripts/ folder with one-off scripts.
+- Reuse reuse reuse. I don't want you to reinvent the wheel prefer to reuse existing code and functions in this repo instead of writing new ones.

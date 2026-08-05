@@ -37,7 +37,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from .mfa import MFA
+from ..mfa import MFA
 
 
 # softplus(-120) underflows to exactly 0 in float32 while staying finite, so a

@@ -11,6 +11,17 @@ from tqdm import tqdm
 from dalg.models.mfa import load_mfa
 
 
+def _load_assignment_model(model_path: Path, model_type: str):
+    """Load the explicitly selected MFA implementation."""
+    if model_type == "hddc":
+        from dalg.models.adaptive_q.mfa_hddc import load_mfa_hddc
+
+        return load_mfa_hddc(model_path, map_location="cpu")
+    if model_type != "mfa":
+        raise ValueError(f"Unknown model_type={model_type!r}; expected 'mfa' or 'hddc'")
+    return load_mfa(model_path, map_location="cpu")
+
+
 def _responsibility_margin(r: torch.Tensor) -> torch.Tensor:
     """Return top responsibility minus second responsibility for each sample."""
     if r.shape[1] == 1:
@@ -44,6 +55,7 @@ def compute_assignments(
     device: str | torch.device = "cpu",
     max_batches: int | None = None,
     use_inference_cache: bool = True,
+    model_type: str = "mfa",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """
     Single-pass streaming over `loader`. Per point, takes the argmax of the
@@ -55,7 +67,7 @@ def compute_assignments(
     """
     model_path = Path(model_path)
     device = _resolve_device(device)
-    model = load_mfa(model_path, map_location="cpu").to(device)
+    model = _load_assignment_model(model_path, model_type).to(device)
     model.eval()
     K = model.K
     print(f"MFA: K={K} components  D={model.D}  rank={model.q}")
@@ -122,6 +134,12 @@ def main() -> None:
     parser.add_argument("--max-batches", type=int, default=None)
     parser.add_argument("--save-path", type=Path, default=None)
     parser.add_argument(
+        "--model-type",
+        choices=("mfa", "hddc"),
+        default="mfa",
+        help="Checkpoint implementation to load (ARD checkpoints use the mfa default)",
+    )
+    parser.add_argument(
         "--no-inference-cache", "--slow-responsibilities",
         dest="use_inference_cache",
         action="store_false",
@@ -168,6 +186,7 @@ def main() -> None:
         device=device,
         max_batches=args.max_batches,
         use_inference_cache=args.use_inference_cache,
+        model_type=args.model_type,
     )
 
     save_path = args.save_path
@@ -183,6 +202,7 @@ def main() -> None:
         "max_responsibilities": max_responsibilities,
         "peakedness": peakedness,
         "K": int(sizes.numel()),
+        "model_type": args.model_type,
         "subset_spec": subset_spec,
     }, save_path)
     print(f"Assignments saved to {save_path}")
