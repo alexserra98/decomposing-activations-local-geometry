@@ -1,0 +1,4 @@
+interface:
+  display_name: "Compare DALG Metrics"
+  short_description: "Compare pipeline runs in a Markdown table"
+  default_prompt: "Use $dalg-compare-metrics to compare completed runs under this experiment folder."
