@@ -1,0 +1,56 @@
+# Small end-to-end smoke run: train -> assignments -> adaptive-q evaluation.
+# The source toy-manifold activation shards must already exist.
+
+experiment:
+  name: adaptive_q_toy_20k_ard
+  output_root: dalg-cache/toy_manifold_models_20k/
+
+dataset:
+  id: toy_manifolds_D128_20K_noise1e4
+  shard_dir: /u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/assets/toy_manifolds_circle_helix_D128_20K_noise1e4_shards
+  layer: 0
+
+model:
+  kind: mfa
+  K: 200
+  q_max: 16
+
+
+
+training:
+  # Reuse one initialization across runs by pointing at a compatible (K, D)
+  # .pt tensor file.
+  centroids_path: /u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/toy_manifold_models_20k/centroids/kmedoids_k200/centroids.pt
+  epochs: 1000
+  early_stop_patience: 10
+  early_stop_min_delta: 0.001
+  early_stop_delta: 0.0
+  epoch_snapshot_every: 1
+  batch_size: 2048
+  num_workers: 2
+  pool_size: 4096
+  refine_epochs: 0
+  val_frac: 0.1
+  split_seed: 42
+  seed: 42
+  device: cuda
+  wandb: false
+
+assignments:
+  enabled: true
+  batch_size: 4096
+  device: cuda
+
+
+resources:
+  partition: H100
+  account: LADE
+  nodes: 1
+  ntasks_per_node: 1
+  cpus_per_task: 8
+  gpus: 1
+  gpu_type: H100
+  memory: 80G
+  time: "01:00:00"
+  max_parallel: 1
+

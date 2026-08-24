@@ -2,12 +2,12 @@
 # The source toy-manifold activation shards must already exist.
 
 experiment:
-  name: adaptive_q_toy_10k
-  output_root: dalg-cache/toy_manifold_models_10k/
+  name: adaptive_q_toy_20k_hddc
+  output_root: dalg-cache/toy_manifold_models_20k/
 
 dataset:
-  id: toy_manifolds_D128_10K
-  shard_dir: /u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/assets/toy_manifolds_circle_helix_D128_10K_shards
+  id: toy_manifolds_D128_20K_noise1e4
+  shard_dir: /u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/assets/toy_manifolds_circle_helix_D128_20K_noise1e4_shards
   layer: 0
 
 model:
@@ -19,11 +19,9 @@ model:
   surgery_threshold: 0.01
 
 training:
-  # Reuse one initialization across runs by pointing at a compatible (K, D)
-  # .pt tensor file.
-  centroids_path: /u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/assets/toy_manifolds_circle_helix_D128_10K_shards/centroids/kmedoids_k200/centroids.pt
+  centroids_path: /u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/toy_manifold_models_20k/centroids/kmedoids_k200/centroids.pt
   epochs: 500
-  early_stop_patience: 5
+  early_stop_patience: 10
   early_stop_min_delta: 0.001
   early_stop_delta: 0.0
   epoch_snapshot_every: 1

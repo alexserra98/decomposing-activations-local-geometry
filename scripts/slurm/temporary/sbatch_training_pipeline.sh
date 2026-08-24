@@ -11,8 +11,12 @@ fi
 
 : "${SLURM_ARRAY_TASK_ID:?this worker must run as a Slurm array}"
 
-REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 MANIFEST=$1
+REPO_ROOT=${SLURM_SUBMIT_DIR:?Slurm did not record the submission directory}
+if [[ ! -f "$REPO_ROOT/pyproject.toml" ]]; then
+  echo "submission directory is not the DALG repository: $REPO_ROOT" >&2
+  exit 2
+fi
 
 cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
@@ -22,7 +26,7 @@ echo "=== $(date) === job ${SLURM_JOB_ID}.${SLURM_ARRAY_TASK_ID} on $(hostname) 
 echo "manifest=$MANIFEST index=$SLURM_ARRAY_TASK_ID"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
-uv run --locked dalg-run-pipeline run \
+"$REPO_ROOT/.venv/bin/python" -m dalg.cli.run_pipeline run \
   --manifest "$MANIFEST" \
   --index "$SLURM_ARRAY_TASK_ID"
 

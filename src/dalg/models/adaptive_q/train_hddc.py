@@ -124,6 +124,42 @@ def _restore_rng_state(state, device):
     if "cuda" in state and torch.cuda.is_available() and torch.device(device).type == "cuda":
         torch.cuda.set_rng_state(state["cuda"].cpu(), device)
 
+
+def seed_training_checkpoint(
+    model,
+    path,
+    *,
+    lr,
+    val_tensor=None,
+    val_loader=None,
+):
+    """Write a resumable epoch-0 checkpoint from an initialized HDDC model."""
+    raw_model = _unwrap_model(model)
+    device = next(raw_model.parameters()).device
+    optimizer = torch.optim.Adam(raw_model.parameters(), lr=lr)
+    if val_tensor is not None:
+        initial_metric = _eval_nll_tensor(raw_model, val_tensor, device)
+    elif val_loader is not None:
+        initial_metric = _eval_nll(raw_model, val_loader, device)
+    else:
+        initial_metric = float("inf")
+    best_state = _cpu_state_dict(raw_model)
+    _atomic_torch_save(
+        {
+            "epoch": 0,
+            "model": raw_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "best_metric": initial_metric,
+            "best_state": best_state,
+            "best_epoch": 0,
+            "last_val_metric": initial_metric if math.isfinite(initial_metric) else None,
+            "epochs_without_improvement": 0,
+            "rng_state": _rng_state(device),
+        },
+        path,
+    )
+    return initial_metric
+
 #TODO refactor to use pytorch lightining
 def train_nll_hddc(
     model,
@@ -148,6 +184,7 @@ def train_nll_hddc(
     epoch_snapshot_func=None,
     epoch_snapshot_every=5,
     surgery=None,
+    surgery_loader=None,
 ):
     """
     Train with NLL, keep the best (lowest) NLL model.
@@ -179,12 +216,15 @@ def train_nll_hddc(
     epoch + best state) is written atomically after every epoch. On startup,
     if that file exists it is loaded and training resumes from the next epoch.
 
-    `surgery` optionally takes a `dalg.models.hddc_surgery.SurgeryConfig`. When
-    it is active for an epoch, the HDDC closed-form covariance update runs after
-    that epoch's validation and best-model bookkeeping, so the selected metric
-    and the state it selected still describe the same model. The checkpoint
-    written at the end of the epoch is post-surgery, so a resume picks up the
-    rewritten covariances and the reset optimizer state.
+    `surgery` optionally takes a `dalg.models.hddc_surgery.SurgeryConfig`.
+    Integer cadences run after the selected epoch's validation. Fractional
+    cadences run on the first completed optimizer step crossing each requested
+    fraction, with exact epoch-boundary events deferred until after validation.
+    `surgery_loader` may provide a separate full E-pass loader for an in-epoch
+    update; this is required for a DataLoader whose active training iterator
+    cannot be nested.
+    The checkpoint written at the end of the epoch is post-surgery, so a resume
+    picks up the rewritten covariances and the reset optimizer state.
     """
     dist_on, rank = _distributed_state()
     is_main = (rank == 0)
@@ -257,6 +297,64 @@ def train_nll_hddc(
     # Linear LR warmup after each surgery; 0 leaves the LR alone.
     warmup_total, warmup_step = 0, 0
     surgery_summary = None
+    has_validation = val_tensor is not None or val_loader is not None
+    min_delta = 0.0 if early_stop_min_delta is None else float(early_stop_min_delta)
+
+    def run_surgery(*, epoch: int, position: str, nll_before: float):
+        nonlocal best_epoch
+        nonlocal best_metric
+        nonlocal best_state
+        nonlocal epochs_without_improvement
+        nonlocal surgery_summary
+        nonlocal warmup_step
+        nonlocal warmup_total
+
+        from .hddc_surgery import (
+            hddc_surgery,
+            reset_optimizer_state,
+            surgery_params,
+        )
+
+        stats_loader = surgery_loader if surgery_loader is not None else loader
+        summary = hddc_surgery(
+            raw_model, stats_loader, surgery, device=device, log=log
+        )
+        reset_optimizer_state(opt, surgery_params(raw_model))
+        warmup_total, warmup_step = int(surgery.warmup_steps or 0), 0
+        nll_after = eval_val_nll() if has_validation else float("nan")
+        if dist_on:
+            t = torch.tensor([nll_after], device=device, dtype=torch.float64)
+            dist.broadcast(t, src=0)
+            nll_after = float(t[0].item())
+        summary["nll_before"] = nll_before
+        summary["nll_after"] = nll_after
+        surgery_summary = summary
+
+        if math.isnan(nll_after):
+            delta_str = "val nll n/a"
+        else:
+            delta_str = (
+                f"nll {nll_before:.6f} -> {nll_after:.6f} "
+                f"(delta {nll_after - nll_before:+.6f})"
+            )
+        log(
+            f"[surgery] {position} | {delta_str} | "
+            f"d_k hist={summary['d_k_hist']}"
+        )
+
+        if track_best and not math.isnan(nll_after) and nll_after < (
+            best_metric - max(0.0, min_delta)
+        ):
+            best_metric = nll_after
+            epochs_without_improvement = 0
+            if keep_best_on_this_rank:
+                best_state = _cpu_state_dict(raw_model)
+                best_epoch = epoch
+            if is_main and save_path and save_func:
+                save_func(raw_model, save_path)
+
+        model.train()
+        return summary
 
     ep = start_epoch
     while epoch_limit is None or ep <= epoch_limit:
@@ -331,12 +429,25 @@ def train_nll_hddc(
                 win_loss_sum = 0.0
                 win_n = 0
 
+            del x, loss
+
+            if (
+                surgery is not None
+                and surgery.active_after_batch(
+                    batch_idx, steps_per_epoch, epoch=ep
+                )
+            ):
+                mid_nll = eval_val_nll() if has_validation else float("nan")
+                run_surgery(
+                    epoch=ep,
+                    position=f"epoch {ep:02d} step {batch_idx}/{steps_per_epoch}",
+                    nll_before=mid_nll,
+                )
+
             if steps_per_epoch is not None and batch_idx >= steps_per_epoch:
                 break
             if max_steps is not None and global_step >= max_steps:
                 break
-
-            del x, loss
 
         avg_train_nll = total_nll / total_n if total_n else float("nan")
         epoch_time = time.time() - ep_start
@@ -382,7 +493,6 @@ def train_nll_hddc(
         if has_val_metric and not math.isnan(select_metric):
             last_val_metric = select_metric
 
-        min_delta = 0.0 if early_stop_min_delta is None else float(early_stop_min_delta)
         improved = False
         if track_best and not math.isnan(select_metric):
             improved = select_metric < (best_metric - max(0.0, min_delta))
@@ -407,7 +517,11 @@ def train_nll_hddc(
             if is_main:
                 if save_path and save_func:
                     save_func(raw_model, save_path)
-        elif has_val_metric and not math.isnan(select_metric) and best_epoch > 0:
+        elif (
+            has_val_metric
+            and not math.isnan(select_metric)
+            and math.isfinite(best_metric)
+        ):
             epochs_without_improvement += 1
 
         if is_main:
@@ -435,52 +549,11 @@ def train_nll_hddc(
         # checkpoint write so a resume continues from the rewritten covariances.
         epoch_surgery = None
         if surgery is not None and surgery.active_at(ep):
-            from .hddc_surgery import (
-                hddc_surgery,
-                reset_optimizer_state,
-                surgery_params,
+            epoch_surgery = run_surgery(
+                epoch=ep,
+                position=f"epoch {ep:02d}",
+                nll_before=select_metric,
             )
-
-            nll_before = select_metric
-            epoch_surgery = hddc_surgery(
-                raw_model, loader, surgery, device=device, log=log
-            )
-            reset_optimizer_state(opt, surgery_params(raw_model))
-            warmup_total, warmup_step = int(surgery.warmup_steps or 0), 0
-            nll_after = eval_val_nll() if has_val_metric else float("nan")
-            if dist_on:
-                t = torch.tensor([nll_after], device=device, dtype=torch.float64)
-                dist.broadcast(t, src=0)
-                nll_after = float(t[0].item())
-            epoch_surgery["nll_before"] = nll_before
-            epoch_surgery["nll_after"] = nll_after
-            # Survives epochs so the returned info always reports the most
-            # recent surgery, not only one that landed on the final epoch.
-            surgery_summary = epoch_surgery
-            if math.isnan(nll_after):
-                delta_str = "val nll n/a"
-            else:
-                delta_str = (f"nll {nll_before:.6f} -> {nll_after:.6f} "
-                             f"(delta {nll_after - nll_before:+.6f})")
-            log(
-                f"[surgery] epoch {ep:02d} | {delta_str} | "
-                f"d_k hist={epoch_surgery['d_k_hist']}"
-            )
-
-            # Surgery is a partial M-step evaluated on the same validation set,
-            # so its result competes for "best" on equal terms. Without this the
-            # end-of-run rollback would silently discard a surgery that landed on
-            # the final epoch.
-            if track_best and not math.isnan(nll_after) and nll_after < (
-                best_metric - max(0.0, min_delta)
-            ):
-                best_metric = nll_after
-                epochs_without_improvement = 0
-                if keep_best_on_this_rank:
-                    best_state = _cpu_state_dict(raw_model)
-                    best_epoch = ep
-                if is_main and save_path and save_func:
-                    save_func(raw_model, save_path)
 
         if wandb_on:
             payload = {
@@ -528,7 +601,7 @@ def train_nll_hddc(
             early_stop_patience is not None
             and early_stop_patience > 0
             and has_val_metric
-            and best_epoch > 0
+            and math.isfinite(best_metric)
             and epochs_without_improvement >= int(early_stop_patience)
         ):
             log(

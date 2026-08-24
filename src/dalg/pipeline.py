@@ -255,7 +255,7 @@ def _resolve_optional_path(value: Any) -> Any:
 
 
 def _resolve_centroids_path(value: Any) -> str | None:
-    """Resolve a shared centroid tensor path and reject ambiguous inputs."""
+    """Resolve a shared centroid artifact path and reject ambiguous inputs."""
     resolved = _resolve_optional_path(value)
     if not resolved:
         return None
@@ -271,20 +271,42 @@ def _resolve_centroids_path(value: Any) -> str | None:
     return str(path)
 
 
+def _resolve_init_model_path(value: Any) -> str | None:
+    """Resolve the direct HDDC model file used for epoch-0 initialization."""
+    resolved = _resolve_optional_path(value)
+    if not resolved:
+        return None
+    path = Path(resolved)
+    if path.suffix != ".pt":
+        raise PipelineConfigError(
+            "training.init_model_path must point directly to a .pt file"
+        )
+    if path.exists() and not path.is_file():
+        raise PipelineConfigError(
+            f"training.init_model_path must be a file, got: {path}"
+        )
+    return str(path)
+
+
 def _validate_centroids(
     path_value: str,
     *,
     expected_k: int,
+    expected_rank: int,
+    direction_init: str,
     shard_dir_arg: str,
 ) -> None:
     """Fail at planning time when shared centroids cannot initialize the run."""
+    from dalg.init.centroid_artifact import unpack_centroid_artifact
+
     path = Path(path_value)
     if not path.is_file():
         raise PipelineConfigError(f"centroids file not found: {path}")
     try:
-        centroids = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+        value = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+        centroids, principal_components = unpack_centroid_artifact(value)
     except Exception as exc:
-        raise PipelineConfigError(f"could not load centroids tensor: {path}: {exc}") from exc
+        raise PipelineConfigError(f"could not load centroid artifact: {path}: {exc}") from exc
     if not isinstance(centroids, torch.Tensor) or centroids.ndim != 2:
         raise PipelineConfigError(
             f"centroids must be a rank-2 tensor, got {type(centroids).__name__} "
@@ -308,6 +330,79 @@ def _validate_centroids(
             f"centroid dimension D={centroids.shape[1]} does not match activation "
             f"d_model={expected_dim}: {path}"
         )
+    if principal_components is not None:
+        if principal_components.ndim != 3:
+            raise PipelineConfigError(
+                "principal_components must have shape (K, D, Q), got "
+                f"{tuple(principal_components.shape)}: {path}"
+            )
+        if tuple(principal_components.shape[:2]) != tuple(centroids.shape):
+            raise PipelineConfigError(
+                "principal_components leading dimensions "
+                f"{tuple(principal_components.shape[:2])} do not match centroids "
+                f"{tuple(centroids.shape)}: {path}"
+            )
+    if direction_init == "cluster_pca":
+        if principal_components is None:
+            raise PipelineConfigError(
+                "training.direction_init=cluster_pca requires a centroid artifact "
+                f"containing principal_components: {path}"
+            )
+        stored_rank = int(principal_components.shape[-1])
+        if stored_rank < expected_rank:
+            raise PipelineConfigError(
+                f"centroid artifact stores {stored_rank} principal components per "
+                f"cluster, but model rank/q_max={expected_rank} was requested: {path}"
+            )
+
+
+def _validate_hddc_init_model(
+    path_value: str,
+    *,
+    expected_k: int,
+    expected_rank: int,
+    expected_isotropic_psi: bool,
+    expected_shared_b: bool,
+    shard_dir_arg: str,
+) -> None:
+    """Fail at planning time when an HDDC model cannot seed the requested run."""
+    from dalg.models.adaptive_q.mfa_hddc import load_mfa_hddc
+
+    path = Path(path_value)
+    if not path.is_file():
+        raise PipelineConfigError(f"initial model not found: {path}")
+    try:
+        model = load_mfa_hddc(path, map_location="cpu")
+    except Exception as exc:
+        raise PipelineConfigError(f"could not load initial HDDC model: {path}: {exc}") from exc
+
+    shard_dir, _ = split_shard_dir_spec(shard_dir_arg)
+    try:
+        shard_config = json.loads((shard_dir / "config.json").read_text())
+        expected_dim = int(shard_config["d_model"])
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise PipelineConfigError(
+            f"could not read activation dimension from {shard_dir / 'config.json'}"
+        ) from exc
+
+    if model.K != expected_k or model.D != expected_dim:
+        raise PipelineConfigError(
+            f"initial model has (K={model.K}, D={model.D}), expected "
+            f"(K={expected_k}, D={expected_dim}): {path}"
+        )
+    if model.q != expected_rank:
+        raise PipelineConfigError(
+            f"initial model rank q={model.q} does not match model.q_max={expected_rank}: {path}"
+        )
+    if (
+        model.isotropic_psi != expected_isotropic_psi
+        or getattr(model, "shared_b", False) != expected_shared_b
+    ):
+        raise PipelineConfigError(
+            "initial model and requested HDDC run must use the same Psi noise mode"
+        )
+    if getattr(model, "_rotation_on", False):
+        raise PipelineConfigError("initial HDDC model must not have an active factor rotation")
 
 
 def _slug(value: str) -> str:
@@ -415,6 +510,8 @@ def resolve_run(config: Mapping[str, Any], *, check_inputs: bool = True) -> dict
     }
     if "centroids_path" in values:
         values["centroids_path"] = _resolve_centroids_path(values["centroids_path"])
+    if "init_model_path" in values:
+        values["init_model_path"] = _resolve_init_model_path(values["init_model_path"])
 
     training_mode = str(values.get("training_mode", "vanilla"))
     world_size = resources["gpus"] if training_mode == "component_shard" else 1
@@ -430,6 +527,17 @@ def resolve_run(config: Mapping[str, Any], *, check_inputs: bool = True) -> dict
         _validate_centroids(
             training_args["centroids_path"],
             expected_k=int(training_args["K"]),
+            expected_rank=int(training_args["rank"]),
+            direction_init=str(training_args["direction_init"]),
+            shard_dir_arg=shard_dir,
+        )
+    if check_inputs and training_args.get("init_model_path"):
+        _validate_hddc_init_model(
+            training_args["init_model_path"],
+            expected_k=int(training_args["K"]),
+            expected_rank=int(training_args["rank"]),
+            expected_isotropic_psi=bool(training_args["isotropic_psi"]),
+            expected_shared_b=bool(training_args["shared_b"]),
             shard_dir_arg=shard_dir,
         )
 

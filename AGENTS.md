@@ -41,6 +41,7 @@ scripts/adaptive_q/       Runners for the per-component-rank experiments
 scripts/slurm/adaptive_q/ Their cluster job scripts
 tests/            Unit/smoke tests and synthetic shard fixtures
 notebooks/        Exploratory notebooks
+docs/models/      Model explanations: what each MFA variant changes and why
 docs/experiments/ Attachable context for temporary experiment workflows
 .agents/skills/   Canonical recurring workflow skills for Codex and Claude
 .claude/skills/   Symlinks exposing the canonical skills to Claude Code
@@ -231,7 +232,8 @@ the two stacks is deleted and the other folds back into `models/` and `cli/`.
 ### ARD prior path
 
 Learns a per-component rank `q_k` through an ARD prior that shrinks whole
-columns of `W_k`:
+columns of `W_k`. `docs/models/mfa-ard.md` explains the model and how it differs
+from vanilla MFA. The stack:
 
 - `src/dalg/models/adaptive_q/mfa_ard.py`: `MFA_ARD(MFA)`, plus `save_mfa_ard` /
   `load_mfa_ard`
@@ -267,22 +269,24 @@ Invariants that matter when editing this path:
 ### HDDC covariance-surgery path
 
 A second route to a per-component rank, independent of ARD. SGD training is
-unchanged; every `T` epochs the closed-form covariance update of the HDDC model
-`[a_ij b_i Q_i d_i]` (Bouveyron, Girard & Schmid, arXiv:math/0604064)
-re-estimates each component's covariance at an adaptive rank `d_k <= q_max` and
-rewrites it in MFA parameters. Three phases: an E-pass accumulating the
-responsibility-weighted second moment in float64, then per component an `eigh`
+unchanged; every `T` epochs the closed-form covariance update of the HDDC models
+`[a_ij b_i Q_i d_i]` and `[a_ij b Q_i d_i]` (Bouveyron, Girard & Schmid,
+arXiv:math/0604064) re-estimates each component's covariance at an adaptive rank
+`d_k <= q_max` and rewrites it in MFA parameters. Three phases: an E-pass
+accumulating the responsibility-weighted second moment in float64, then per component an `eigh`
 plus a scale-free Cattell scree test that picks `d_k` and the noise level
 `b_k = (Tr(S_k) - sum_{j<=d_k} lam_j) / (D - d_k)`, then an Adam-state reset for
-the rewritten tensors.
+the rewritten tensors. `docs/models/mfa-hddc.md` explains the model and how it
+differs from vanilla MFA.
 
 - `src/dalg/models/adaptive_q/mfa_hddc.py`: `MFA_HDDC` /
   `ComponentShardedMFA_HDDC` plus `save_mfa_hddc` / `load_mfa_hddc` and the
   component-shard pair. Unlike `MFA_ARD`, this is a self-contained fork of
   `mfa.py` rather than a subclass, because it changes the parameter shapes: it
-  adds `isotropic_psi` (a `(K, 1)` `psi_rho`), a non-trainable `rank_mask`
-  buffer `(K, q_max)`, and a `component_ranks` property returning
-  `rank_mask.sum(-1)`. `EncodedBatch` / `MFAEncoderDecoder` are deliberately
+  adds `isotropic_psi` (a `(K, 1)` `psi_rho`) or single-process `shared_b` (a
+  `(1,)` `psi_rho`), a non-trainable `rank_mask` buffer `(K, q_max)`, and a
+  `component_ranks` property returning `rank_mask.sum(-1)`. `EncodedBatch` /
+  `MFAEncoderDecoder` are deliberately
   *not* forked; they call public methods only, so `mfa.MFAEncoderDecoder`
   accepts an `MFA_HDDC`.
 - `src/dalg/models/adaptive_q/hddc_surgery.py`: `SurgeryConfig`, `hddc_surgery`,
@@ -306,9 +310,10 @@ Invariants that matter when editing this path:
   responsibility-weighted mean. Pairing a covariance centered at `mu_hat_k` with
   a retained `mu_k` is inconsistent and leaks the mean shift into the spectrum,
   inflating apparent rank whenever the SGD means lag the data.
-- `isotropic_psi` is required: the reconstruction `Sigma_k = W_k W_k^T + b_k I`
-  is exact only for isotropic noise. The CLI rejects `--surgery-every-epochs`
-  without `--isotropic-psi`.
+- Isotropic noise is required: `--isotropic-psi` gives component-specific `b_k`,
+  while `--shared-b` gives one responsibility-weighted pooled `b`. The flags are
+  mutually exclusive, and shared-b is supported only by the full single-process
+  model and single-file checkpoint path.
 - Masking is multiplicative, so masked columns get exactly zero gradient and no
   stop-gradient machinery is needed. All `q_max` columns are rewritten at every
   surgery and only the mask records `d_k`, so a rank *increase* needs no revival
@@ -439,4 +444,4 @@ PYTHONPATH=src python -m torch.distributed.run --standalone --nproc_per_node=2 \
 - When I ask you to implement an experimental module the guiding principle is: **implement something easy to add and easy to remove**. Avoid overengineering or overgeneralizing. I prefere code redundacy rather than chaning the codebase to support a single experiment. 
 - If you need to create scripts custom for a execute a specific experiment put under either scripts/temporary of scripts/slurm/temporary. Avoid cluttering the main scripts/ folder with one-off scripts.
 - Reuse reuse reuse. I don't want you to reinvent the wheel prefer to reuse existing code and functions in this repo instead of writing new ones.
-- This is code for  research not production so if the code halts or fails in some edge case it is ok. I prefer clear and strict contracts rather than loads of fallbacks and error handling. 
+- This is code for  research not production so if the code halts or fails in some edge case it is ok. I prefer clear and strict contracts rather than loads of fallbacks and error handling.

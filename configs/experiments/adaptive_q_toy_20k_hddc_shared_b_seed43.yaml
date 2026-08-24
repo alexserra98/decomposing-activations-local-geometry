@@ -1,0 +1,62 @@
+# Seed-43 replicate of shared-b HDDC on the 20K toy-manifold dataset.
+# The source activation shards and K=200 centroid initialization must already exist.
+
+experiment:
+  name: adaptive_q_toy_20k_hddc_shared_b_seed43
+  output_root: dalg-cache/toy_manifold_models_20k/
+
+dataset:
+  id: toy_manifolds_D128_20K_noise1e4
+  shard_dir: /u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/assets/toy_manifolds_circle_helix_D128_20K_noise1e4_shards
+  layer: 0
+
+model:
+  kind: hddc
+  K: 200
+  q_max: 16
+  shared_b: true
+  surgery_every_epochs: 1
+  surgery_threshold: 0.01
+
+training:
+  centroids_path: /u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/toy_manifold_models_20k/centroids/kmedoids_k200/centroids.pt
+  epochs: 500
+  early_stop_patience: 10
+  early_stop_min_delta: 0.001
+  early_stop_delta: 0.0
+  epoch_snapshot_every: 1
+  batch_size: 2048
+  num_workers: 2
+  pool_size: 4096
+  refine_epochs: 0
+  val_frac: 0.1
+  split_seed: 43
+  seed: 43
+  device: cuda
+  wandb: false
+
+assignments:
+  enabled: true
+  batch_size: 4096
+  device: cuda
+
+evaluation:
+  enabled: true
+  kind: adaptive_q_toy
+  batch_size: 4096
+  device: cuda
+
+resources:
+  partition: H100
+  account: LADE
+  nodes: 1
+  ntasks_per_node: 1
+  cpus_per_task: 8
+  gpus: 1
+  gpu_type: H100
+  memory: 80G
+  time: "01:00:00"
+  max_parallel: 1
+
+sweep:
+  model.surgery_threshold: [0.0001, 0.001, 0.01, 0.1]

@@ -56,7 +56,8 @@ For every supported YAML field, default, and model-specific constraint, see the
   `model.kind` selects `mfa`, `ard`, or `hddc`; HDDC accepts `q_max` as a YAML
   alias for the CLI's `rank` destination. Set `training.centroids_path` to reuse
   a precomputed initialization instead of fitting KMeans separately for every
-  run.
+  run. Set `training.direction_init: cluster_pca` to initialize loading
+  directions from principal components stored with those centroids.
 - `assignments`: full MFA responsibility assignments. Partial `max_batches`
   output is deliberately not part of the completed pipeline contract.
 - `evaluation`: currently supports `adaptive_q_toy`, the numerical evaluation
@@ -69,21 +70,54 @@ be written either in `shard_dir` (`path#pile_wikipedia_1M`) or as a separate
 
 ### Reusing centroids
 
-Point `training.centroids_path` directly at a `.pt` tensor file:
+Point `training.centroids_path` directly at a `.pt` centroid artifact:
 
 ```yaml
 training:
   centroids_path: dalg-cache/pile_gemma2b_models/centroids/k1000_L17/centroids.pt
+  direction_init: random
   epochs: 20
 ```
 
 The planner resolves the value to an absolute file path and verifies that its
-shape matches both `model.K` and the activation dimension. The resolved path is
-stored in every manifest row and passed to the existing trainer. Each run copies
-the tensor into its own output directory and does not run centroid fitting. If
-the path is a directory or does not have the lowercase `.pt` extension, planning
-fails. If the field is omitted, the trainer keeps its normal fit-from-scratch
-behavior.
+centroid shape matches both `model.K` and the activation dimension. The resolved
+path is stored in every manifest row and passed to the existing trainer. Each
+run copies the artifact into its own output directory and does not run centroid
+fitting. If the path is a directory or does not have the lowercase `.pt`
+extension, planning fails. If the field is omitted, the trainer keeps its normal
+fit-from-scratch behavior.
+
+Legacy artifacts are bare `(K, D)` tensors. Enriched artifacts are mappings:
+
+```text
+centroids:             (K, D)
+principal_components: (K, D, Q_stored)
+```
+
+Use `direction_init: random` (the default) with either format. To initialize
+`W_k` from local KMeans geometry, set `direction_init: cluster_pca`; the trainer
+uses `principal_components[:, :, :q]` and requires `Q_stored >= rank/q_max`.
+Only loading directions change: every loading scale still starts at 1.
+
+For the D=128, K=5000 toy experiment, upgrade the existing centroid tensor
+without refitting KMeans:
+
+```bash
+.venv/bin/python scripts/temporary/build_toy_kmeans_centroids.py \
+  --shard-dir dalg-cache/assets/toy_manifolds_circle_helix_D128_1M_noise1e4_shards \
+  --layer 0 \
+  --K 5000 \
+  --out-dir dalg-cache/toy_manifold_models_1M/centroids/kmeans_k5000 \
+  --device cuda \
+  --pca-rank 32 \
+  --pca-only
+```
+
+This reassigns all points to their saved centroids, accumulates exact float64
+cluster covariances around those centroids, keeps only the first 32 eigenvectors,
+and atomically replaces `centroids.pt` with the enriched bundle. It requires at
+least 33 assigned points in every cluster. The operation is idempotent when the
+artifact already stores at least 32 directions.
 
 ## Sweeps
 

@@ -17,6 +17,12 @@ from dalg.pipeline import (
     pipeline_status,
     resolve_experiment,
 )
+from dalg.models.adaptive_q.mfa_hddc import (
+    MFA_HDDC,
+    load_mfa_hddc,
+    save_mfa_hddc,
+)
+from dalg.models.mfa import load_mfa
 from tests.synthetic_shards import LAYER, build_multi_shard
 
 
@@ -164,6 +170,278 @@ def test_shared_centroids_reject_directory(tmp_path: Path) -> None:
         resolve_experiment(path)
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        {"kind": "mfa", "K": 2, "rank": 1},
+        {"kind": "ard", "K": 2, "rank": 1, "ard_lambda": 0.0},
+        {"kind": "hddc", "K": 2, "q_max": 1},
+    ],
+)
+def test_cluster_pca_direction_init_is_forwarded_for_every_trainer(
+    tmp_path: Path,
+    model: dict,
+) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    centroids_path = tmp_path / "centroids.pt"
+    torch.save(
+        {
+            "centroids": torch.zeros(2, 2),
+            "principal_components": torch.eye(2).reshape(2, 2, 1),
+        },
+        centroids_path,
+    )
+    config = _config(tmp_path, shard_dir)
+    config["model"] = model
+    config["training"].update(
+        {
+            "centroids_path": str(centroids_path),
+            "direction_init": "cluster_pca",
+        }
+    )
+
+    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+    command = _training_command(run)
+
+    assert run["training"]["arguments"]["direction_init"] == "cluster_pca"
+    option = command.index("--direction-init")
+    assert command[option + 1] == "cluster_pca"
+
+
+def test_cluster_pca_requires_principal_components(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    centroids_path = tmp_path / "centroids.pt"
+    torch.save(torch.zeros(2, 2), centroids_path)
+    config = _config(tmp_path, shard_dir)
+    config["training"].update(
+        {
+            "centroids_path": str(centroids_path),
+            "direction_init": "cluster_pca",
+        }
+    )
+
+    with pytest.raises(PipelineConfigError, match="containing principal_components"):
+        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+
+
+def test_cluster_pca_requires_centroids_path(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    config = _config(tmp_path, shard_dir)
+    config["training"]["direction_init"] = "cluster_pca"
+
+    with pytest.raises(PipelineConfigError, match="requires --centroids-path"):
+        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+
+
+def test_cluster_pca_rejects_insufficient_stored_rank(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    centroids_path = tmp_path / "centroids.pt"
+    torch.save(
+        {
+            "centroids": torch.zeros(2, 2),
+            "principal_components": torch.ones(2, 2, 1),
+        },
+        centroids_path,
+    )
+    config = _config(tmp_path, shard_dir)
+    config["model"]["rank"] = 2
+    config["training"].update(
+        {
+            "centroids_path": str(centroids_path),
+            "direction_init": "cluster_pca",
+        }
+    )
+
+    with pytest.raises(PipelineConfigError, match="stores 1 principal components"):
+        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+
+
+def test_cluster_pca_rejects_malformed_direction_shape(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    centroids_path = tmp_path / "centroids.pt"
+    torch.save(
+        {
+            "centroids": torch.zeros(2, 2),
+            "principal_components": torch.ones(2, 1, 2),
+        },
+        centroids_path,
+    )
+    config = _config(tmp_path, shard_dir)
+    config["training"].update(
+        {
+            "centroids_path": str(centroids_path),
+            "direction_init": "cluster_pca",
+        }
+    )
+
+    with pytest.raises(PipelineConfigError, match="leading dimensions"):
+        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+
+
+def test_hddc_initial_model_is_validated_resolved_and_forwarded(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    initial_path = tmp_path / "mfa_model.pt"
+    save_mfa_hddc(
+        MFA_HDDC(torch.zeros(2, 2), rank=2, isotropic_psi=True),
+        str(initial_path),
+    )
+    config = _config(tmp_path, shard_dir)
+    config["model"] = {
+        "kind": "hddc",
+        "K": 2,
+        "q_max": 2,
+        "isotropic_psi": True,
+    }
+    config["training"]["init_model_path"] = str(initial_path)
+    path = _write_yaml(tmp_path / "experiment.yaml", config)
+
+    run = resolve_experiment(path)[0]
+    resolved = str(initial_path.resolve())
+
+    assert run["training"]["arguments"]["init_model_path"] == resolved
+    assert run["identity"]["training_args"]["init_model_path"] == resolved
+    command = _training_command(run)
+    assert command[command.index("--init-model-path") + 1] == resolved
+
+
+def test_hddc_shared_b_is_forwarded_as_a_single_process_model(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    config = _config(tmp_path, shard_dir)
+    config["model"] = {
+        "kind": "hddc",
+        "K": 2,
+        "q_max": 1,
+        "shared_b": True,
+    }
+    path = _write_yaml(tmp_path / "experiment.yaml", config)
+
+    run = resolve_experiment(path)[0]
+    command = _training_command(run)
+
+    assert run["training"]["arguments"]["shared_b"] is True
+    assert run["training"]["arguments"]["isotropic_psi"] is False
+    assert "--shared-b" in command
+    assert "--isotropic-psi" not in command
+
+
+def test_hddc_fractional_epoch_surgery_is_forwarded(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    config = _config(tmp_path, shard_dir)
+    config["model"] = {
+        "kind": "hddc",
+        "K": 2,
+        "q_max": 1,
+        "shared_b": True,
+        "surgery_every_epochs": 0.3,
+    }
+    path = _write_yaml(tmp_path / "experiment.yaml", config)
+
+    run = resolve_experiment(path)[0]
+    command = _training_command(run)
+
+    assert run["training"]["arguments"]["surgery_every_epochs"] == 0.3
+    option = command.index("--surgery-every-epochs")
+    assert command[option + 1] == "0.3"
+
+
+def test_hddc_shared_b_warm_start_requires_the_same_noise_mode(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    initial_path = tmp_path / "mfa_model.pt"
+    save_mfa_hddc(
+        MFA_HDDC(torch.zeros(2, 2), rank=1, isotropic_psi=True),
+        str(initial_path),
+    )
+    config = _config(tmp_path, shard_dir)
+    config["model"] = {
+        "kind": "hddc",
+        "K": 2,
+        "q_max": 1,
+        "shared_b": True,
+    }
+    config["training"]["init_model_path"] = str(initial_path)
+
+    with pytest.raises(PipelineConfigError, match="same Psi noise mode"):
+        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+
+
+def test_hddc_shared_b_rejects_component_sharding(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    config = _config(tmp_path, shard_dir)
+    config["model"] = {
+        "kind": "hddc",
+        "K": 2,
+        "q_max": 1,
+        "shared_b": True,
+    }
+    config["training"].update(
+        {"device": "cuda", "training_mode": "component_shard"}
+    )
+    config["resources"].update({"gpus": 2, "gpu_type": "H100"})
+
+    with pytest.raises(PipelineConfigError, match="shared-b supports.*vanilla only"):
+        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+
+
+def test_hddc_shared_b_and_isotropic_psi_are_mutually_exclusive(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    config = _config(tmp_path, shard_dir)
+    config["model"] = {
+        "kind": "hddc",
+        "K": 2,
+        "q_max": 1,
+        "isotropic_psi": True,
+        "shared_b": True,
+    }
+
+    with pytest.raises(PipelineConfigError, match="select different noise modes"):
+        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+
+
+def test_hddc_initial_model_rejects_rank_mismatch(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    initial_path = tmp_path / "mfa_model.pt"
+    save_mfa_hddc(
+        MFA_HDDC(torch.zeros(2, 2), rank=1, isotropic_psi=True),
+        str(initial_path),
+    )
+    config = _config(tmp_path, shard_dir)
+    config["model"] = {
+        "kind": "hddc",
+        "K": 2,
+        "q_max": 2,
+        "isotropic_psi": True,
+    }
+    config["training"]["init_model_path"] = str(initial_path)
+    path = _write_yaml(tmp_path / "experiment.yaml", config)
+
+    with pytest.raises(PipelineConfigError, match="rank q=1 does not match model.q_max=2"):
+        resolve_experiment(path)
+
+
+def test_hddc_initial_model_rejects_k_mismatch(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    initial_path = tmp_path / "mfa_model.pt"
+    save_mfa_hddc(
+        MFA_HDDC(torch.zeros(2, 2), rank=1, isotropic_psi=True),
+        str(initial_path),
+    )
+    config = _config(tmp_path, shard_dir)
+    config["model"] = {
+        "kind": "hddc",
+        "K": 3,
+        "q_max": 1,
+        "isotropic_psi": True,
+    }
+    config["training"]["init_model_path"] = str(initial_path)
+    path = _write_yaml(tmp_path / "experiment.yaml", config)
+
+    with pytest.raises(
+        PipelineConfigError,
+        match=r"initial model has \(K=2, D=2\), expected \(K=3, D=2\)",
+    ):
+        resolve_experiment(path)
+
+
 def test_component_sharded_command_uses_torchrun(tmp_path: Path) -> None:
     shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
     config = _config(tmp_path, shard_dir)
@@ -260,6 +538,108 @@ def test_real_cpu_training_and_assignment_pipeline_smoke(tmp_path: Path) -> None
     )
     assert assignments["assignments"].numel() == 2 * 4 * 3
     assert int(assignments["cluster_sizes"].sum()) == 2 * 4 * 3
+
+
+def test_real_cpu_pipeline_preserves_cluster_pca_directions_at_zero_lr(
+    tmp_path: Path,
+) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=2, rows_per_shard=4)
+    centroids = torch.tensor([[10.0, 11.0], [1010.0, 1011.0]])
+    directions = torch.tensor([[[1.0], [0.0]], [[0.0], [1.0]]])
+    centroids_path = tmp_path / "shared_centroids.pt"
+    torch.save(
+        {
+            "centroids": centroids,
+            "principal_components": directions,
+        },
+        centroids_path,
+    )
+    config = _config(tmp_path, shard_dir)
+    config["training"].update(
+        {
+            "centroids_path": str(centroids_path),
+            "direction_init": "cluster_pca",
+            "lr": 0.0,
+            "max_steps": 1,
+        }
+    )
+    config["assignments"]["enabled"] = False
+    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+
+    run_dir = execute_run(run)
+    trained = load_mfa(run_dir / "mfa_model.pt", map_location="cpu")
+
+    assert torch.equal(trained.mu.detach(), centroids)
+    assert torch.equal(trained.dir_raw.detach(), directions)
+    saved_config = json.loads((run_dir / "config.json").read_text())
+    assert saved_config["direction_init"] == "cluster_pca"
+
+
+def test_real_hddc_initial_model_pipeline_smoke(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=2, rows_per_shard=4)
+    initial = MFA_HDDC(
+        torch.tensor([[10.0, 11.0], [1010.0, 1011.0]]),
+        rank=2,
+        isotropic_psi=True,
+    )
+    initial.rank_mask[:, 1] = 0.0
+    initial_path = tmp_path / "initial_mfa_model.pt"
+    save_mfa_hddc(initial, str(initial_path))
+
+    config = _config(tmp_path, shard_dir)
+    config["model"] = {
+        "kind": "hddc",
+        "K": 2,
+        "q_max": 2,
+        "isotropic_psi": True,
+        "surgery_every_epochs": 0,
+    }
+    config["training"].update(
+        {
+            "init_model_path": str(initial_path),
+            "max_steps": 1,
+        }
+    )
+    config["assignments"]["enabled"] = False
+    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+
+    run_dir = execute_run(run)
+
+    checkpoint = torch.load(
+        run_dir / "checkpoint.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    trained = load_mfa_hddc(run_dir / "mfa_model.pt", map_location="cpu")
+    assert checkpoint["epoch"] == 1
+    assert trained.q == 2
+    assert torch.equal(trained.rank_mask[:, 1], torch.zeros(2))
+    assert torch.equal(
+        torch.load(run_dir / "centroids.pt", weights_only=True),
+        initial.mu.detach(),
+    )
+
+
+def test_real_shared_b_pipeline_smoke(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=2, rows_per_shard=4)
+    config = _config(tmp_path, shard_dir)
+    config["model"] = {
+        "kind": "hddc",
+        "K": 2,
+        "q_max": 1,
+        "shared_b": True,
+        "surgery_every_epochs": 0,
+    }
+    config["assignments"]["enabled"] = False
+    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+
+    run_dir = execute_run(run)
+    trained = load_mfa_hddc(run_dir / "mfa_model.pt", map_location="cpu")
+    saved_config = json.loads((run_dir / "config.json").read_text())
+
+    assert trained.shared_b is True
+    assert tuple(trained.psi_rho.shape) == (1,)
+    assert saved_config["shared_b"] is True
 
 
 def test_real_adaptive_q_pipeline_runs_end_to_end(tmp_path: Path) -> None:

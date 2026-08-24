@@ -1,4 +1,4 @@
-"""MFA variant carrying an isotropic Psi_k and a hard per-component rank mask.
+"""MFA variant carrying an isotropic Psi and a hard per-component rank mask.
 
 Deliberately redundant with `mfa.py`: this is a self-contained copy of the MFA
 model and its persistence helpers, so the HDDC rank-surgery research path can
@@ -8,6 +8,8 @@ diverge without touching the production model. Same arrangement as
 - `isotropic_psi=True` stores Psi_k as one scalar per component, shape (K, 1),
   broadcast over D. HDDC surgery requires it: the reconstruction
   `Sigma_k = W_k W_k^T + b_k I` is exact only for isotropic noise.
+- `shared_b=True` is the single-process HDDC model with one scalar noise floor,
+  shape (1,), shared across both K and D: `Sigma_k = W_k W_k^T + b I`.
 - a non-trainable `rank_mask` buffer of shape (K, q) gates the loading columns.
   It is folded into the scale, so a masked column is exactly zero in W and both
   `dir_raw` and `scale_rho` receive exactly zero gradient through it — no
@@ -16,10 +18,10 @@ diverge without touching the production model. Same arrangement as
   `save_mfa_hddc` / `load_mfa_hddc` and the component-shard path, and is sharded
   like the other per-component tensors.
 
-Note that the mask and the (K, 1) psi_rho make this `state_dict` incompatible
-with `mfa.load_mfa`, so downstream analyses that load plain MFA checkpoints do
-not read HDDC runs. That is deliberate: this is a research path, and a model
-worth analysing gets retrained on the production stack.
+Note that the mask and the isotropic psi_rho shapes make this `state_dict`
+incompatible with `mfa.load_mfa`, so downstream analyses that load plain MFA
+checkpoints do not read HDDC runs. That is deliberate: this is a research path,
+and a model worth analysing gets retrained on the production stack.
 
 `MFAEncoderDecoder` is not duplicated here: it only calls public model methods,
 so `mfa.MFAEncoderDecoder` accepts an `MFA_HDDC` unchanged.
@@ -44,9 +46,11 @@ class MFA_HDDC(nn.Module):
         centroids: torch.Tensor, # (K, D) initial mu_k
         *,
         rank: int, # q
+        init_directions: Optional[torch.Tensor] = None, # optional (K, D, q)
         psi_init: float = 1.0, # initial diagonal unique variance
         psi_per_component: bool = False, # True => Psi_k per component; False => shared Psi
         isotropic_psi: bool = False, # True => Psi_k = b_k I  (overrides psi_per_component)
+        shared_b: bool = False, # True => Psi_k = b I for every component (single process only)
         scale_init: float = 1.0, # initial loading scales s_{k,j}
         eps_floor: float = 1e-5, # numerical floor for positivity / norms
     ):
@@ -56,6 +60,16 @@ class MFA_HDDC(nn.Module):
         K, D = centroids.shape
         if not (1 <= rank <= D):
             raise ValueError("rank must be in [1, D]")
+        if init_directions is not None and tuple(init_directions.shape) != (K, D, rank):
+            raise ValueError(
+                "init_directions must have shape "
+                f"{(K, D, rank)}, got {tuple(init_directions.shape)}"
+            )
+        if shared_b and (isotropic_psi or psi_per_component):
+            raise ValueError(
+                "shared_b is a distinct noise mode and cannot be combined with "
+                "isotropic_psi or psi_per_component"
+            )
 
         self.K, self.D, self.q = K, D, int(rank)
         self._two_pi_logD = self.D * math.log(2.0 * math.pi)
@@ -65,19 +79,28 @@ class MFA_HDDC(nn.Module):
         self.mu = nn.Parameter(centroids.clone())
 
         # Loadings W_k parameterized as direction * scale
-        self.dir_raw = nn.Parameter(
-            torch.randn(K, D, self.q, dtype=centroids.dtype) / math.sqrt(D)
-        )  # (K, D, q)
+        if init_directions is None:
+            direction_values = (
+                torch.randn(K, D, self.q, dtype=centroids.dtype, device=centroids.device)
+                / math.sqrt(D)
+            )
+        else:
+            direction_values = init_directions.to(
+                device=centroids.device,
+                dtype=centroids.dtype,
+            ).clone()
+        self.dir_raw = nn.Parameter(direction_values)  # (K, D, q)
         rho_s0 = math.log(math.exp(float(scale_init)) - 1.0)
         self.scale_rho = nn.Parameter(
             torch.full((K, self.q), rho_s0, dtype=centroids.dtype)
         )  # (K, q)
 
         # Diagonal unique variances Psi. `isotropic_psi` stores one scalar per
-        # component, broadcast over D; HDDC-style covariance surgery needs it
-        # because its reconstruction Sigma_k = W_k W_k^T + b_k I is exact only
-        # for isotropic noise.
-        if isotropic_psi:
+        # component; `shared_b` stores one scalar for the whole mixture. Both
+        # broadcast over D and admit an exact HDDC covariance reconstruction.
+        if shared_b:
+            psi_shape = (1,)
+        elif isotropic_psi:
             psi_shape = (K, 1)
         else:
             psi_shape = (K, D) if psi_per_component else (D,)
@@ -85,6 +108,7 @@ class MFA_HDDC(nn.Module):
         self.psi_rho = nn.Parameter(torch.full(psi_shape, rho0, dtype=centroids.dtype))
         self.psi_per_component = bool(psi_per_component)
         self.isotropic_psi = bool(isotropic_psi)
+        self.shared_b = bool(shared_b)
 
         # Mixture weights (K,)
         self.pi_logits = nn.Parameter(torch.zeros(K, dtype=centroids.dtype))
@@ -104,7 +128,7 @@ class MFA_HDDC(nn.Module):
 
     def _psi(self) -> torch.Tensor:
         psi = F.softplus(self.psi_rho) + self._eps
-        if psi.ndim == 1:                       # shared (D,)
+        if psi.ndim == 1:                       # shared diagonal (D,) or scalar b (1,)
             psi = psi[None, :].expand(self.K, self.D)
         elif psi.shape[-1] != self.D:           # isotropic (K, 1)
             psi = psi.expand(self.K, self.D)
@@ -460,6 +484,7 @@ class ComponentShardedMFA_HDDC(MFA_HDDC):
         rank: int,
         global_K: int,
         component_start: int,
+        init_directions: Optional[torch.Tensor] = None,
         psi_init: float = 1.0,
         psi_per_component: bool = False,
         isotropic_psi: bool = False,
@@ -469,6 +494,7 @@ class ComponentShardedMFA_HDDC(MFA_HDDC):
         super().__init__(
             centroids,
             rank=rank,
+            init_directions=init_directions,
             psi_init=psi_init,
             psi_per_component=psi_per_component,
             isotropic_psi=isotropic_psi,
@@ -487,6 +513,7 @@ class ComponentShardedMFA_HDDC(MFA_HDDC):
         rank: int,
         dist_rank: int,
         world_size: int,
+        init_directions: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> "ComponentShardedMFA_HDDC":
         start, end = component_shard_bounds(centroids.shape[0], dist_rank, world_size)
@@ -495,6 +522,11 @@ class ComponentShardedMFA_HDDC(MFA_HDDC):
             rank=rank,
             global_K=centroids.shape[0],
             component_start=start,
+            init_directions=(
+                None
+                if init_directions is None
+                else init_directions[start:end].contiguous()
+            ),
             **kwargs,
         )
 
@@ -563,6 +595,7 @@ def save_mfa_hddc(model: MFA_HDDC, path: str, *, extra: Optional[Dict[str, Any]]
         "q": model.q,
         "psi_per_component": model.psi_per_component,
         "isotropic_psi": bool(getattr(model, "isotropic_psi", False)),
+        "shared_b": bool(getattr(model, "shared_b", False)),
         "eps_floor": model._eps,
         "dtype": str(model.mu.dtype),
         "version": 1,
@@ -587,6 +620,13 @@ def _infer_isotropic_psi(meta: Dict[str, Any], psi_rho: torch.Tensor, D: int) ->
     if "isotropic_psi" in meta:
         return bool(meta["isotropic_psi"])
     return bool(psi_rho.ndim == 2 and psi_rho.shape[-1] == 1 and D != 1)
+
+
+def _infer_shared_b(meta: Dict[str, Any], psi_rho: torch.Tensor, D: int) -> bool:
+    """Whether a full-model checkpoint stores one scalar b for the mixture."""
+    if "shared_b" in meta:
+        return bool(meta["shared_b"])
+    return bool(psi_rho.ndim == 1 and psi_rho.numel() == 1 and D != 1)
 
 
 def load_mfa_hddc(
@@ -620,8 +660,9 @@ def load_mfa_hddc(
     K, D = mu.shape
     q = dir_raw.shape[-1]
 
-    psi_rho = state["psi_rho"] # (K, D), (K, 1) or (D,)
+    psi_rho = state["psi_rho"] # (K, D), (K, 1), (D,) or shared-b (1,)
     isotropic_psi = _infer_isotropic_psi(meta, psi_rho, D)
+    shared_b = _infer_shared_b(meta, psi_rho, D)
     psi_per_component = bool(meta.get("psi_per_component",
                                       psi_rho.ndim == 2 and psi_rho.shape[0] == K))
     eps_floor = float(meta.get("eps_floor", 1e-8))
@@ -632,6 +673,7 @@ def load_mfa_hddc(
         rank=q,
         psi_per_component=psi_per_component,
         isotropic_psi=isotropic_psi,
+        shared_b=shared_b,
         eps_floor=eps_floor,
     )
 

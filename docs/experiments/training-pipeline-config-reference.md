@@ -96,14 +96,16 @@ component sharding.
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `q_max` | integer | `10` | YAML alias for `rank`. Use one of `q_max` or `rank`, never both. |
-| `isotropic_psi` | boolean | `false` | Use one isotropic noise value per component. Required when surgery is enabled. |
-| `surgery_every_epochs` | integer | `0` | Run covariance surgery every N epochs. `0` disables surgery and provides the fixed-rank baseline. |
+| `isotropic_psi` | boolean | `false` | Use one isotropic noise value per component. One isotropic mode is required when surgery is enabled. |
+| `shared_b` | boolean | `false` | Use one isotropic noise scalar for the full mixture. Mutually exclusive with `isotropic_psi` and supported only in vanilla training mode. |
+| `surgery_every_epochs` | float | `0` | Run covariance surgery every N epochs. Positive integers run at epoch boundaries; fractions below 1 run on the first optimizer step crossing each fractional boundary. `0` disables surgery and provides the fixed-rank baseline. |
 | `surgery_threshold` | float | `0.01` | Relative Cattell scree threshold. Must be positive when surgery is enabled. |
 | `surgery_min_count` | float | `0.0` | Components with fewer effective points are not rewritten. `0` selects `max(5 * q_max, 50)`. |
 | `surgery_warmup_steps` | integer | `0` | Linear learning-rate warmup steps after each surgery; `0` disables it. |
 
-When `surgery_every_epochs > 0`, `isotropic_psi` must be `true`. HDDC surgery
-materializes a `(K, D, D)` scatter and is intended for D=128-scale data.
+When `surgery_every_epochs > 0`, exactly one of `isotropic_psi` or `shared_b`
+must be `true`. HDDC surgery materializes a `(K, D, D)` scatter and is intended
+for D=128-scale data. `shared_b` cannot be used with component sharding.
 
 ## `training`
 
@@ -120,11 +122,24 @@ These arguments are shared by MFA, ARD, and HDDC unless noted otherwise.
 | `val_frac` | float | `0.05` | Fraction of selected rows reserved for validation. Set `0` to disable validation; validation-based early stopping then cannot operate. |
 | `split_seed` | integer | `42` | Seed for the deterministic stratified train/validation row split. |
 | `val_on_gpu` | boolean | `false` | Materialize validation activations on the selected device in single-process training. |
-| `centroids_path` | `.pt` path or `null` | `null` | Reuse a precomputed rank-2 `(K, D)` centroid tensor instead of fitting KMeans. The pipeline accepts only a direct lowercase `.pt` file, resolves it to an absolute path, and validates `K` and `D`. |
+| `centroids_path` | `.pt` path or `null` | `null` | Reuse a precomputed centroid artifact instead of fitting KMeans. It may be a legacy `(K, D)` tensor or a bundle containing `centroids` and `principal_components`. The pipeline accepts only a direct lowercase `.pt` file, resolves it to an absolute path, and validates `K` and `D`. |
+| `direction_init` | `random` or `cluster_pca` | `random` | Initialize each component's loading directions randomly, or from the first `rank/q_max` principal components stored in the centroid artifact. |
+| `init_model_path` | `.pt` path or `null` | `null` | HDDC only. Seed an epoch-0 training checkpoint from a saved `MFA_HDDC` whose `K`, `D`, `q`, and isotropic-Psi setting exactly match the YAML model configuration. |
 
-When `centroids_path` is set, the trainer copies that tensor into the run
+When `centroids_path` is set, the trainer copies that artifact into the run
 directory and skips centroid fitting. The initialization arguments below have
-no effect in that case.
+no effect in that case. `direction_init: cluster_pca` requires
+`principal_components` with shape `(K, D, Q_stored)` and fails during planning
+when `Q_stored < rank/q_max`. The trainer slices the first requested directions;
+loading scales still initialize to 1. Legacy tensor-only artifacts remain valid
+with `direction_init: random`.
+
+`init_model_path` and `centroids_path` are mutually exclusive because the full
+model already supplies its means. The initial model must exactly match `K`, `D`,
+`q_max`, and the isotropic-Psi setting. Only vanilla HDDC training supports this
+option. The saved model has no optimizer history, so the epoch-0 checkpoint
+starts with a fresh Adam state; subsequent restarts use the normal local
+checkpoint exactly.
 
 | Field | Type | Default | Meaning when fitting centroids |
 | --- | --- | --- | --- |

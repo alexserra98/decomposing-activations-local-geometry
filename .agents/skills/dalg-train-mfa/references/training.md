@@ -202,6 +202,8 @@ fractions, `effective_ranks`, and whether the model was pruned.
 ## Centroids, subsets, and resume behavior
 
 - Reuse centroids with `--centroids-path`; shared centroid collections live under `dalg-cache/pile_gemma2b_models/centroids/`.
+- `--direction-init random` is the default and accepts legacy `(K, D)` centroid tensors. `--direction-init cluster_pca` requires an enriched `centroids.pt` mapping with `centroids: (K, D)` and `principal_components: (K, D, Q_stored)`, where `Q_stored >= --rank`. The first `--rank` directions initialize `dir_raw`; loading scales remain 1.
+- PCA directions are a preprocessing artifact, not a training-time computation. For the D=128, K=5000 toy workflow, `scripts/temporary/build_toy_kmeans_centroids.py --pca-only --pca-rank 32 ...` upgrades the saved centroid file using all full-data nearest-centroid assignments without refitting KMeans.
 - A shard suffix such as `#pile_wikipedia_1M` deterministically selects a token-budgeted subset without copying activations.
 - The spec resolves to sorted positions in canonical stream order and must stay consistent downstream.
 - Inspect checkpoints and completion artifacts before deciding whether to resume, skip, or start a new output directory.

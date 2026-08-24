@@ -325,7 +325,7 @@ def _ensure_centroids(
     is_main: bool,
     device: str,
     barrier: bool,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Resolve centroids for the run, then load them on every rank.
 
     Order of precedence on rank 0:
@@ -355,13 +355,32 @@ def _ensure_centroids(
             )
     if barrier and dist.is_available() and dist.is_initialized():
         dist.barrier()
-    centroids = torch.load(centroids_path, map_location=device, weights_only=True)
-    if centroids.shape[0] != args.K:
-        raise SystemExit(
-            f"Cached centroids K={centroids.shape[0]} != --K {args.K}; "
-            f"delete {centroids_path} to recompute."
+    from dalg.init.centroid_artifact import (
+        load_centroid_artifact,
+        validate_centroid_artifact,
+    )
+
+    centroids, principal_components = load_centroid_artifact(
+        centroids_path,
+        map_location=device,
+    )
+    required_pca_rank = args.rank if args.direction_init == "cluster_pca" else None
+    try:
+        validate_centroid_artifact(
+            centroids,
+            principal_components,
+            expected_k=args.K,
+            expected_d=data["d_model"],
+            required_pca_rank=required_pca_rank,
         )
-    return centroids
+    except ValueError as exc:
+        raise SystemExit(f"Invalid centroid artifact {centroids_path}: {exc}") from exc
+    init_directions = (
+        principal_components[:, :, : args.rank].contiguous()
+        if required_pca_rank is not None
+        else None
+    )
+    return centroids, init_directions
 
 
 def _write_split_info(
@@ -418,6 +437,7 @@ def _write_run_config(
         "split_seed": data["split_seed"],
         "pool_size": args.pool_size,
         "refine_epochs": args.refine_epochs,
+        "direction_init": args.direction_init,
     }
     (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
 
@@ -450,6 +470,7 @@ def _maybe_init_wandb(args, data: dict, *, training_mode: str, world_size: int, 
         "drop_prefix": data["drop_prefix"],
         "n_train_tokens": data["n_train_tokens"],
         "val_frac": data["val_frac"],
+        "direction_init": args.direction_init,
     }
     return wandb.init(
         project=args.wandb_project,
@@ -503,7 +524,7 @@ def cmd_train(args):
         world_size=1,
     )
 
-    centroids = _ensure_centroids(
+    centroids, init_directions = _ensure_centroids(
         data,
         args,
         out_dir=out_dir,
@@ -515,6 +536,7 @@ def cmd_train(args):
     model = MFA(
         centroids=centroids,
         rank=args.rank,
+        init_directions=init_directions,
     ).to(args.device)
     if getattr(args, "compile", False):
         print("Compiling model with torch.compile...")
@@ -625,7 +647,7 @@ def cmd_train_component_shard(args):
             world_size=world_size,
         )
 
-    centroids = _ensure_centroids(
+    centroids, init_directions = _ensure_centroids(
         data,
         args,
         out_dir=out_dir,
@@ -640,6 +662,7 @@ def cmd_train_component_shard(args):
         rank=args.rank,
         dist_rank=rank,
         world_size=world_size,
+        init_directions=init_directions,
     ).to(device)
     log(
         f"Component sharding: rank {rank}/{world_size} owns "
@@ -785,6 +808,11 @@ def validate_args(args) -> None:
             raise SystemExit("train: component_shard requires --device cuda")
     if args.steps_per_epoch is not None and args.steps_per_epoch <= 0:
         raise SystemExit("train: --steps-per-epoch must be positive")
+    if args.direction_init == "cluster_pca" and not args.centroids_path:
+        raise SystemExit(
+            "train: --direction-init cluster_pca requires --centroids-path "
+            "pointing to an enriched centroid artifact"
+        )
     if (
         args.epochs <= 0
         and args.max_steps is None
@@ -807,8 +835,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--centroids-path",
         default=None,
-        help="Path to a pre-computed centroids.pt (or a directory containing one) "
+        help="Path to a pre-computed centroid artifact (or a directory containing one) "
              "to use instead of fitting KMeans. Copied into <out_dir>/centroids.pt.",
+    )
+    p.add_argument(
+        "--direction-init",
+        choices=["random", "cluster_pca"],
+        default="random",
+        help="Initialize loading directions randomly or from the first --rank "
+             "principal components stored in --centroids-path.",
     )
     p.add_argument("--val-frac", type=float, default=0.05)
     p.add_argument("--split-seed", type=int, default=42)

@@ -17,6 +17,7 @@ class MFA(nn.Module):
         centroids: torch.Tensor, # (K, D) initial mu_k
         *,
         rank: int, # q
+        init_directions: Optional[torch.Tensor] = None, # optional (K, D, q)
         psi_init: float = 1.0, # initial diagonal unique variance
         psi_per_component: bool = False, # True => Psi_k per component; False => shared Psi
         scale_init: float = 1.0, # initial loading scales s_{k,j}
@@ -28,6 +29,11 @@ class MFA(nn.Module):
         K, D = centroids.shape
         if not (1 <= rank <= D):
             raise ValueError("rank must be in [1, D]")
+        if init_directions is not None and tuple(init_directions.shape) != (K, D, rank):
+            raise ValueError(
+                "init_directions must have shape "
+                f"{(K, D, rank)}, got {tuple(init_directions.shape)}"
+            )
 
         self.K, self.D, self.q = K, D, int(rank)
         self._two_pi_logD = self.D * math.log(2.0 * math.pi)
@@ -37,9 +43,17 @@ class MFA(nn.Module):
         self.mu = nn.Parameter(centroids.clone())
 
         # Loadings W_k parameterized as direction * scale
-        self.dir_raw = nn.Parameter(
-            torch.randn(K, D, self.q, dtype=centroids.dtype) / math.sqrt(D)
-        )  # (K, D, q)
+        if init_directions is None:
+            direction_values = (
+                torch.randn(K, D, self.q, dtype=centroids.dtype, device=centroids.device)
+                / math.sqrt(D)
+            )
+        else:
+            direction_values = init_directions.to(
+                device=centroids.device,
+                dtype=centroids.dtype,
+            ).clone()
+        self.dir_raw = nn.Parameter(direction_values)  # (K, D, q)
         rho_s0 = math.log(math.exp(float(scale_init)) - 1.0)
         self.scale_rho = nn.Parameter(
             torch.full((K, self.q), rho_s0, dtype=centroids.dtype)
@@ -407,6 +421,7 @@ class ComponentShardedMFA(MFA):
         rank: int,
         global_K: int,
         component_start: int,
+        init_directions: Optional[torch.Tensor] = None,
         psi_init: float = 1.0,
         psi_per_component: bool = False,
         scale_init: float = 1.0,
@@ -415,6 +430,7 @@ class ComponentShardedMFA(MFA):
         super().__init__(
             centroids,
             rank=rank,
+            init_directions=init_directions,
             psi_init=psi_init,
             psi_per_component=psi_per_component,
             scale_init=scale_init,
@@ -432,6 +448,7 @@ class ComponentShardedMFA(MFA):
         rank: int,
         dist_rank: int,
         world_size: int,
+        init_directions: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> "ComponentShardedMFA":
         start, end = component_shard_bounds(centroids.shape[0], dist_rank, world_size)
@@ -440,6 +457,11 @@ class ComponentShardedMFA(MFA):
             rank=rank,
             global_K=centroids.shape[0],
             component_start=start,
+            init_directions=(
+                None
+                if init_directions is None
+                else init_directions[start:end].contiguous()
+            ),
             **kwargs,
         )
 

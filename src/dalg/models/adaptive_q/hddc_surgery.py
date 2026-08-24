@@ -1,12 +1,13 @@
 """Periodic HDDC-style covariance surgery for MFA, giving adaptive per-component rank.
 
 SGD training of `train_nll` is left untouched. Every `T` epochs this module
-applies the closed-form covariance update of the HDDC model `[a_ij b_i Q_i d_i]`
-(Bouveyron, Girard & Schmid, arXiv:math/0604064) to re-estimate each component's
-covariance with an adaptive rank `d_k <= q_max`, and rewrites the result in MFA
-parameters. Between surgeries the columns beyond `d_k` are hard-masked by
-`MFA.rank_mask`, so they contribute nothing to the likelihood and receive no
-gradient.
+applies the closed-form covariance update of either the HDDC model
+`[a_ij b_i Q_i d_i]` or its single-process shared-noise variant
+`[a_ij b Q_i d_i]` (Bouveyron, Girard & Schmid, arXiv:math/0604064). It
+re-estimates each component's covariance with an adaptive rank
+`d_k <= q_max`, and rewrites the result in MFA parameters. Between surgeries
+the columns beyond `d_k` are hard-masked by `MFA.rank_mask`, so they contribute
+nothing to the likelihood and receive no gradient.
 
 Surgery touches covariances only — `dir_raw`, `scale_rho`, `psi_rho`,
 `rank_mask`. `mu` and `pi_logits` stay whatever SGD has made them.
@@ -23,12 +24,12 @@ A. One E-pass over the train loader accumulating, in float64, the
    SGD means lag the data.
 
 B. Per component: `eigh(S_k)`, a scale-free Cattell scree test on consecutive
-   eigenvalue differences to pick `d_k`, the HDDC noise level
-   `b_k = (Tr(S_k) - sum_{j<=d_k} lam_j) / (D - d_k)`, then the MFA
-   reconstruction of `Sigma_k = W_k W_k^T + b_k I` with
-   `scale_j = sqrt(lam_j - b_k)`. All `q_max` columns are written from the
-   eigendecomposition and only the mask records `d_k`, so a later surgery can
-   raise a component's rank with no revival logic.
+   eigenvalue differences to pick `d_k`, and the HDDC noise level. The default
+   is `b_k = (Tr(S_k) - sum_{j<=d_k} lam_j) / (D - d_k)`; the shared-noise
+   model pools those residuals with weights `N_k`. The MFA reconstruction uses
+   `scale_j = sqrt(lam_j - b)` (or `b_k`). All `q_max` columns are written from
+   the eigendecomposition and only the mask records `d_k`, so a later surgery
+   can raise a component's rank with no revival logic.
 
 C. Adam state for the rewritten tensors is dropped by the caller
    (`reset_optimizer_state`), optionally followed by a short LR warmup.
@@ -41,6 +42,7 @@ those four files and the `dalg-run-training-hddc` entry in `pyproject.toml`.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -56,7 +58,7 @@ class SurgeryConfig:
     """Everything the periodic surgery needs. `every <= 0` disables it."""
 
     enabled: bool = False
-    every: int = 0
+    every: float = 0.0
     threshold: float = 0.01      # Cattell t, relative to lam_1 (scale-free)
     min_count: float = 0.0       # n_min in effective points; <=0 => max(5*q, 50)
     warmup_steps: int = 0        # linear LR warmup after each surgery
@@ -70,9 +72,52 @@ class SurgeryConfig:
         return float(max(5 * q, 50))
 
     def active_at(self, epoch: int) -> bool:
-        return bool(
-            self.enabled and self.every > 0 and epoch > 0 and epoch % self.every == 0
-        )
+        if not self.enabled or self.every <= 0 or epoch <= 0:
+            return False
+        periods = float(epoch) / float(self.every)
+        return math.isclose(periods, round(periods), rel_tol=0.0, abs_tol=1e-9)
+
+    def active_after_batch(
+        self,
+        batch: int,
+        steps_per_epoch: Optional[int],
+        *,
+        epoch: int = 1,
+    ) -> bool:
+        """Whether a sub-epoch cadence crosses a surgery boundary after `batch`.
+
+        Optimizer steps discretize fractional epoch positions. Surgery therefore
+        runs on the first completed batch at or beyond each multiple of `every`.
+        The epoch is included in the calculation so non-divisor cadences such as
+        0.3 continue across epoch boundaries without being rounded or reset.
+        """
+        if (
+            not self.enabled
+            or not 0 < float(self.every) < 1
+            or steps_per_epoch is None
+            or steps_per_epoch <= 0
+            or epoch <= 0
+            or batch <= 0
+            or batch > steps_per_epoch
+        ):
+            return False
+
+        previous = (epoch - 1) + (batch - 1) / steps_per_epoch
+        current = (epoch - 1) + batch / steps_per_epoch
+        previous_period = math.floor(previous / self.every + 1e-9)
+        current_period = math.floor(current / self.every + 1e-9)
+        crossed = current_period - previous_period
+
+        # An exact epoch-boundary event runs after validation via `active_at`,
+        # preserving the existing integer and half-epoch ordering.
+        if batch == steps_per_epoch and self.active_at(epoch):
+            crossed -= 1
+        if crossed > 1:
+            raise ValueError(
+                "surgery cadence is shorter than one optimizer step; increase "
+                "--surgery-every-epochs or --steps-per-epoch"
+            )
+        return crossed == 1
 
 
 # Optimizer hygiene (phase C)
@@ -180,7 +225,9 @@ def _softplus_inverse(y: torch.Tensor) -> torch.Tensor:
 def reconstruct_components(model, N, S_acc, cfg: SurgeryConfig) -> Dict[str, Any]:
     """Rewrite each eligible component's covariance from its scatter matrix.
 
-    Components with `N_k < n_min` keep every parameter and their mask untouched.
+    Components with `N_k < n_min` keep their loading parameters and mask. In
+    shared-b mode their covariance floor still changes when eligible components
+    produce a new global b.
     """
     K, D, q = model.K, model.D, model.q
     device = model.mu.device
@@ -188,12 +235,14 @@ def reconstruct_components(model, N, S_acc, cfg: SurgeryConfig) -> Dict[str, Any
 
     d_k = model.rank_mask.sum(-1).to(torch.int64)          # unchanged where skipped
     b_k = torch.full((K,), float("nan"), dtype=torch.float64, device=device)
+    shared_b = bool(getattr(model, "shared_b", False))
 
     eligible = (N >= n_min) & torch.isfinite(N)
     idx = eligible.nonzero(as_tuple=True)[0]
     if idx.numel() == 0:
         return {
             "d_k": d_k, "b_k": b_k, "eligible": eligible,
+            "b_shared": None,
             "n_updated": 0, "n_skipped": int(K), "N_k": N,
         }
 
@@ -216,15 +265,49 @@ def reconstruct_components(model, N, S_acc, cfg: SurgeryConfig) -> Dict[str, Any
     # Empty selection -> 1; never exceed q_max, and never leave zero noise dims.
     d_sel = d_sel.clamp(min=1, max=min(q, D - 1))
 
-    # HDDC eq. 4: the noise level is the mean of the discarded eigenvalues, so
-    # b_k > 0 and lam_j >= b_k for every retained j hold by construction.
+    # HDDC eq. 4: a component-specific noise level is the mean of its discarded
+    # eigenvalues. Equation 5 pools the same residual variance across components
+    # for the [a_ij b Q_i d_i] model, weighted by effective membership N_k.
     head = torch.cumsum(lam[:, :q].clamp_min(0.0), dim=1)
     kept = head.gather(1, (d_sel - 1)[:, None]).squeeze(1)
-    b = (trace - kept) / (D - d_sel).to(trace.dtype)
-    b = b.clamp_min(float(cfg.psi_floor))
+    residual = trace - kept
+    if shared_b:
+        numerator = (N[idx] * residual).sum()
+        denominator = (N[idx] * (D - d_sel).to(N.dtype)).sum()
+        if (
+            not torch.isfinite(numerator)
+            or not torch.isfinite(denominator)
+            or float(denominator) <= 0.0
+        ):
+            raise RuntimeError(
+                "shared-b surgery produced a non-finite pooled residual or "
+                "non-positive residual degrees of freedom"
+            )
+        b_shared = (numerator / denominator).clamp_min(float(cfg.psi_floor))
 
-    # Sigma_k = W_k W_k^T + b_k I with W_k's columns the top eigenvectors scaled
-    # by sqrt(lam_j - b_k). All q_max columns are written; only the mask records
+        # Every retained signal eigenvalue a_kj must be strictly above the
+        # common floor b. Clamping would leave rank_mask reporting a direction
+        # with no signal variance, so expose an incompatible shared-b fit.
+        retained = j <= d_sel[:, None]
+        invalid = retained & (lam[:, :q] <= b_shared)
+        if invalid.any():
+            row, col = invalid.nonzero()[0].tolist()
+            component = int(idx[row].item())
+            eigenvalue = float(lam[row, col].item())
+            raise RuntimeError(
+                "shared-b surgery cannot reconstruct retained direction: "
+                f"component={component}, direction={col + 1}, "
+                f"lambda={eigenvalue:.8g} <= b={float(b_shared):.8g}"
+            )
+        b = b_shared.expand(idx.numel())
+    else:
+        b_shared = None
+        b = (residual / (D - d_sel).to(trace.dtype)).clamp_min(
+            float(cfg.psi_floor)
+        )
+
+    # Sigma_k = W_k W_k^T + b_* I with W_k's columns the top eigenvectors scaled
+    # by sqrt(lam_j - b_*). All q_max columns are written; only the mask records
     # d_k, so a later surgery can raise the rank with no revival logic.
     scale = (lam[:, :q] - b[:, None]).clamp_min(float(cfg.eps)).sqrt()
 
@@ -233,7 +316,12 @@ def reconstruct_components(model, N, S_acc, cfg: SurgeryConfig) -> Dict[str, Any
     model.scale_rho.data[idx] = _softplus_inverse(scale).to(dtype)
     # _psi() is softplus(psi_rho) + eps_floor, so invert against the offset.
     psi_target = (b - model._eps).clamp_min(1e-12)
-    model.psi_rho.data[idx] = _softplus_inverse(psi_target).to(dtype)[:, None]
+    if shared_b:
+        model.psi_rho.data.copy_(
+            _softplus_inverse(psi_target[:1]).to(dtype).reshape_as(model.psi_rho)
+        )
+    else:
+        model.psi_rho.data[idx] = _softplus_inverse(psi_target).to(dtype)[:, None]
     model.rank_mask.data[idx] = (j <= d_sel[:, None]).to(model.rank_mask.dtype)
 
     d_k = d_k.clone()
@@ -243,6 +331,7 @@ def reconstruct_components(model, N, S_acc, cfg: SurgeryConfig) -> Dict[str, Any
     return {
         "d_k": d_k,
         "b_k": b_k,
+        "b_shared": b_shared,
         "eligible": eligible,
         "n_updated": int(idx.numel()),
         "n_skipped": int(K - idx.numel()),
@@ -289,7 +378,7 @@ def _summarize(stats: Dict[str, Any], q: int, device) -> Dict[str, Any]:
     cumulative = counts.cumsum(0)
     median_idx = int((cumulative >= counts.sum() / 2.0).nonzero(as_tuple=True)[0][0]) \
         if counts.sum() > 0 else 0
-    return {
+    summary = {
         "d_k_mean": float(totals[1].item()) / K_total,
         "d_k_median": median_idx,
         "d_k_min": int(occupied[0].item()) if occupied.numel() else 0,
@@ -301,6 +390,10 @@ def _summarize(stats: Dict[str, Any], q: int, device) -> Dict[str, Any]:
         "n_components": int(totals[0].item()),
         "saturated_frac": float(totals[6].item()) / K_total,
     }
+    b_shared = stats.get("b_shared")
+    if b_shared is not None:
+        summary["b_shared"] = float(b_shared.item())
+    return summary
 
 
 # Entry point
@@ -312,10 +405,17 @@ def hddc_surgery(model, loader, cfg: SurgeryConfig, *, device=None, log=None) ->
     The caller is responsible for phase C (`reset_optimizer_state` on
     `surgery_params(model)`) and for any post-surgery LR warmup.
     """
-    if not getattr(model, "isotropic_psi", False):
+    if getattr(model, "shared_b", False) and isinstance(
+        model, ComponentShardedMFA_HDDC
+    ):
+        raise ValueError("shared-b surgery is supported only for a full MFA_HDDC model")
+    if not (
+        getattr(model, "isotropic_psi", False)
+        or getattr(model, "shared_b", False)
+    ):
         raise ValueError(
-            "hddc_surgery requires isotropic_psi=True: the HDDC reconstruction "
-            "Sigma_k = W_k W_k^T + b_k I is exact only for isotropic Psi_k"
+            "hddc_surgery requires isotropic_psi=True or shared_b=True: the "
+            "HDDC reconstruction is exact only for isotropic noise"
         )
     device = device if device is not None else model.mu.device
 
@@ -329,10 +429,15 @@ def hddc_surgery(model, loader, cfg: SurgeryConfig, *, device=None, log=None) ->
     summary["n_min"] = cfg.n_min(model.q)
     summary["d_k_per_component"] = [int(v) for v in stats["d_k"].tolist()]
     if log is not None:
+        noise_text = (
+            f"b={summary['b_shared']:.4g}"
+            if "b_shared" in summary
+            else f"b_k mean={summary['b_k_mean']:.4g}"
+        )
         log(
             f"[surgery] rows={n_rows:,} | d_k mean={summary['d_k_mean']:.2f} "
             f"median={summary['d_k_median']} range=[{summary['d_k_min']}, "
-            f"{summary['d_k_max']}] | b_k mean={summary['b_k_mean']:.4g} | "
+            f"{summary['d_k_max']}] | {noise_text} | "
             f"updated={summary['n_updated']} skipped={summary['n_skipped']} "
             f"(n_min={summary['n_min']:.0f}) | saturated@q={summary['saturated_frac']:.1%}"
         )
@@ -342,17 +447,21 @@ def hddc_surgery(model, loader, cfg: SurgeryConfig, *, device=None, log=None) ->
 def parameter_count(model) -> int:
     """Free parameters under the current rank mask, for post-hoc BIC curves.
 
-    Per component: `mu` (D) + mixture weight (1) + one noise level (1 with
-    isotropic Psi, else D) + the loading columns actually in use. A rank-d
-    subspace of R^D has d(D - d) + d free parameters once the rotational
-    redundancy inside the subspace is removed, matching HDDC's count.
+    Per component: `mu` (D) + mixture weight (1) + the loading columns actually
+    in use, plus either one global shared-b parameter, K component-specific
+    isotropic levels, or the diagonal Psi parameters. A rank-d subspace of R^D
+    has d(D - d) + d free parameters once the rotational redundancy inside the
+    subspace is removed, matching HDDC's count.
     """
     K, D = model.K, model.D
     d = model.rank_mask.sum(-1).to(torch.int64)
     subspace = (d * (D - d) + d).sum().item()
-    noise = K if getattr(model, "isotropic_psi", False) else (
-        K * D if model.psi_per_component else D
-    )
+    if getattr(model, "shared_b", False):
+        noise = 1
+    elif getattr(model, "isotropic_psi", False):
+        noise = K
+    else:
+        noise = K * D if model.psi_per_component else D
     return int(K * D + (K - 1) + noise + subspace)
 
 

@@ -24,16 +24,22 @@ feature, delete those files and the `dalg-run-training-hddc` entry in
 ## What surgery does
 
 Every `T` epochs, the closed-form covariance update of the HDDC model
-`[a_ij b_i Q_i d_i]` (Bouveyron, Girard & Schmid, arXiv:math/0604064) re-estimates
-each component's covariance at an adaptive rank and rewrites it in MFA
-parameters. Three phases:
+`[a_ij b_i Q_i d_i]`, or its single-process `[a_ij b Q_i d_i]` variant,
+(Bouveyron, Girard & Schmid, arXiv:math/0604064) re-estimates each component's
+covariance at an adaptive rank and rewrites it in MFA parameters. Three phases:
 
 - **A** — one E-pass accumulating, in float64, the responsibility-weighted second
   moment of each component about its *current* `mu_k`.
 - **B** — per component: `eigh(S_k)`, a scale-free Cattell scree test on
   consecutive eigenvalue differences to pick `d_k`, the noise level
   `b_k = (Tr(S_k) - sum_{j<=d_k} lam_j) / (D - d_k)`, then the reconstruction of
-  `Sigma_k = W_k W_k^T + b_k I` with `scale_j = sqrt(lam_j - b_k)`.
+  `Sigma_k = W_k W_k^T + b_k I` with `scale_j = sqrt(lam_j - b_k)`. With
+  `--shared-b`, eligible components instead estimate one pooled floor:
+
+  ```text
+  b = sum_k N_k (Tr(S_k) - sum_{j<=d_k} lam_kj)
+      / sum_k N_k (D - d_k)
+  ```
 - **C** — Adam state for the rewritten tensors is dropped, optionally followed by
   a short LR warmup.
 
@@ -45,7 +51,9 @@ Invariants worth preserving when editing:
   responsibility-weighted mean — pairing a covariance centered at `mu_hat_k` with
   a retained `mu_k` is inconsistent and inflates apparent rank when the SGD means
   lag the data.
-- `--isotropic-psi` is required; the CLI rejects the combination without it.
+- `--isotropic-psi` selects component-specific `b_k`; `--shared-b` selects a
+  global `b`. Exactly one is required for surgery, and shared-b is vanilla-mode
+  only.
 - All `q_max` columns are rewritten every time and only the mask records `d_k`,
   so a rank *increase* needs no revival logic.
 - Surgery is a partial M-step, so it competes for best-model selection on the
@@ -67,6 +75,19 @@ dalg-run-training-hddc \
 ```
 
 `--surgery-every-epochs 0` gives a fixed-q baseline on the same stack.
+
+For the single-process shared-noise model, replace `--isotropic-psi` with
+`--shared-b`. The two flags are mutually exclusive. The pooled `b` excludes
+components below `surgery_min_count`, although their covariance floor still
+changes because the scalar is global. Surgery stops explicitly if pooled `b`
+is not below every retained signal eigenvalue. The Slurm launcher makes the
+same selection with `SHARED_B=1`; its default remains component-specific `b_k`.
+
+To warm-start from a saved HDDC model, pass `--init-model-path mfa_model.pt` in
+vanilla mode. The source must exactly match `K`, `D`, `q_max`, and the Psi noise
+mode. The trainer records this state as an epoch-0 checkpoint
+with the initial validation NLL and a fresh Adam state, after which normal
+checkpoint resume behavior applies.
 
 ## Toy-manifold validation data
 

@@ -6,8 +6,9 @@ diverge without touching the production entrypoint. Same arrangement as
 `run_training_ard.py`. Differences from `run_training.py`:
 
 - builds `MFA_HDDC` / `ComponentShardedMFA_HDDC` and calls `train_nll_hddc`
-- adds `--isotropic-psi` and the `--surgery-*` flags; `--rank` doubles as
-  `--q-max`, the per-component upper bound on the adaptive rank
+- adds `--isotropic-psi`, single-process `--shared-b`, and the `--surgery-*`
+  flags; `--rank` doubles as `--q-max`, the per-component upper bound on the
+  adaptive rank
 - with `--surgery-every-epochs 0` this is a fixed-q baseline, numerically
   equivalent to `run_training.py` at the same settings
 
@@ -21,6 +22,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
 import os
 from datetime import timedelta
 from pathlib import Path
@@ -144,6 +146,23 @@ def _build_train_loader(
         seed=(args.seed or 0),
     )
     return _build_data_loader(train_ds, args, device=device), len(train_ds), train_pos
+
+
+def _build_surgery_loader(data: dict, args, *, device: str):
+    """Build a separate full E-pass loader safe to use during a train epoch."""
+    from dalg.data.shard_activations import ActivationBatchDataset
+
+    surgery_ds = ActivationBatchDataset(
+        data["shard_dir"],
+        layer=data["layer"],
+        row_subset=data["train_pos_full"],
+        batch_size=args.batch_size,
+        drop_prefix=data["drop_prefix"],
+        shuffle_shards=False,
+        shuffle_within_shard=False,
+        seed=(args.seed or 0),
+    )
+    return _build_data_loader(surgery_ds, args, device=device)
 
 
 def _limit_steps_per_epoch(steps_per_epoch: int, args, *, log) -> int:
@@ -336,7 +355,7 @@ def _ensure_centroids(
     is_main: bool,
     device: str,
     barrier: bool,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Resolve centroids for the run, then load them on every rank.
 
     Order of precedence on rank 0:
@@ -366,13 +385,32 @@ def _ensure_centroids(
             )
     if barrier and dist.is_available() and dist.is_initialized():
         dist.barrier()
-    centroids = torch.load(centroids_path, map_location=device, weights_only=True)
-    if centroids.shape[0] != args.K:
-        raise SystemExit(
-            f"Cached centroids K={centroids.shape[0]} != --K {args.K}; "
-            f"delete {centroids_path} to recompute."
+    from dalg.init.centroid_artifact import (
+        load_centroid_artifact,
+        validate_centroid_artifact,
+    )
+
+    centroids, principal_components = load_centroid_artifact(
+        centroids_path,
+        map_location=device,
+    )
+    required_pca_rank = args.rank if args.direction_init == "cluster_pca" else None
+    try:
+        validate_centroid_artifact(
+            centroids,
+            principal_components,
+            expected_k=args.K,
+            expected_d=data["d_model"],
+            required_pca_rank=required_pca_rank,
         )
-    return centroids
+    except ValueError as exc:
+        raise SystemExit(f"Invalid centroid artifact {centroids_path}: {exc}") from exc
+    init_directions = (
+        principal_components[:, :, : args.rank].contiguous()
+        if required_pca_rank is not None
+        else None
+    )
+    return centroids, init_directions
 
 
 def _write_split_info(
@@ -429,9 +467,12 @@ def _write_run_config(
         "split_seed": data["split_seed"],
         "pool_size": args.pool_size,
         "refine_epochs": args.refine_epochs,
+        "direction_init": args.direction_init,
+        "init_model_path": args.init_model_path,
         "model": "MFA_HDDC",
         "isotropic_psi": bool(args.isotropic_psi),
-        "surgery_every_epochs": int(args.surgery_every_epochs or 0),
+        "shared_b": bool(args.shared_b),
+        "surgery_every_epochs": args.surgery_every_epochs or 0,
         "surgery_threshold": float(args.surgery_threshold),
         "surgery_min_count": float(args.surgery_min_count),
         "surgery_warmup_steps": int(args.surgery_warmup_steps or 0),
@@ -467,6 +508,14 @@ def _maybe_init_wandb(args, data: dict, *, training_mode: str, world_size: int, 
         "drop_prefix": data["drop_prefix"],
         "n_train_tokens": data["n_train_tokens"],
         "val_frac": data["val_frac"],
+        "direction_init": args.direction_init,
+        "init_model_path": args.init_model_path,
+        "isotropic_psi": bool(args.isotropic_psi),
+        "shared_b": bool(args.shared_b),
+        "surgery_every_epochs": args.surgery_every_epochs or 0,
+        "surgery_threshold": float(args.surgery_threshold),
+        "surgery_min_count": float(args.surgery_min_count),
+        "surgery_warmup_steps": int(args.surgery_warmup_steps or 0),
     }
     return wandb.init(
         project=args.wandb_project,
@@ -484,7 +533,7 @@ def _finish_wandb(run) -> None:
 
 def _surgery_config(args):
     """Build a SurgeryConfig from the CLI, or None when surgery is off."""
-    every = int(args.surgery_every_epochs or 0)
+    every = float(args.surgery_every_epochs or 0)
     if every <= 0:
         return None
     from dalg.models.adaptive_q.hddc_surgery import SurgeryConfig
@@ -503,8 +552,15 @@ def _surgery_config(args):
 
 def cmd_train(args):
     """Single-process MFA training on activation shards."""
-    from dalg.models.adaptive_q.mfa_hddc import MFA_HDDC, save_mfa_hddc
-    from dalg.models.adaptive_q.train_hddc import train_nll_hddc
+    from dalg.models.adaptive_q.mfa_hddc import (
+        MFA_HDDC,
+        load_mfa_hddc,
+        save_mfa_hddc,
+    )
+    from dalg.models.adaptive_q.train_hddc import (
+        seed_training_checkpoint,
+        train_nll_hddc,
+    )
 
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
@@ -523,6 +579,7 @@ def cmd_train(args):
         device=args.device,
     )
     steps_per_epoch = _limit_steps_per_epoch(steps_per_epoch, args, log=print)
+    surgery_loader = _build_surgery_loader(data, args, device=args.device)
     val_tensor = _build_val_tensor_for_main(
         data,
         args,
@@ -536,20 +593,81 @@ def cmd_train(args):
         world_size=1,
     )
 
-    centroids = _ensure_centroids(
-        data,
-        args,
-        out_dir=out_dir,
-        is_main=True,
-        device=args.device,
-        barrier=False,
-    )
+    initial_model = None
+    if args.init_model_path:
+        source_model = load_mfa_hddc(args.init_model_path, map_location="cpu")
+        if source_model.K != args.K or source_model.D != data["d_model"]:
+            raise SystemExit(
+                "--init-model-path has shape "
+                f"(K={source_model.K}, D={source_model.D}), expected "
+                f"(K={args.K}, D={data['d_model']})"
+            )
+        if (
+            source_model.isotropic_psi != bool(args.isotropic_psi)
+            or getattr(source_model, "shared_b", False) != bool(args.shared_b)
+        ):
+            raise SystemExit(
+                "--init-model-path must use the same Psi noise mode as the requested run"
+            )
+        if source_model.q != args.rank:
+            raise SystemExit(
+                f"--init-model-path has rank q={source_model.q}, expected q={args.rank}"
+            )
+        if getattr(source_model, "_rotation_on", False):
+            raise SystemExit("--init-model-path must not have an active factor rotation")
+        initial_model = source_model
 
-    model = MFA_HDDC(
-        centroids=centroids,
-        rank=args.rank,
-        isotropic_psi=bool(args.isotropic_psi),
-    ).to(args.device)
+        centroids_path = out_dir / "centroids.pt"
+        source_centroids = source_model.mu.detach().cpu()
+        if centroids_path.exists():
+            from dalg.init.centroid_artifact import load_centroid_artifact
+
+            cached, _principal_components = load_centroid_artifact(
+                centroids_path,
+                map_location="cpu",
+            )
+            if not torch.equal(cached, source_centroids):
+                raise SystemExit(
+                    f"cached centroids do not match --init-model-path: {centroids_path}"
+                )
+        else:
+            torch.save(source_centroids, centroids_path)
+            print(f"Centroids: copied from model means in {args.init_model_path}")
+
+    if initial_model is None:
+        centroids, init_directions = _ensure_centroids(
+            data,
+            args,
+            out_dir=out_dir,
+            is_main=True,
+            device=args.device,
+            barrier=False,
+        )
+        if args.seed is not None:
+            torch.manual_seed(args.seed)
+        model = MFA_HDDC(
+            centroids=centroids,
+            rank=args.rank,
+            init_directions=init_directions,
+            isotropic_psi=bool(args.isotropic_psi),
+            shared_b=bool(args.shared_b),
+        )
+    else:
+        model = initial_model
+    model = model.to(args.device)
+
+    ckpt_path = out_dir / "checkpoint.pt"
+    if initial_model is not None and not ckpt_path.exists():
+        initial_metric = seed_training_checkpoint(
+            model,
+            str(ckpt_path),
+            lr=args.lr,
+            val_tensor=val_tensor,
+        )
+        print(
+            f"[init] seeded epoch-0 checkpoint from {args.init_model_path} "
+            f"with val_nll={initial_metric:.6f}"
+        )
     if getattr(args, "compile", False):
         print("Compiling model with torch.compile...")
         model = torch.compile(model)
@@ -568,7 +686,7 @@ def cmd_train(args):
         grad_clip=args.grad_clip,
         save_path=str(out_dir / "mfa_model.pt"),
         save_func=save_mfa_hddc,
-        ckpt_path=str(out_dir / "checkpoint.pt"),
+        ckpt_path=str(ckpt_path),
         steps_per_epoch=steps_per_epoch,
         track_best=True,
         max_steps=args.max_steps,
@@ -578,6 +696,7 @@ def cmd_train(args):
         epoch_snapshot_func=_epoch_snapshot,
         epoch_snapshot_every=args.epoch_snapshot_every,
         surgery=_surgery_config(args),
+        surgery_loader=surgery_loader,
     )
 
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -660,7 +779,7 @@ def cmd_train_component_shard(args):
             world_size=world_size,
         )
 
-    centroids = _ensure_centroids(
+    centroids, init_directions = _ensure_centroids(
         data,
         args,
         out_dir=out_dir,
@@ -675,6 +794,7 @@ def cmd_train_component_shard(args):
         rank=args.rank,
         dist_rank=rank,
         world_size=world_size,
+        init_directions=init_directions,
         isotropic_psi=bool(args.isotropic_psi),
     ).to(device)
     log(
@@ -810,6 +930,11 @@ def validate_args(args) -> None:
         raise SystemExit("train: --layer is required")
 
     mode = args.training_mode
+    if args.shared_b and args.isotropic_psi:
+        raise SystemExit(
+            "train: --shared-b and --isotropic-psi select different noise modes; "
+            "set only one"
+        )
     if mode == "vanilla" and world_size > 1:
         raise SystemExit(
             "train: --training-mode vanilla was requested under torchrun; "
@@ -820,13 +945,50 @@ def validate_args(args) -> None:
             raise SystemExit(f"train: --training-mode {mode} requires torchrun with WORLD_SIZE>1")
         if args.device != "cuda":
             raise SystemExit("train: component_shard requires --device cuda")
+        if args.init_model_path:
+            raise SystemExit("train: --init-model-path currently supports vanilla mode only")
+        if args.shared_b:
+            raise SystemExit("train: --shared-b supports --training-mode vanilla only")
+    if args.init_model_path and args.centroids_path:
+        raise SystemExit(
+            "train: set only one of --init-model-path and --centroids-path; "
+            "the initial model already supplies its means"
+        )
     if args.steps_per_epoch is not None and args.steps_per_epoch <= 0:
         raise SystemExit("train: --steps-per-epoch must be positive")
+    if args.direction_init == "cluster_pca" and not args.centroids_path:
+        raise SystemExit(
+            "train: --direction-init cluster_pca requires --centroids-path "
+            "pointing to an enriched centroid artifact"
+        )
+    surgery_every = float(args.surgery_every_epochs or 0)
+    if surgery_every < 0:
+        raise SystemExit("train: --surgery-every-epochs must be non-negative")
+    supported_cadence = (
+        surgery_every == 0
+        or 0 < surgery_every < 1
+        or (surgery_every >= 1 and surgery_every.is_integer())
+    )
+    if not supported_cadence:
+        raise SystemExit(
+            "train: --surgery-every-epochs must be 0, a fraction below 1, "
+            "or a positive integer"
+        )
+    if surgery_every == 0:
+        args.surgery_every_epochs = 0
+    elif surgery_every >= 1:
+        args.surgery_every_epochs = int(surgery_every)
+    else:
+        args.surgery_every_epochs = surgery_every
+    if mode == "component_shard" and 0 < surgery_every < 1:
+        raise SystemExit(
+            "train: fractional-epoch surgery currently supports vanilla mode only"
+        )
     if args.surgery_every_epochs and args.surgery_every_epochs > 0:
-        if not args.isotropic_psi:
+        if not (args.isotropic_psi or args.shared_b):
             raise SystemExit(
-                "train: --surgery-every-epochs requires --isotropic-psi; the HDDC "
-                "reconstruction Sigma_k = W_k W_k^T + b_k I assumes isotropic noise"
+                "train: --surgery-every-epochs requires --isotropic-psi or "
+                "--shared-b; HDDC covariance reconstruction assumes isotropic noise"
             )
         if args.surgery_threshold <= 0:
             raise SystemExit("train: --surgery-threshold must be positive")
@@ -854,8 +1016,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--centroids-path",
         default=None,
-        help="Path to a pre-computed centroids.pt (or a directory containing one) "
+        help="Path to a pre-computed centroid artifact (or a directory containing one) "
              "to use instead of fitting KMeans. Copied into <out_dir>/centroids.pt.",
+    )
+    p.add_argument(
+        "--direction-init",
+        choices=["random", "cluster_pca"],
+        default="random",
+        help="Initialize loading directions randomly or from the first --rank "
+             "principal components stored in --centroids-path.",
+    )
+    p.add_argument(
+        "--init-model-path",
+        default=None,
+        help="HDDC mfa_model.pt used to seed a resumable epoch-0 checkpoint. "
+             "Its K, D, q, and Psi shape must match the requested model.",
     )
     p.add_argument("--val-frac", type=float, default=0.05)
     p.add_argument("--split-seed", type=int, default=42)
@@ -867,9 +1042,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--isotropic-psi", action="store_true",
                    help="Psi_k = b_k I (one noise scalar per component) instead of "
                         "a shared diagonal Psi. Required by HDDC surgery.")
-    p.add_argument("--surgery-every-epochs", type=int, default=0,
-                   help="Run HDDC covariance surgery every N epochs (0 = fixed-q "
-                        "baseline). Requires --isotropic-psi.")
+    p.add_argument(
+        "--shared-b",
+        action="store_true",
+        help="Psi_k = b I (one trainable noise scalar for the full mixture). "
+             "Single-process only and mutually exclusive with --isotropic-psi.",
+    )
+    p.add_argument("--surgery-every-epochs", type=float, default=0,
+                   help="Run HDDC covariance surgery every N epochs. Supports "
+                        "fractions below 1 or a positive integer "
+                        "(0 = fixed-q baseline). "
+                        "Requires --isotropic-psi or --shared-b.")
     p.add_argument("--surgery-threshold", type=float, default=0.01,
                    help="Cattell scree threshold t, relative to the leading eigenvalue.")
     p.add_argument("--surgery-min-count", type=float, default=0.0,

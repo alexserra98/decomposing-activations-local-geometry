@@ -55,6 +55,23 @@ def test_shapes_dtypes_labels_and_metadata() -> None:
     assert tuple(metadata["intrinsic_dims"]) == INTRINSIC_DIMS
     assert tuple(metadata["embedding_dims"]) == EMBEDDING_DIMS
     assert metadata["type_id_to_name"] == dict(enumerate(MANIFOLD_NAMES))
+    assert metadata["curvature_definition"] == (
+        "maximum absolute extrinsic principal curvature"
+    )
+    assert metadata["flat_radius_convention"] == "unit RMS radius"
+    assert metadata["max_abs_curvatures"].shape == (8,)
+    assert metadata["curvature_radii"].shape == (8,)
+    assert metadata["noise_stds"].shape == (8,)
+    assert torch.equal(
+        metadata["max_abs_curvatures"][[0, 2]],
+        torch.zeros(2, dtype=torch.float64),
+    )
+    assert torch.all(metadata["curvature_radii"] > 0)
+    assert torch.all(metadata["noise_stds"] > 0)
+    assert torch.allclose(
+        metadata["curvature_radii"] / metadata["noise_stds"],
+        torch.full((8,), 10_000.0, dtype=torch.float64),
+    )
 
     train_counts = torch.bincount(y_train, minlength=64)
     val_counts = torch.bincount(y_val, minlength=64)
@@ -71,9 +88,34 @@ def test_shapes_dtypes_labels_and_metadata() -> None:
         assert item["type_name"] == MANIFOLD_NAMES[type_id]
         assert item["intrinsic_dim"] == INTRINSIC_DIMS[type_id]
         assert item["embedding_dim"] == EMBEDDING_DIMS[type_id]
+        assert item["max_abs_curvature"] == metadata["max_abs_curvatures"][type_id]
+        assert item["curvature_radius"] == metadata["curvature_radii"][type_id]
+        assert item["noise_std"] == metadata["noise_stds"][type_id]
         assert torch.equal(
             item["position"], metadata["offsets"][item["manifold_id"]]
         )
+
+
+def test_selected_manifold_types() -> None:
+    config = _tiny_config(
+        n_train=20,
+        n_val=10,
+        manifolds_per_type=1,
+        manifold_types=("circle", "helix"),
+    )
+    train, val, metadata = make_toy_manifold_datasets(config)
+
+    assert metadata["manifold_types"] == ("circle", "helix")
+    assert metadata["intrinsic_dims"] == (1, 1)
+    assert metadata["embedding_dims"] == (2, 3)
+    assert metadata["num_manifolds"] == 2
+    assert torch.equal(metadata["manifold_type_ids"], torch.tensor([0, 1]))
+    assert torch.bincount(train.tensors[1], minlength=2).tolist() == [10, 10]
+    assert torch.bincount(val.tensors[1], minlength=2).tolist() == [5, 5]
+    assert [item["type_name"] for item in metadata["manifolds"]] == [
+        "circle",
+        "helix",
+    ]
 
 
 def test_generation_is_deterministic_and_seeded() -> None:
@@ -94,10 +136,32 @@ def test_generation_is_deterministic_and_seeded() -> None:
     assert not torch.equal(train_a.tensors[0], train_c.tensors[0])
 
 
-def test_instances_have_independent_embeddings_and_offset_directions() -> None:
-    _, _, metadata = make_toy_manifold_datasets(
-        _tiny_config(offset_radius=2.0)
+def test_raw_curvatures_match_manifold_geometry() -> None:
+    config = _tiny_config(
+        torus_major_radius=3.0,
+        torus_minor_radius=1.0,
+        swiss_theta_min=2.0,
+        swiss_theta_max=5.0,
+        helix_alpha=0.5,
     )
+    _, _, metadata = make_toy_manifold_datasets(config)
+    curvatures = metadata["raw_max_abs_curvatures"]
+
+    assert torch.equal(curvatures[[0, 2]], torch.zeros(2, dtype=torch.float64))
+    assert curvatures[1] == 1.0
+    assert curvatures[3] == 1.0
+    assert curvatures[4] == 1.0
+    assert curvatures[5] > 0.0
+    assert float(curvatures[6]) == pytest.approx(6.0 / 5.0**1.5)
+    assert float(curvatures[7]) == pytest.approx(0.8)
+    assert torch.allclose(
+        metadata["max_abs_curvatures"],
+        curvatures * metadata["calibration_scales"],
+    )
+
+
+def test_instances_have_independent_embeddings_and_offset_directions() -> None:
+    _, _, metadata = make_toy_manifold_datasets(_tiny_config(offset_radius=2.0))
 
     for manifold in metadata["manifolds"]:
         local_dim = manifold["embedding_dim"]
@@ -142,6 +206,42 @@ def test_centered_manifolds_have_zero_mean_and_unit_rms() -> None:
         assert points.mean(dim=0).norm() < 0.12
         rms = points.square().sum(dim=1).mean().sqrt()
         assert abs(float(rms) - 1.0) < 0.08
+
+
+def test_ambient_noise_matches_curvature_scaled_standard_deviation() -> None:
+    train, _, metadata = make_toy_manifold_datasets(
+        _tiny_config(
+            n_train=6_400,
+            n_val=80,
+            calibration_size=2_000,
+            offset_radius=2.0,
+            noise_ratio=1_000.0,
+        )
+    )
+    points, manifold_ids = train.tensors
+    normalized_normal_energy = []
+
+    for manifold in metadata["manifolds"]:
+        manifold_id = manifold["manifold_id"]
+        local_points = points[manifold_ids == manifold_id].double()
+        centered = local_points - manifold["position"]
+        embedding = manifold["embedding"]
+        tangent_projection = (centered @ embedding.T) @ embedding
+        normal_noise = centered - tangent_projection
+        normal_dim = points.shape[1] - manifold["embedding_dim"]
+        normalized_normal_energy.append(
+            normal_noise.square().sum()
+            / (len(local_points) * normal_dim * manifold["noise_std"].square())
+        )
+
+    observed = torch.stack(normalized_normal_energy)
+    assert torch.allclose(
+        observed.mean(), torch.tensor(1.0, dtype=torch.float64), atol=0.04, rtol=0.0
+    )
+    assert torch.allclose(
+        metadata["curvature_radii"] / metadata["noise_stds"],
+        torch.full((8,), 1_000.0, dtype=torch.float64),
+    )
 
 
 def test_offset_condition_differs_only_by_manifold_offset() -> None:
@@ -288,7 +388,11 @@ def test_shard_writer_rejects_nonempty_output(tmp_path) -> None:
         ({"n_val": 0}, "n_val"),
         ({"calibration_size": 1}, "calibration_size"),
         ({"manifolds_per_type": 0}, "manifolds_per_type"),
+        ({"manifold_types": ()}, "manifold_types"),
+        ({"manifold_types": ("circle", "circle")}, "unique"),
+        ({"manifold_types": ("circle", "unknown")}, "unknown manifold"),
         ({"offset_radius": -1.0}, "offset_radius"),
+        ({"noise_ratio": 0.0}, "noise_ratio"),
         ({"segment_min": 1.0, "segment_max": 1.0}, "segment"),
         ({"torus_major_radius": 1.0, "torus_minor_radius": 1.0}, "torus"),
         ({"mobius_half_width": 1.0}, "mobius"),

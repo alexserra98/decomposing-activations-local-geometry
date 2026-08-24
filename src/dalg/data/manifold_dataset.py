@@ -31,9 +31,13 @@ class ToyManifoldConfig:
     """Configuration for the synthetic manifold-instance dataset.
 
     There are ``manifolds_per_type`` independently embedded instances of each
-    manifold type. ``offset_radius=0`` places every normalized instance at the
-    origin. A positive radius places their centers at random directions on the
-    corresponding ambient-space sphere without changing their local geometry.
+    type selected by ``manifold_types``. ``offset_radius=0`` places every
+    normalized instance at the origin. A positive radius places their centers
+    at random directions on the corresponding ambient-space sphere without
+    changing their local geometry.
+    ``noise_ratio`` is the ratio between a type's normalized radius of
+    curvature and the per-coordinate standard deviation of its ambient
+    Gaussian observation noise.
     """
 
     ambient_dim: int = 128
@@ -41,7 +45,9 @@ class ToyManifoldConfig:
     n_val: int = 100_000
     calibration_size: int = 50_000
     manifolds_per_type: int = 8
+    manifold_types: tuple[str, ...] = MANIFOLD_NAMES
     offset_radius: float = 4.0
+    noise_ratio: float = 10_000.0
     seed: int = 0
 
     segment_min: float = -1.0
@@ -77,11 +83,21 @@ def _validate_config(config: ToyManifoldConfig) -> None:
         raise ValueError("calibration_size must be at least 2")
     if config.manifolds_per_type <= 0:
         raise ValueError("manifolds_per_type must be positive")
+    if not isinstance(config.manifold_types, tuple):
+        raise TypeError("manifold_types must be a tuple")
+    if not config.manifold_types:
+        raise ValueError("manifold_types must not be empty")
+    if len(set(config.manifold_types)) != len(config.manifold_types):
+        raise ValueError("manifold_types must be unique")
+    unknown_types = set(config.manifold_types) - set(MANIFOLD_NAMES)
+    if unknown_types:
+        raise ValueError(f"unknown manifold types: {sorted(unknown_types)}")
     if not isinstance(config.seed, int) or isinstance(config.seed, bool):
         raise TypeError("seed must be an integer")
 
     finite_values = {
         "offset_radius": config.offset_radius,
+        "noise_ratio": config.noise_ratio,
         "segment_min": config.segment_min,
         "segment_max": config.segment_max,
         "torus_major_radius": config.torus_major_radius,
@@ -101,6 +117,8 @@ def _validate_config(config: ToyManifoldConfig) -> None:
 
     if config.offset_radius < 0:
         raise ValueError("offset_radius must be non-negative")
+    if config.noise_ratio <= 0:
+        raise ValueError("noise_ratio must be positive")
     if config.segment_min >= config.segment_max:
         raise ValueError("segment_min must be smaller than segment_max")
     if not (
@@ -232,6 +250,117 @@ def _sample_helix(
     )
 
 
+def _surface_max_abs_principal_curvature(
+    xu: torch.Tensor,
+    xv: torch.Tensor,
+    xuu: torch.Tensor,
+    xuv: torch.Tensor,
+    xvv: torch.Tensor,
+) -> torch.Tensor:
+    """Return ``max(|k1|, |k2|)`` from a parametric surface's derivatives."""
+
+    normal = torch.linalg.cross(xu, xv, dim=-1)
+    normal = normal / normal.norm(dim=-1, keepdim=True)
+
+    first_uu = (xu * xu).sum(dim=-1)
+    first_uv = (xu * xv).sum(dim=-1)
+    first_vv = (xv * xv).sum(dim=-1)
+    second_uu = (xuu * normal).sum(dim=-1)
+    second_uv = (xuv * normal).sum(dim=-1)
+    second_vv = (xvv * normal).sum(dim=-1)
+
+    det_first = first_uu * first_vv - first_uv.square()
+    mean = (
+        second_uu * first_vv - 2.0 * second_uv * first_uv + second_vv * first_uu
+    ) / (2.0 * det_first)
+    gaussian = (second_uu * second_vv - second_uv.square()) / det_first
+    half_gap = (mean.square() - gaussian).clamp_min(0.0).sqrt()
+    return mean.abs() + half_gap
+
+
+def _mobius_max_abs_curvature(config: ToyManifoldConfig) -> torch.Tensor:
+    """Numerically maximize the Mobius strip's principal curvature."""
+
+    phi_values = torch.linspace(0.0, 2.0 * math.pi, 4_097, dtype=torch.float64)
+    width_values = torch.linspace(
+        -config.mobius_half_width,
+        config.mobius_half_width,
+        33,
+        dtype=torch.float64,
+    )
+    phi, width = torch.meshgrid(phi_values, width_values, indexing="ij")
+    phi = phi.flatten()
+    width = width.flatten()
+
+    cos_phi = torch.cos(phi)
+    sin_phi = torch.sin(phi)
+    cos_half = torch.cos(0.5 * phi)
+    sin_half = torch.sin(0.5 * phi)
+    radius = 1.0 + width * cos_half
+    radius_u = -0.5 * width * sin_half
+    radius_uu = -0.25 * width * cos_half
+
+    xu = torch.stack(
+        (
+            radius_u * cos_phi - radius * sin_phi,
+            radius_u * sin_phi + radius * cos_phi,
+            0.5 * width * cos_half,
+        ),
+        dim=-1,
+    )
+    xv = torch.stack((cos_half * cos_phi, cos_half * sin_phi, sin_half), dim=-1)
+    xuu = torch.stack(
+        (
+            radius_uu * cos_phi - 2.0 * radius_u * sin_phi - radius * cos_phi,
+            radius_uu * sin_phi + 2.0 * radius_u * cos_phi - radius * sin_phi,
+            -0.25 * width * sin_half,
+        ),
+        dim=-1,
+    )
+    xuv = torch.stack(
+        (
+            -0.5 * sin_half * cos_phi - cos_half * sin_phi,
+            -0.5 * sin_half * sin_phi + cos_half * cos_phi,
+            0.5 * cos_half,
+        ),
+        dim=-1,
+    )
+    xvv = torch.zeros_like(xu)
+    return _surface_max_abs_principal_curvature(xu, xv, xuu, xuv, xvv).max()
+
+
+def _raw_max_abs_curvatures(config: ToyManifoldConfig) -> torch.Tensor:
+    """Maximum extrinsic principal curvature of every unnormalized type."""
+
+    torus_curvature = max(
+        1.0 / config.torus_minor_radius,
+        1.0 / (config.torus_major_radius - config.torus_minor_radius),
+    )
+    closest_swiss_theta = (
+        0.0
+        if config.swiss_theta_min <= 0.0 <= config.swiss_theta_max
+        else min(abs(config.swiss_theta_min), abs(config.swiss_theta_max))
+    )
+    swiss_curvature = (closest_swiss_theta**2 + 2.0) / (
+        closest_swiss_theta**2 + 1.0
+    ) ** 1.5
+    helix_curvature = 1.0 / (1.0 + config.helix_alpha**2)
+
+    return torch.tensor(
+        (
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            torus_curvature,
+            _mobius_max_abs_curvature(config),
+            swiss_curvature,
+            helix_curvature,
+        ),
+        dtype=torch.float64,
+    )
+
+
 _Sampler = Callable[[int, torch.Generator, ToyManifoldConfig], torch.Tensor]
 _SAMPLERS: tuple[_Sampler, ...] = (
     _sample_segment,
@@ -285,6 +414,8 @@ def _make_split(
     stream: int,
     means: tuple[torch.Tensor, ...],
     scales: torch.Tensor,
+    noise_stds: torch.Tensor,
+    samplers: tuple[_Sampler, ...],
     embeddings: tuple[torch.Tensor, ...],
     offsets: torch.Tensor,
     manifold_type_ids: torch.Tensor,
@@ -298,11 +429,17 @@ def _make_split(
         if count == 0:
             continue
         type_id = int(manifold_type_ids[manifold_id])
-        raw = _SAMPLERS[type_id](
+        raw = samplers[type_id](
             count, _generator(config.seed, stream + manifold_id), config
         )
         normalized = (raw - means[type_id]) / scales[type_id]
         ambient = normalized @ embeddings[manifold_id] + offsets[manifold_id]
+        ambient += noise_stds[type_id] * torch.randn(
+            count,
+            config.ambient_dim,
+            generator=_generator(config.seed, stream + 2_000 + manifold_id),
+            dtype=torch.float64,
+        )
         samples.append(ambient)
         manifold_ids.append(
             torch.full((count,), manifold_id, dtype=torch.long)
@@ -323,8 +460,10 @@ def make_toy_manifold_datasets(
 
     The first tensor in each dataset is the ambient observation and the second
     is its manifold-instance ID. Train and validation independently sample
-    points from the same instances. This ordering lets the datasets pass
-    directly through a normal ``DataLoader`` into ``train_nll`` while retaining
+    noisy points from the same instances. Observation noise is isotropic in the
+    ambient space, with a type-specific standard deviation set by
+    ``config.noise_ratio``. This ordering lets the datasets pass directly
+    through a normal ``DataLoader`` into ``train_nll`` while retaining
     ground-truth instance membership for evaluation.
     """
 
@@ -333,9 +472,16 @@ def make_toy_manifold_datasets(
         raise TypeError("config must be a ToyManifoldConfig")
     _validate_config(config)
 
+    selected_type_ids = tuple(
+        MANIFOLD_NAMES.index(name) for name in config.manifold_types
+    )
+    samplers = tuple(_SAMPLERS[type_id] for type_id in selected_type_ids)
+    intrinsic_dims = tuple(INTRINSIC_DIMS[type_id] for type_id in selected_type_ids)
+    embedding_dims = tuple(EMBEDDING_DIMS[type_id] for type_id in selected_type_ids)
+
     means = []
     scales = []
-    for type_id, sampler in enumerate(_SAMPLERS):
+    for type_id, sampler in zip(selected_type_ids, samplers, strict=True):
         calibration = sampler(
             config.calibration_size,
             _generator(config.seed, 100 + type_id),
@@ -353,8 +499,19 @@ def make_toy_manifold_datasets(
     means_tuple = tuple(means)
     scales_tensor = torch.stack(scales)
 
-    num_manifolds = len(MANIFOLD_NAMES) * config.manifolds_per_type
-    manifold_type_ids = torch.arange(len(MANIFOLD_NAMES)).repeat_interleave(
+    raw_max_abs_curvatures = _raw_max_abs_curvatures(config)[list(selected_type_ids)]
+    max_abs_curvatures = raw_max_abs_curvatures * scales_tensor
+    # A flat manifold has infinite curvature radius. Its normalized RMS size is
+    # the only finite geometric scale available for adding nonzero noise.
+    curvature_radii = torch.where(
+        max_abs_curvatures > 0.0,
+        max_abs_curvatures.reciprocal(),
+        torch.ones_like(max_abs_curvatures),
+    )
+    noise_stds = curvature_radii / float(config.noise_ratio)
+
+    num_manifolds = len(config.manifold_types) * config.manifolds_per_type
+    manifold_type_ids = torch.arange(len(config.manifold_types)).repeat_interleave(
         config.manifolds_per_type
     )
     embeddings = []
@@ -363,7 +520,7 @@ def make_toy_manifold_datasets(
         embeddings.append(
             _orthonormal_embedding(
                 config.ambient_dim,
-                EMBEDDING_DIMS[type_id],
+                embedding_dims[type_id],
                 generator=_generator(config.seed, 200 + manifold_id),
             )
         )
@@ -378,6 +535,8 @@ def make_toy_manifold_datasets(
         stream=400,
         means=means_tuple,
         scales=scales_tensor,
+        noise_stds=noise_stds,
+        samplers=samplers,
         embeddings=embeddings_tuple,
         offsets=offsets,
         manifold_type_ids=manifold_type_ids,
@@ -388,6 +547,8 @@ def make_toy_manifold_datasets(
         stream=500,
         means=means_tuple,
         scales=scales_tensor,
+        noise_stds=noise_stds,
+        samplers=samplers,
         embeddings=embeddings_tuple,
         offsets=offsets,
         manifold_type_ids=manifold_type_ids,
@@ -400,9 +561,12 @@ def make_toy_manifold_datasets(
             {
                 "manifold_id": manifold_id,
                 "type_id": type_id,
-                "type_name": MANIFOLD_NAMES[type_id],
-                "intrinsic_dim": INTRINSIC_DIMS[type_id],
-                "embedding_dim": EMBEDDING_DIMS[type_id],
+                "type_name": config.manifold_types[type_id],
+                "intrinsic_dim": intrinsic_dims[type_id],
+                "embedding_dim": embedding_dims[type_id],
+                "max_abs_curvature": max_abs_curvatures[type_id],
+                "curvature_radius": curvature_radii[type_id],
+                "noise_std": noise_stds[type_id],
                 "position": offsets[manifold_id],
                 "embedding": embeddings_tuple[manifold_id],
             }
@@ -410,16 +574,22 @@ def make_toy_manifold_datasets(
     metadata: dict[str, object] = {
         "config": asdict(config),
         "num_manifolds": num_manifolds,
-        "manifold_types": MANIFOLD_NAMES,
-        "type_id_to_name": dict(enumerate(MANIFOLD_NAMES)),
+        "manifold_types": config.manifold_types,
+        "type_id_to_name": dict(enumerate(config.manifold_types)),
         "type_name_to_id": {
-            name: type_id for type_id, name in enumerate(MANIFOLD_NAMES)
+            name: type_id for type_id, name in enumerate(config.manifold_types)
         },
-        "intrinsic_dims": INTRINSIC_DIMS,
-        "embedding_dims": EMBEDDING_DIMS,
+        "intrinsic_dims": intrinsic_dims,
+        "embedding_dims": embedding_dims,
         "manifold_type_ids": manifold_type_ids,
         "calibration_means": means_tuple,
         "calibration_scales": scales_tensor,
+        "raw_max_abs_curvatures": raw_max_abs_curvatures,
+        "max_abs_curvatures": max_abs_curvatures,
+        "curvature_radii": curvature_radii,
+        "noise_stds": noise_stds,
+        "curvature_definition": "maximum absolute extrinsic principal curvature",
+        "flat_radius_convention": "unit RMS radius",
         "embeddings": embeddings_tuple,
         "offset_directions": offset_directions,
         "offsets": offsets,
@@ -471,6 +641,8 @@ def save_toy_manifold_shards(
     config = ToyManifoldConfig() if config is None else config
     train_dataset, val_dataset, metadata = make_toy_manifold_datasets(config)
     manifold_type_ids = metadata["manifold_type_ids"]
+    manifold_types = metadata["manifold_types"]
+    intrinsic_dims = metadata["intrinsic_dims"]
 
     root.mkdir(parents=True, exist_ok=True)
     layer_dir = root / f"layer{layer:02d}"
@@ -495,10 +667,10 @@ def save_toy_manifold_shards(
                 type_id = int(manifold_type_ids[manifold_id])
                 rows.append(
                     {
-                        "subset": MANIFOLD_NAMES[type_id],
+                        "subset": manifold_types[type_id],
                         "manifold_id": int(manifold_id),
                         "manifold_type_id": type_id,
-                        "intrinsic_dim": INTRINSIC_DIMS[type_id],
+                        "intrinsic_dim": intrinsic_dims[type_id],
                     }
                 )
 

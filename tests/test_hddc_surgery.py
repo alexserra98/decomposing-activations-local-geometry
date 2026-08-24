@@ -30,6 +30,7 @@ from dalg.models.adaptive_q.hddc_surgery import (  # noqa: E402
     accumulate_statistics,
     hddc_surgery,
     parameter_count,
+    reconstruct_components,
     reset_optimizer_state,
     surgery_params,
 )
@@ -41,7 +42,10 @@ from dalg.models.adaptive_q.mfa_hddc import (  # noqa: E402
     save_component_shard_hddc,
     save_mfa_hddc,
 )
-from dalg.models.adaptive_q.train_hddc import train_nll_hddc  # noqa: E402
+from dalg.models.adaptive_q.train_hddc import (  # noqa: E402
+    seed_training_checkpoint,
+    train_nll_hddc,
+)
 
 
 def _planted_gaussian(
@@ -83,6 +87,38 @@ def test_isotropic_psi_matches_equivalent_per_component_psi():
     assert torch.allclose(iso.nll(x), ref.nll(x))
 
 
+def test_shared_b_matches_identical_component_noise_and_has_one_gradient():
+    torch.manual_seed(101)
+    K, D, q = 5, 12, 4
+    centroids = torch.randn(K, D)
+    x = torch.randn(32, D)
+
+    shared = MFA_HDDC(centroids, rank=q, shared_b=True, psi_init=0.7)
+    per_component = MFA_HDDC(
+        centroids, rank=q, isotropic_psi=True, psi_init=0.7
+    )
+    per_component.dir_raw.data.copy_(shared.dir_raw.data)
+    per_component.scale_rho.data.copy_(shared.scale_rho.data)
+
+    assert shared.shared_b is True
+    assert shared.isotropic_psi is False
+    assert tuple(shared.psi_rho.shape) == (1,)
+    assert torch.allclose(shared._psi(), per_component._psi())
+    assert torch.allclose(shared.nll(x), per_component.nll(x))
+
+    shared.nll(x).backward()
+    assert tuple(shared.psi_rho.grad.shape) == (1,)
+    assert torch.isfinite(shared.psi_rho.grad).all()
+
+
+def test_shared_b_is_a_distinct_noise_mode():
+    centroids = torch.randn(3, 8)
+    with pytest.raises(ValueError, match="distinct noise mode"):
+        MFA_HDDC(centroids, rank=2, isotropic_psi=True, shared_b=True)
+    with pytest.raises(ValueError, match="distinct noise mode"):
+        MFA_HDDC(centroids, rank=2, psi_per_component=True, shared_b=True)
+
+
 def test_all_ones_mask_is_a_no_op():
     torch.manual_seed(1)
     K, D, q = 4, 10, 3
@@ -99,6 +135,18 @@ def test_all_ones_mask_is_a_no_op():
 def test_inference_cache_agrees_with_uncached_path_for_isotropic_psi():
     torch.manual_seed(2)
     model = MFA_HDDC(torch.randn(6, 16), rank=4, isotropic_psi=True)
+    model.rank_mask[2, 1] = 0.0
+    x = torch.randn(24, 16)
+    with torch.no_grad():
+        plain = model.log_prob_components(x)
+        with model.inference_cache():
+            cached = model.log_prob_components(x)
+    assert torch.allclose(plain, cached, atol=1e-4)
+
+
+def test_inference_cache_agrees_with_uncached_path_for_shared_b():
+    torch.manual_seed(102)
+    model = MFA_HDDC(torch.randn(6, 16), rank=4, shared_b=True)
     model.rank_mask[2, 1] = 0.0
     x = torch.randn(24, 16)
     with torch.no_grad():
@@ -139,6 +187,38 @@ def test_masking_a_column_equals_a_model_without_it():
     assert torch.allclose(full.nll(x), small.nll(x), atol=1e-5)
 
 
+def test_epoch_zero_checkpoint_restores_initial_model():
+    torch.manual_seed(42)
+    model = MFA_HDDC(torch.randn(3, 8), rank=2, isotropic_psi=True)
+    model.rank_mask[:, 1] = 0.0
+    x = torch.randn(20, 8)
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "checkpoint.pt"
+        initial_nll = seed_training_checkpoint(
+            model,
+            str(path),
+            lr=1e-3,
+            val_tensor=x,
+        )
+        saved = torch.load(path, map_location="cpu", weights_only=False)
+        restored = MFA_HDDC(torch.zeros(3, 8), rank=2, isotropic_psi=True)
+        train_nll_hddc(
+            restored,
+            [],
+            val_tensor=x,
+            epochs=1,
+            ckpt_path=str(path),
+        )
+
+    assert saved["epoch"] == 0
+    assert saved["best_epoch"] == 0
+    assert saved["optimizer"]["state"] == {}
+    assert saved["best_metric"] == pytest.approx(initial_nll)
+    assert torch.equal(restored.rank_mask, model.rank_mask)
+    assert torch.allclose(restored.nll(x), model.nll(x), atol=0.0, rtol=0.0)
+
+
 # --------------------------------------------------------------------------
 # Checkpoint round-trip
 # --------------------------------------------------------------------------
@@ -161,6 +241,40 @@ def test_mask_and_isotropic_psi_survive_save_load():
     assert torch.equal(loaded.rank_mask, model.rank_mask)
     assert loaded.component_ranks.tolist() == model.component_ranks.tolist()
     assert torch.allclose(loaded.nll(x), model.nll(x))
+
+
+def test_shared_b_survives_single_file_save_load():
+    torch.manual_seed(103)
+    model = MFA_HDDC(torch.randn(6, 14), rank=4, shared_b=True)
+    model.rank_mask[0, 3] = 0.0
+    x = torch.randn(16, 14)
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "mfa.pt"
+        save_mfa_hddc(model, str(path))
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+        loaded = load_mfa_hddc(path)
+
+    assert blob["meta"]["shared_b"] is True
+    assert loaded.shared_b is True
+    assert loaded.isotropic_psi is False
+    assert tuple(loaded.psi_rho.shape) == (1,)
+    assert torch.equal(loaded.rank_mask, model.rank_mask)
+    assert torch.allclose(loaded.nll(x), model.nll(x))
+
+
+def test_metadata_free_shared_b_is_inferred_from_shape():
+    model = MFA_HDDC(torch.randn(3, 8), rank=2, shared_b=True)
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "mfa.pt"
+        save_mfa_hddc(model, str(path))
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+        blob["meta"].pop("shared_b")
+        torch.save(blob, path)
+        loaded = load_mfa_hddc(path)
+
+    assert loaded.shared_b is True
+    assert tuple(loaded.psi_rho.shape) == (1,)
 
 
 def test_hddc_checkpoint_supports_assignment_analysis():
@@ -278,6 +392,85 @@ def test_surgery_recovers_a_planted_low_rank_covariance():
     assert float((U.T @ U_hat).pow(2).sum()) == pytest.approx(3.0, abs=1e-2)
 
 
+def test_shared_b_surgery_uses_membership_weighted_pooled_residual():
+    model = MFA_HDDC(torch.zeros(2, 4), rank=2, shared_b=True, psi_init=0.5)
+    N = torch.tensor([100.0, 25.0], dtype=torch.float64)
+    covariances = torch.stack(
+        [
+            torch.diag(torch.tensor([9.0, 4.0, 3.0, 3.0], dtype=torch.float64)),
+            torch.diag(torch.tensor([16.0, 9.0, 2.0, 2.0], dtype=torch.float64)),
+        ]
+    )
+    S_acc = covariances * N[:, None, None]
+
+    stats = reconstruct_components(
+        model,
+        N,
+        S_acc,
+        SurgeryConfig(enabled=True, every=1, threshold=0.2, min_count=1.0),
+    )
+
+    # Cattell selects d=[1, 2]. The pooled floor is
+    # (100*(19-9) + 25*(29-25)) / (100*3 + 25*2) = 22/7.
+    expected_b = 22.0 / 7.0
+    assert stats["d_k"].tolist() == [1, 2]
+    assert float(stats["b_shared"]) == pytest.approx(expected_b)
+    assert stats["b_k"].tolist() == pytest.approx([expected_b, expected_b])
+    assert float(model._psi()[0, 0].detach()) == pytest.approx(expected_b, rel=1e-6)
+    assert torch.equal(model._psi()[0], model._psi()[1])
+
+
+def test_hddc_surgery_reports_shared_b_without_dropping_b_k_mean():
+    x, mu, _U, _lam = _planted_gaussian(
+        D=16, d_true=2, b_true=0.05, n=20_000, seed=104
+    )
+    model = MFA_HDDC(mu[None, :], rank=4, shared_b=True)
+    summary = hddc_surgery(
+        model,
+        _batches(x),
+        SurgeryConfig(enabled=True, every=1, threshold=0.01, min_count=10.0),
+    )
+
+    assert summary["b_shared"] == pytest.approx(0.05, rel=0.1)
+    assert summary["b_k_mean"] == pytest.approx(summary["b_shared"])
+
+
+def test_shared_b_surgery_rejects_retained_eigenvalue_below_common_floor():
+    model = MFA_HDDC(torch.zeros(2, 4), rank=1, shared_b=True)
+    N = torch.tensor([100.0, 100.0], dtype=torch.float64)
+    covariances = torch.stack(
+        [
+            torch.diag(torch.tensor([1.0, 0.9, 0.9, 0.9], dtype=torch.float64)),
+            torch.diag(torch.tensor([100.0, 50.0, 50.0, 50.0], dtype=torch.float64)),
+        ]
+    )
+    S_acc = covariances * N[:, None, None]
+
+    with pytest.raises(RuntimeError, match=r"lambda=.* <= b="):
+        reconstruct_components(
+            model,
+            N,
+            S_acc,
+            SurgeryConfig(enabled=True, every=1, threshold=0.01, min_count=1.0),
+        )
+
+
+def test_shared_b_surgery_with_no_eligible_components_is_a_no_op():
+    model = MFA_HDDC(torch.zeros(2, 4), rank=2, shared_b=True)
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    stats = reconstruct_components(
+        model,
+        torch.tensor([1.0, 2.0], dtype=torch.float64),
+        torch.zeros(2, 4, 4, dtype=torch.float64),
+        SurgeryConfig(enabled=True, every=1, min_count=10.0),
+    )
+
+    assert stats["b_shared"] is None
+    assert stats["n_updated"] == 0
+    for key, value in model.state_dict().items():
+        assert torch.equal(value, before[key])
+
+
 def test_higher_threshold_selects_a_smaller_rank():
     x, mu, _U, _lam = _planted_gaussian(D=32, d_true=3, b_true=0.02)
     ranks = {}
@@ -366,9 +559,40 @@ def test_parameter_count_tracks_the_rank_mask():
     assert parameter_count(model) < full
 
 
+def test_parameter_count_counts_one_shared_b_parameter():
+    K, D, q = 4, 20, 5
+    shared = MFA_HDDC(torch.zeros(K, D), rank=q, shared_b=True)
+    per_component = MFA_HDDC(torch.zeros(K, D), rank=q, isotropic_psi=True)
+    assert parameter_count(shared) == parameter_count(per_component) - (K - 1)
+
+
 # --------------------------------------------------------------------------
 # Phase C and the training-loop hook
 # --------------------------------------------------------------------------
+
+
+def test_fractional_epoch_schedule_tracks_global_progress():
+    half = SurgeryConfig(enabled=True, every=0.5)
+    thirds = SurgeryConfig(enabled=True, every=0.3)
+    integer = SurgeryConfig(enabled=True, every=1)
+
+    assert [
+        step for step in range(1, 10) if half.active_after_batch(step, 9)
+    ] == [5]
+    assert half.active_at(1)
+    assert [
+        [
+            step
+            for step in range(1, 10)
+            if thirds.active_after_batch(step, 9, epoch=epoch)
+        ]
+        for epoch in range(1, 4)
+    ] == [[3, 6, 9], [2, 5, 8], [1, 4, 7]]
+    assert not thirds.active_at(1)
+    assert not thirds.active_at(2)
+    assert thirds.active_at(3)
+    assert not integer.active_after_batch(5, 9)
+    assert integer.active_at(1)
 
 
 def test_reset_optimizer_state_only_clears_surgery_params():
@@ -416,6 +640,37 @@ def test_train_nll_runs_surgery_on_schedule_without_blowing_up():
     # Every component sits on a planted rank-2 blob.
     assert model.component_ranks.tolist() == [2] * 6
     assert all(torch.isfinite(p).all() for p in model.parameters())
+
+
+def test_train_nll_runs_half_epoch_surgery_twice(monkeypatch):
+    import dalg.models.adaptive_q.hddc_surgery as surgery_module
+
+    torch.manual_seed(12)
+    batches = [torch.randn(8, 4) for _ in range(4)]
+    model = MFA_HDDC(torch.randn(2, 4), rank=1, isotropic_psi=True)
+    calls = []
+
+    def fake_surgery(model, loader, cfg, *, device=None, log=None):
+        calls.append(sum(batch.shape[0] for batch in loader))
+        return {
+            "d_k_hist": [0, model.K],
+            "d_k_per_component": [1] * model.K,
+        }
+
+    monkeypatch.setattr(surgery_module, "hddc_surgery", fake_surgery)
+    train_nll_hddc(
+        model,
+        batches,
+        surgery_loader=batches,
+        val_tensor=batches[0],
+        epochs=1,
+        steps_per_epoch=4,
+        early_stop_delta=0.0,
+        log_interval=10_000,
+        surgery=SurgeryConfig(enabled=True, every=0.5),
+    )
+
+    assert calls == [32, 32]
 
 
 def test_surgery_schedule_respects_enabled_and_every():

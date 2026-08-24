@@ -43,6 +43,7 @@ SURGERY_EVERY=${SURGERY_EVERY:-3}          # epochs between surgeries; 0 = fixed
 SURGERY_THRESHOLD=${SURGERY_THRESHOLD:-0.01}   # Cattell t, relative to the leading eigenvalue
 SURGERY_MIN_COUNT=${SURGERY_MIN_COUNT:-0}      # n_min; 0 => max(5 * q_max, 50)
 SURGERY_WARMUP=${SURGERY_WARMUP:-0}            # linear LR warmup steps after each surgery
+SHARED_B=${SHARED_B:-0}                        # 1 = one global b; 0 = per-component b_k
 
 OUT_DIR=${OUT_DIR:-"$MODELS_DIR/layer$(printf '%02d' "$LAYER")_${K}_${RANK}_mfa_hddc"}
 CENTROIDS_FROM=${CENTROIDS_FROM:-}         # optional: reuse centroids from an existing K-matched run
@@ -60,6 +61,11 @@ fi
 MAX_STEPS_FLAG=""
 [[ -n "$MAX_STEPS" ]] && MAX_STEPS_FLAG="--max-steps $MAX_STEPS"
 
+NOISE_FLAG="--isotropic-psi"
+if [[ "$SHARED_B" == "1" ]]; then
+    NOISE_FLAG="--shared-b"
+fi
+
 # ── Env ──────────────────────────────────────────────────────────────────
 REPO_ROOT=/u/dssc/zenocosini/decomposing-activations-local-geometry
 
@@ -75,16 +81,16 @@ echo "=== $(date) === job $SLURM_JOB_ID.$SLURM_ARRAY_TASK_ID on $(hostname) ==="
 echo "repo_root: $REPO_ROOT"
 echo "shard_dir: $SHARD_DIR   layer: $LAYER   out_dir: $OUT_DIR"
 echo "K=$K  q_max=$RANK  epochs=$EPOCHS  refine=$REFINE_EPOCHS  batch=$BATCH  num_workers=$NUM_WORKERS"
-echo "surgery: every=$SURGERY_EVERY  t=$SURGERY_THRESHOLD  n_min=$SURGERY_MIN_COUNT  warmup=$SURGERY_WARMUP"
+echo "surgery: every=$SURGERY_EVERY  t=$SURGERY_THRESHOLD  n_min=$SURGERY_MIN_COUNT  warmup=$SURGERY_WARMUP  shared_b=$SHARED_B"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 # ── Run ─────────────────────────────────────────────────────────────────
-# --isotropic-psi is required whenever surgery is on: the reconstruction
-# Sigma_k = W_k W_k^T + b_k I is exact only for isotropic noise.
+# Surgery requires isotropic noise. NOISE_FLAG selects the existing b_k model or
+# the single-process shared-b model.
 uv run python -m dalg.cli.adaptive_q.run_training_hddc \
     --shard-dir "$SHARD_DIR" --layer "$LAYER" --out-dir "$OUT_DIR" \
     --K "$K" --q-max "$RANK" --epochs "$EPOCHS" \
-    --isotropic-psi \
+    $NOISE_FLAG \
     --surgery-every-epochs "$SURGERY_EVERY" \
     --surgery-threshold "$SURGERY_THRESHOLD" \
     --surgery-min-count "$SURGERY_MIN_COUNT" \
