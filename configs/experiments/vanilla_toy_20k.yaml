@@ -2,7 +2,7 @@
 # The source toy-manifold activation shards must already exist.
 
 experiment:
-  name: adaptive_q_toy_20k_ard
+  name: vanilla_toy_20k
   output_root: dalg-cache/toy_manifold_models_20k/
 
 dataset:
@@ -13,15 +13,12 @@ dataset:
 model:
   kind: mfa
   K: 200
-  q_max: 16
-
+  rank: 16
 
 
 training:
-  # Reuse one initialization across runs by pointing at a compatible (K, D)
-  # .pt tensor file.
   centroids_path: /u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/toy_manifold_models_20k/centroids/kmedoids_k200/centroids.pt
-  epochs: 1000
+  epochs: 500
   early_stop_patience: 10
   early_stop_min_delta: 0.001
   early_stop_delta: 0.0
@@ -41,6 +38,11 @@ assignments:
   batch_size: 4096
   device: cuda
 
+evaluation:
+  enabled: true
+  kind: toy_manifold_tiling
+  batch_size: 4096
+  device: cuda
 
 resources:
   partition: H100

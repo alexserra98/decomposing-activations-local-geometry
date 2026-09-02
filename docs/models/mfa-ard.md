@@ -1,5 +1,9 @@
 # MFA-ARD
 
+> **Kind:** Model explanation · **Status:** Current · **Use when:** Working on
+> ARD rank shrinkage, training behavior, checkpoint compatibility, or rank
+> readout.
+
 `MFA_ARD` learns a **per-component rank** `q_k` by letting an ARD prior shrink
 whole columns of `W_k` to zero. It is a subclass of `MFA` that changes the
 *objective* and nothing else.
@@ -120,6 +124,33 @@ calls it.
 | Rank mechanism | — | continuous column shrinkage, thresholded post hoc |
 | Checkpoint | — | readable by `mfa.load_mfa` |
 
+## Implementation organization
+
+ARD is an intentionally separate research stack so it can evolve without
+changing the fixed-rank implementation in `mfa.py`, `train.py`, or
+`run_training.py`:
+
+- `src/dalg/models/adaptive_q/mfa_ard.py`: `MFA_ARD` and checkpoint helpers
+- `src/dalg/models/adaptive_q/train_ard.py`: `train_nll_ard` and
+  `ard_beta_schedule`
+- `src/dalg/cli/adaptive_q/run_training_ard.py`: the single-process
+  `dalg-run-training-ard` entrypoint
+- `scripts/slurm/adaptive_q/sbatch_train_ard.sh`: cluster launcher
+- `tests/test_mfa_ard.py`: model, schedule, training, and checkpoint coverage
+
+The `adaptive_q/` directories deliberately have no `__init__.py`; they are
+implicit namespace packages. The console script therefore resolves through the
+full `dalg.cli.adaptive_q.run_training_ard:main` path declared in
+`pyproject.toml`.
+
+ARD and HDDC currently remain redundant experimental implementations. The
+intention is to converge on one adaptive-rank route, delete the other, and fold
+the survivor back into the main model and CLI directories. The core ARD model
+is isolated, but the YAML pipeline and toy-manifold evaluator now select and
+load it explicitly. Before removing the variant, search the full repository for
+`model.kind: ard`, `MFA_ARD`, and `adaptive_q.run_training_ard` references in
+code, tests, configs, scripts, and entrypoints.
+
 ## Costs and failure modes
 
 - Rank is **soft**: the reported `q_k` depends on `--rank-threshold`, and a
@@ -129,4 +160,6 @@ calls it.
   of rank recovery — see `docs/experiments/adaptive-q-technical-card.md`.
 - Set `--rank` (i.e. `q_max`) generously; ARD can only remove columns.
 
-Related: `docs/models/mfa-hddc.md` (the alternative, hard-rank route).
+Related: [MFA-HDDC](mfa-hddc.md) (the alternative, hard-rank route) and the
+[adaptive-q technical card](../experiments/adaptive-q-technical-card.md)
+(measured results).

@@ -2,6 +2,8 @@
 
 This is the official repository for **“From Directions to Regions: Decomposing Activations in Language Models via Local Geometry”** (Or Shafran, Shaked Ronen, Omri Fahn, Shauli Ravfogel, Atticus Geiger, Mor Geva). 2026.
 
+Project documentation is organized from the [documentation hub](docs/README.md).
+
 We’ve uploaded an **end-to-end tutorial** that walks through the core MFA workflow:
 
 * **Training** an MFA on model activations

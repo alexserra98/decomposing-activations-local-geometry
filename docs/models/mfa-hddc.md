@@ -1,5 +1,8 @@
 # MFA-HDDC
 
+> **Kind:** Model explanation · **Status:** Current · **Use when:** Working on
+> HDDC covariance surgery, isotropic noise, rank masks, or HDDC checkpoints.
+
 `MFA_HDDC` learns a **per-component rank** `d_k` by periodically re-estimating
 each component's covariance in closed form and reading its rank off the
 eigenspectrum. Unlike the ARD path it is a self-contained fork of `mfa.py`,
@@ -76,24 +79,53 @@ from `train_nll` only by the `surgery=` argument and the block it gates. Every
   scale-free Cattell scree test on consecutive eigenvalue differences,
 
   ```text
-  d_k = max{ j <= q_max : (lam_j - lam_{j+1}) / lam_1 > threshold }
-  b_k = (Tr(S_k) - sum_{j<=d_k} lam_j) / (D - d_k)        # mean discarded eigenvalue
+  r_k = max{ j <= q_max : (lam_j - lam_{j+1}) / lam_1 > threshold }
+  b_k = (Tr(S_k) - sum_{j<=r_k} lam_j) / (D - r_k)        # mean discarded eigenvalue
   ```
 
   In shared-b mode, equation 5 of the HDDC paper pools eligible components:
 
   ```text
-  b = sum_k N_k (Tr(S_k) - sum_{j<=d_k} lam_kj)
-      / sum_k N_k (D - d_k)
+  b = sum_k N_k (Tr(S_k) - sum_{j<=r_k} lam_kj)
+      / sum_k N_k (D - r_k)
   ```
+
+  For component-specific `b_k`, the Cattell proposal is the final rank
+  `d_k = r_k`; surgery raises if an imposed numerical floor nevertheless
+  overtakes a retained eigenvalue. For shared `b`, the independently proposed
+  ranks can be inconsistent with the common absolute floor: reconstruction
+  requires every retained eigenvalue to satisfy `lam_kj > b`, because its
+  loading variance is `lam_kj - b`. Shared-b surgery therefore treats `r_k` as
+  a rank cap and runs an active-set solve. It starts with all `j > r_k` in the
+  pooled noise estimate, then considers optional directions `2 <= j <= r_k`
+  globally from smallest to largest eigenvalue. A candidate enters the noise
+  pool when `lam_kj <= b`; the weighted pooled floor is updated before
+  considering the next candidate. Once the next candidate is above `b`, all
+  larger candidates remain active. This ordering avoids the over-pruning that
+  would result from discarding every violation against the initial, higher
+  floor in one batch.
+
+  Direction one remains mandatory, preserving `d_k >= 1`. Surgery still fails
+  explicitly if the final floor reaches `lam_k1`, because that component would
+  require an unsupported rank-zero covariance. The active set is a feasibility
+  update conditional on Cattell's caps, not a replacement intrinsic-dimension
+  criterion. Surgery reports the initial `b_shared_at_cattell` and the numbers
+  of pruned directions and affected components for diagnosis. Before validating
+  or reconstructing loadings, it round-trips the selected floor through the
+  model dtype and `softplus(psi_rho) + model._eps`. The reported `b`, the strict
+  retained-eigenvalue check, and `sqrt(lam_j - b)` therefore all use the value
+  actually stored by the model rather than an idealized float64 target.
 
   The reconstruction uses `Sigma_k = W_k W_k^T + b_* I` with
   `scale_j = sqrt(lam_j - b_*)`. All `q_max` columns are written from the
   eigendecomposition and only the mask records `d_k`, so a later surgery can
   *raise* a component's rank with no revival logic. Components with
-  `N_k < n_min` (default `max(5 q_max, 50)`) do not contribute to the pooled
-  estimate and keep their directions and mask. Their covariance floor still
-  changes because `b` is global.
+  `N_k < n_min` do not contribute to the pooled estimate and keep their
+  directions and mask. The default `n_min = 0` disables this cutoff: every
+  component with positive soft responsibility mass is rewritten, including a
+  component with zero hard assignments. An exactly zero `N_k` cannot define an
+  empirical covariance and raises explicitly. Skipped components' covariance
+  floor still changes because `b` is global.
 - **C — optimizer hygiene.** Adam state for the rewritten tensors (`dir_raw`,
   `scale_rho`, `psi_rho`) is dropped, optionally followed by a short LR warmup.
   State for `mu` and `pi_logits` is preserved.
@@ -119,6 +151,41 @@ be thrown away by the end-of-run rollback.
 Set `--surgery-every-epochs 0` for a fixed-`q` baseline on the identical stack —
 that is the control an adaptive-rank claim needs.
 
+## Implementation organization
+
+HDDC is a self-contained research fork so its changed parameter shapes and
+periodic surgery do not modify `mfa.py`, `train.py`, or `run_training.py`:
+
+- `src/dalg/models/adaptive_q/mfa_hddc.py`: full and component-sharded models,
+  masks, and checkpoint helpers
+- `src/dalg/models/adaptive_q/hddc_surgery.py`: statistics, reconstruction,
+  parameter selection, and optimizer-state reset
+- `src/dalg/models/adaptive_q/train_hddc.py`: the training-loop fork gated by a
+  `surgery` configuration
+- `src/dalg/cli/adaptive_q/run_training_hddc.py`: the
+  `dalg-run-training-hddc` entrypoint
+- `scripts/slurm/adaptive_q/sbatch_train_hddc.sh`: cluster launcher
+- `tests/test_hddc_surgery.py`: model, surgery, training, sharding, and
+  checkpoint coverage
+
+The CLI supports `single_process`, where one process owns the full model, and
+`component_shard`, which partitions components across CUDA processes. Reserve
+`vanilla` for the original fixed-rank MFA implementation. Shared `b`, warm-start
+from a full model, and fractional-epoch surgery are single-process-only.
+
+The `adaptive_q/` directories deliberately have no `__init__.py`; they are
+implicit namespace packages. The console script resolves through the full
+`dalg.cli.adaptive_q.run_training_hddc:main` path declared in `pyproject.toml`.
+
+ARD and HDDC currently remain redundant experimental implementations. The
+intention is to converge on one adaptive-rank route, delete the other, and fold
+the survivor back into the main model and CLI directories. The core HDDC stack
+is isolated, but the YAML pipeline, toy-manifold evaluator, assignment loader,
+configs, and temporary experiment scripts now integrate it. Before removing the
+variant, search the full repository for `model.kind: hddc`, `MFA_HDDC`,
+`hddc_surgery`, and `adaptive_q.run_training_hddc`; removal is no longer only a
+five-file deletion.
+
 ## Costs and failure modes
 
 - **Checkpoint incompatibility.** The mask and isotropic `psi_rho` shapes make an
@@ -137,12 +204,17 @@ that is the control an adaptive-rank claim needs.
 - **Shared-b is deliberately single-process.** It is rejected with
   `training_mode=component_shard`; component-sharded checkpoints retain their
   existing noise modes and formats.
-- **The shared floor must remain below every retained eigenvalue.** Surgery
-  fails with the offending component and direction if this model constraint is
-  violated, rather than reporting a rank whose loading variance is zero.
+- **The shared floor must remain below every retained eigenvalue.** The active
+  set removes optional Cattell directions that do not clear the jointly updated
+  floor. Surgery still fails with the offending component if even its mandatory
+  first eigenvalue is not above `b`; clamping would report a rank-one component
+  whose only loading variance was actually zero.
 - On noiseless data, `b_k` is driven to the numerical floor and the NLL goes
   strongly negative; do not compare it naively with noisy-data likelihoods.
 
-Related: `docs/models/mfa-ard.md` (the soft-shrinkage route),
-`docs/experiments/hddc-rank-surgery.md` (how to run and read a run),
-`docs/experiments/adaptive-q-technical-card.md` (measured results).
+Related: [MFA-ARD](mfa-ard.md) (the soft-shrinkage route),
+[HDDC rank surgery](../experiments/hddc-rank-surgery.md) (how to run and read a
+run), [adaptive-q technical card](../experiments/adaptive-q-technical-card.md)
+(measured results), and the
+[toy-manifold dataset reference](../reference/toy-manifold-dataset.md)
+(validation data).

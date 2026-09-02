@@ -1,8 +1,8 @@
-# Small end-to-end smoke run: train -> assignments -> adaptive-q evaluation.
+# Small end-to-end smoke run: train -> assignments -> toy-manifold tiling evaluation.
 # The source toy-manifold activation shards must already exist.
 
 experiment:
-  name: adaptive_q_toy_pipeline_smoke
+  name: toy_manifold_tiling_pipeline_smoke
   output_root: dalg-cache/toy_manifold_models/experiments
 
 dataset:
@@ -42,7 +42,7 @@ assignments:
 
 evaluation:
   enabled: true
-  kind: adaptive_q_toy
+  kind: toy_manifold_tiling
   batch_size: 4096
   device: cuda
 

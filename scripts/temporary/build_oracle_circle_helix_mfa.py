@@ -16,6 +16,11 @@ from typing import Any
 
 import torch
 
+from dalg.data.shard_activations import (
+    load_meta_index,
+    per_subset_counts,
+    stratified_split,
+)
 from dalg.models.adaptive_q.mfa_hddc import (
     MFA_HDDC,
     load_mfa_hddc,
@@ -31,6 +36,8 @@ LAYER = 0
 EPS_FLOOR = 1e-12
 MAX_PROJECTION_RESIDUAL_NOISE_STDS = 8.0
 TANGENT_ALIGNMENT_TOL = 0.999
+VAL_FRAC = 0.05
+SPLIT_SEED = 42
 
 
 def _inverse_softplus(value: torch.Tensor) -> torch.Tensor:
@@ -400,34 +407,35 @@ def _validate_model(
     return total_nll / len(points)
 
 
-def _save_split_info(output_dir: Path, shard_config: dict[str, Any]) -> None:
-    """Record the generator's held-out stream in the training-run schema."""
-    generator_config = shard_config["generator_config"]
-    n_train = int(generator_config["n_train"])
-    n_val = int(generator_config["n_val"])
-    if n_train + n_val != EXPECTED_NUM_POINTS:
-        raise ValueError("generator train/validation sizes do not cover the dataset")
-    if n_train % 2 or n_val % 2:
-        raise ValueError("circle/helix train and validation streams must be balanced")
+def _save_split_info(
+    output_dir: Path,
+    shard_dir: Path,
+    shard_config: dict[str, Any],
+) -> None:
+    """Record the standard shard split in the training-run schema."""
+    meta_index = load_meta_index(shard_dir, layer=LAYER)
+    train_positions, val_positions = stratified_split(
+        meta_index,
+        val_frac=VAL_FRAC,
+        seed=SPLIT_SEED,
+    )
 
     split_info = {
-        "seed": int(generator_config["seed"]),
-        "val_frac": n_val / EXPECTED_NUM_POINTS,
+        "seed": SPLIT_SEED,
+        "val_frac": VAL_FRAC,
         "per_row_tokens": int(shard_config["window"])
         - int(shard_config["drop_prefix"]),
-        "train_rows": n_train,
-        "val_rows": n_val,
-        "train_per_subset": {
-            name: n_train // 2 for name in EXPECTED_MANIFOLD_NAMES
-        },
-        "val_per_subset": {
-            name: n_val // 2 for name in EXPECTED_MANIFOLD_NAMES
-        },
-        "val_global_rows": list(range(n_train, n_train + n_val)),
+        "train_rows": len(train_positions),
+        "val_rows": len(val_positions),
+        "train_per_subset": per_subset_counts(meta_index, train_positions),
+        "val_per_subset": per_subset_counts(meta_index, val_positions),
+        "val_global_rows": [
+            meta_index[position]["global_row"] for position in val_positions
+        ],
         "world_size": 1,
         "training_mode": "parametric_oracle",
         "component_shard": False,
-        "split_kind": "generated_train_then_generated_val",
+        "split_kind": "stratified_by_subset",
     }
     (output_dir / "val_indices.json").write_text(
         json.dumps(split_info, indent=2) + "\n"
@@ -455,7 +463,7 @@ def _save_outputs(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(means, output_dir / "centroids.pt")
-    _save_split_info(output_dir, shard_config)
+    _save_split_info(output_dir, shard_dir, shard_config)
     save_mfa_hddc(
         model,
         str(output_dir / "mfa_model.pt"),
@@ -508,7 +516,7 @@ def _save_outputs(
                 "layer": LAYER,
                 "drop_prefix": int(shard_config["drop_prefix"]),
                 "num_items": int(assignments.numel()),
-                "canonical_order": "generated_train_then_generated_val",
+                "canonical_order": "generated",
                 "component_order": "circle_000_099_then_helix_100_199",
             },
         },

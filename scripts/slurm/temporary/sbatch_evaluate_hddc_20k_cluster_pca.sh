@@ -42,13 +42,13 @@ import json
 import sys
 from pathlib import Path
 
-from dalg.analysis.adaptive_q_evaluation import evaluate_adaptive_q_toy
+from dalg.evaluation.toy_manifold_tiling import evaluate_toy_manifold_tiling
 from dalg.pipeline import _write_json_atomic
 
 run_dir = Path(sys.argv[1])
 shard_dir = Path(sys.argv[2])
 run_spec = json.loads((run_dir / "run_spec.json").read_text())
-metrics = evaluate_adaptive_q_toy(
+metrics = evaluate_toy_manifold_tiling(
     run_dir,
     shard_dir=shard_dir,
     layer=0,
@@ -63,4 +63,3 @@ metrics_path = run_dir / "metrics.json"
 _write_json_atomic(metrics_path, metrics)
 print(f"Metrics saved to {metrics_path}")
 PY
-

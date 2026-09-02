@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from dalg.data import (
     ToyManifoldConfig,
-    make_toy_manifold_datasets,
+    make_toy_manifold_dataset,
     save_toy_manifold_shards,
 )
 from dalg.data.shard_activations import ActivationBatchDataset, load_meta_index
@@ -27,8 +27,7 @@ from dalg.models.train import train_nll
 def _tiny_config(**overrides) -> ToyManifoldConfig:
     config = ToyManifoldConfig(
         ambient_dim=16,
-        n_train=80,
-        n_val=40,
+        n_samples=120,
         calibration_size=256,
         seed=17,
     )
@@ -36,20 +35,13 @@ def _tiny_config(**overrides) -> ToyManifoldConfig:
 
 
 def test_shapes_dtypes_labels_and_metadata() -> None:
-    train, val, metadata = make_toy_manifold_datasets(
-        _tiny_config(n_train=83, n_val=41)
-    )
-    x_train, y_train = train.tensors
-    x_val, y_val = val.tensors
+    dataset, metadata = make_toy_manifold_dataset(_tiny_config(n_samples=124))
+    points, manifold_ids = dataset.tensors
 
-    assert isinstance(train, TensorDataset)
-    assert isinstance(val, TensorDataset)
-    assert x_train.shape == (83, 16)
-    assert x_val.shape == (41, 16)
-    assert x_train.dtype == torch.float32
-    assert x_val.dtype == torch.float32
-    assert y_train.dtype == torch.long
-    assert y_val.dtype == torch.long
+    assert isinstance(dataset, TensorDataset)
+    assert points.shape == (124, 16)
+    assert points.dtype == torch.float32
+    assert manifold_ids.dtype == torch.long
     assert metadata["num_manifolds"] == 64
     assert tuple(metadata["manifold_types"]) == MANIFOLD_NAMES
     assert tuple(metadata["intrinsic_dims"]) == INTRINSIC_DIMS
@@ -73,10 +65,8 @@ def test_shapes_dtypes_labels_and_metadata() -> None:
         torch.full((8,), 10_000.0, dtype=torch.float64),
     )
 
-    train_counts = torch.bincount(y_train, minlength=64)
-    val_counts = torch.bincount(y_val, minlength=64)
-    assert int(train_counts.max() - train_counts.min()) <= 1
-    assert int(val_counts.max() - val_counts.min()) <= 1
+    counts = torch.bincount(manifold_ids, minlength=64)
+    assert int(counts.max() - counts.min()) <= 1
 
     manifolds = metadata["manifolds"]
     assert len(manifolds) == 64
@@ -98,20 +88,18 @@ def test_shapes_dtypes_labels_and_metadata() -> None:
 
 def test_selected_manifold_types() -> None:
     config = _tiny_config(
-        n_train=20,
-        n_val=10,
+        n_samples=30,
         manifolds_per_type=1,
         manifold_types=("circle", "helix"),
     )
-    train, val, metadata = make_toy_manifold_datasets(config)
+    dataset, metadata = make_toy_manifold_dataset(config)
 
     assert metadata["manifold_types"] == ("circle", "helix")
     assert metadata["intrinsic_dims"] == (1, 1)
     assert metadata["embedding_dims"] == (2, 3)
     assert metadata["num_manifolds"] == 2
     assert torch.equal(metadata["manifold_type_ids"], torch.tensor([0, 1]))
-    assert torch.bincount(train.tensors[1], minlength=2).tolist() == [10, 10]
-    assert torch.bincount(val.tensors[1], minlength=2).tolist() == [5, 5]
+    assert torch.bincount(dataset.tensors[1], minlength=2).tolist() == [15, 15]
     assert [item["type_name"] for item in metadata["manifolds"]] == [
         "circle",
         "helix",
@@ -120,20 +108,18 @@ def test_selected_manifold_types() -> None:
 
 def test_generation_is_deterministic_and_seeded() -> None:
     config = _tiny_config()
-    train_a, val_a, metadata_a = make_toy_manifold_datasets(config)
-    train_b, val_b, metadata_b = make_toy_manifold_datasets(config)
-    train_c, _, _ = make_toy_manifold_datasets(replace(config, seed=config.seed + 1))
+    dataset_a, metadata_a = make_toy_manifold_dataset(config)
+    dataset_b, metadata_b = make_toy_manifold_dataset(config)
+    dataset_c, _ = make_toy_manifold_dataset(replace(config, seed=config.seed + 1))
 
-    for tensors_a, tensors_b in (
-        (train_a.tensors, train_b.tensors),
-        (val_a.tensors, val_b.tensors),
-    ):
-        assert all(torch.equal(a, b) for a, b in zip(tensors_a, tensors_b))
+    assert all(
+        torch.equal(a, b) for a, b in zip(dataset_a.tensors, dataset_b.tensors)
+    )
     assert all(
         torch.equal(a, b)
         for a, b in zip(metadata_a["embeddings"], metadata_b["embeddings"])
     )
-    assert not torch.equal(train_a.tensors[0], train_c.tensors[0])
+    assert not torch.equal(dataset_a.tensors[0], dataset_c.tensors[0])
 
 
 def test_raw_curvatures_match_manifold_geometry() -> None:
@@ -144,7 +130,7 @@ def test_raw_curvatures_match_manifold_geometry() -> None:
         swiss_theta_max=5.0,
         helix_alpha=0.5,
     )
-    _, _, metadata = make_toy_manifold_datasets(config)
+    _, metadata = make_toy_manifold_dataset(config)
     curvatures = metadata["raw_max_abs_curvatures"]
 
     assert torch.equal(curvatures[[0, 2]], torch.zeros(2, dtype=torch.float64))
@@ -161,7 +147,7 @@ def test_raw_curvatures_match_manifold_geometry() -> None:
 
 
 def test_instances_have_independent_embeddings_and_offset_directions() -> None:
-    _, _, metadata = make_toy_manifold_datasets(_tiny_config(offset_radius=2.0))
+    _, metadata = make_toy_manifold_dataset(_tiny_config(offset_radius=2.0))
 
     for manifold in metadata["manifolds"]:
         local_dim = manifold["embedding_dim"]
@@ -191,15 +177,14 @@ def test_instances_have_independent_embeddings_and_offset_directions() -> None:
 
 
 def test_centered_manifolds_have_zero_mean_and_unit_rms() -> None:
-    train, _, _ = make_toy_manifold_datasets(
+    dataset, _ = make_toy_manifold_dataset(
         _tiny_config(
-            n_train=128_000,
-            n_val=80,
+            n_samples=128_000,
             calibration_size=30_000,
             offset_radius=0.0,
         )
     )
-    x, manifold_ids = train.tensors
+    x, manifold_ids = dataset.tensors
 
     for manifold_id in range(64):
         points = x[manifold_ids == manifold_id]
@@ -209,16 +194,15 @@ def test_centered_manifolds_have_zero_mean_and_unit_rms() -> None:
 
 
 def test_ambient_noise_matches_curvature_scaled_standard_deviation() -> None:
-    train, _, metadata = make_toy_manifold_datasets(
+    dataset, metadata = make_toy_manifold_dataset(
         _tiny_config(
-            n_train=6_400,
-            n_val=80,
+            n_samples=6_400,
             calibration_size=2_000,
             offset_radius=2.0,
             noise_ratio=1_000.0,
         )
     )
-    points, manifold_ids = train.tensors
+    points, manifold_ids = dataset.tensors
     normalized_normal_energy = []
 
     for manifold in metadata["manifolds"]:
@@ -246,38 +230,31 @@ def test_ambient_noise_matches_curvature_scaled_standard_deviation() -> None:
 
 def test_offset_condition_differs_only_by_manifold_offset() -> None:
     centered_config = _tiny_config(
-        n_train=160,
-        n_val=80,
+        n_samples=240,
         calibration_size=1_000,
         offset_radius=0.0,
     )
     separated_config = replace(centered_config, offset_radius=2.0)
-    centered_train, centered_val, centered_metadata = make_toy_manifold_datasets(
-        centered_config
-    )
-    separated_train, separated_val, separated_metadata = make_toy_manifold_datasets(
-        separated_config
-    )
+    centered, centered_metadata = make_toy_manifold_dataset(centered_config)
+    separated, separated_metadata = make_toy_manifold_dataset(separated_config)
 
     assert torch.count_nonzero(centered_metadata["offsets"]) == 0
-    for centered, separated in (
-        (centered_train, separated_train),
-        (centered_val, separated_val),
-    ):
-        x_centered, ids_centered = centered.tensors
-        x_separated, ids_separated = separated.tensors
-        assert torch.equal(ids_centered, ids_separated)
-        expected = separated_metadata["offsets"].float()[ids_centered]
-        assert torch.allclose(
-            x_separated - x_centered, expected, atol=5e-7, rtol=1e-6
-        )
+    x_centered, ids_centered = centered.tensors
+    x_separated, ids_separated = separated.tensors
+    assert torch.equal(ids_centered, ids_separated)
+    expected = separated_metadata["offsets"].float()[ids_centered]
+    assert torch.allclose(
+        x_separated - x_centered, expected, atol=5e-7, rtol=1e-6
+    )
 
 
 def test_tensor_dataset_runs_through_train_nll() -> None:
-    train, val, _ = make_toy_manifold_datasets(_tiny_config())
-    x_train, _ = train.tensors
-    x_val, _ = val.tensors
-    loader = DataLoader(train, batch_size=16, shuffle=False)
+    dataset, _ = make_toy_manifold_dataset(_tiny_config())
+    x, y = dataset.tensors
+    x_train, x_val = x[:-16], x[-16:]
+    loader = DataLoader(
+        TensorDataset(x_train, y[:-16]), batch_size=16, shuffle=False
+    )
     model = MFA(x_train[:4].clone(), rank=1, psi_init=0.5)
 
     train_nll(
@@ -295,8 +272,8 @@ def test_tensor_dataset_runs_through_train_nll() -> None:
 
 
 def test_shard_writer_matches_activation_training_protocol(tmp_path) -> None:
-    config = _tiny_config(n_train=83, n_val=41)
-    expected_train, expected_val, expected_metadata = make_toy_manifold_datasets(config)
+    config = _tiny_config(n_samples=124)
+    expected_dataset, expected_metadata = make_toy_manifold_dataset(config)
     root = save_toy_manifold_shards(
         tmp_path / "toy_manifold_shards",
         config,
@@ -312,7 +289,7 @@ def test_shard_writer_matches_activation_training_protocol(tmp_path) -> None:
     assert shard_config["d_model"] == 16
     assert shard_config["dtype"] == "float32"
     assert shard_config["num_rows"] == 124
-    assert shard_config["num_shards"] == 6
+    assert shard_config["num_shards"] == 5
     assert not (root / "tokens").exists()
 
     shard_paths = sorted((root / "layer00").glob("shard_*.pt"))
@@ -351,19 +328,16 @@ def test_shard_writer_matches_activation_training_protocol(tmp_path) -> None:
         shuffle_within_shard=False,
     )
     streamed = torch.cat(list(dataset))
-    expected_points = torch.cat(
-        (expected_train.tensors[0], expected_val.tensors[0])
-    )
     assert dataset.num_items == 124
-    assert torch.equal(streamed, expected_points)
+    assert torch.equal(streamed, expected_dataset.tensors[0])
 
     saved_metadata = torch.load(
         root / "manifold_metadata.pt", map_location="cpu", weights_only=True
     )
-    expected_ids = torch.cat(
-        (expected_train.tensors[1], expected_val.tensors[1])
+    assert torch.equal(
+        saved_metadata["row_manifold_ids"], expected_dataset.tensors[1]
     )
-    assert torch.equal(saved_metadata["row_manifold_ids"], expected_ids)
+    assert saved_metadata["canonical_order"] == "generated"
     assert torch.equal(
         saved_metadata["manifold_type_ids"],
         expected_metadata["manifold_type_ids"],
@@ -384,8 +358,7 @@ def test_shard_writer_rejects_nonempty_output(tmp_path) -> None:
     ("overrides", "message"),
     [
         ({"ambient_dim": 2}, "ambient_dim"),
-        ({"n_train": 0}, "n_train"),
-        ({"n_val": 0}, "n_val"),
+        ({"n_samples": 0}, "n_samples"),
         ({"calibration_size": 1}, "calibration_size"),
         ({"manifolds_per_type": 0}, "manifolds_per_type"),
         ({"manifold_types": ()}, "manifold_types"),
@@ -402,9 +375,9 @@ def test_shard_writer_rejects_nonempty_output(tmp_path) -> None:
 )
 def test_invalid_configs_raise_clear_errors(overrides, message) -> None:
     with pytest.raises((TypeError, ValueError), match=message):
-        make_toy_manifold_datasets(_tiny_config(**overrides))
+        make_toy_manifold_dataset(_tiny_config(**overrides))
 
 
 def test_non_finite_geometry_is_rejected() -> None:
     with pytest.raises(ValueError, match="finite"):
-        make_toy_manifold_datasets(_tiny_config(swiss_theta_max=float("inf")))
+        make_toy_manifold_dataset(_tiny_config(swiss_theta_max=float("inf")))

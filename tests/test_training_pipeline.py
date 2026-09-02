@@ -344,6 +344,42 @@ def test_hddc_fractional_epoch_surgery_is_forwarded(tmp_path: Path) -> None:
     assert command[option + 1] == "0.3"
 
 
+def test_hddc_zero_surgery_min_count_disables_the_cutoff(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    config = _config(tmp_path, shard_dir)
+    config["model"] = {
+        "kind": "hddc",
+        "K": 2,
+        "q_max": 1,
+        "shared_b": True,
+        "surgery_every_epochs": 1,
+        "surgery_min_count": 0,
+    }
+
+    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+    command = _training_command(run)
+
+    assert run["training"]["arguments"]["surgery_min_count"] == 0.0
+    option = command.index("--surgery-min-count")
+    assert command[option + 1] == "0.0"
+
+
+def test_hddc_negative_surgery_min_count_is_rejected(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    config = _config(tmp_path, shard_dir)
+    config["model"] = {
+        "kind": "hddc",
+        "K": 2,
+        "q_max": 1,
+        "shared_b": True,
+        "surgery_every_epochs": 1,
+        "surgery_min_count": -1,
+    }
+
+    with pytest.raises(PipelineConfigError, match="finite and non-negative"):
+        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+
+
 def test_hddc_shared_b_warm_start_requires_the_same_noise_mode(tmp_path: Path) -> None:
     shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
     initial_path = tmp_path / "mfa_model.pt"
@@ -378,7 +414,30 @@ def test_hddc_shared_b_rejects_component_sharding(tmp_path: Path) -> None:
     )
     config["resources"].update({"gpus": 2, "gpu_type": "H100"})
 
-    with pytest.raises(PipelineConfigError, match="shared-b supports.*vanilla only"):
+    with pytest.raises(PipelineConfigError, match="shared-b supports.*single_process only"):
+        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+
+
+def test_hddc_defaults_to_single_process_training_mode(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    config = _config(tmp_path, shard_dir)
+    config["model"] = {"kind": "hddc", "K": 2, "q_max": 1}
+
+    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+    command = _training_command(run)
+
+    assert run["training"]["arguments"]["training_mode"] == "single_process"
+    option = command.index("--training-mode")
+    assert command[option + 1] == "single_process"
+
+
+def test_hddc_rejects_vanilla_as_a_training_mode(tmp_path: Path) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    config = _config(tmp_path, shard_dir)
+    config["model"] = {"kind": "hddc", "K": 2, "q_max": 1}
+    config["training"]["training_mode"] = "vanilla"
+
+    with pytest.raises(PipelineConfigError, match="invalid hddc training parameters"):
         resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
@@ -642,13 +701,51 @@ def test_real_shared_b_pipeline_smoke(tmp_path: Path) -> None:
     assert saved_config["shared_b"] is True
 
 
-def test_real_adaptive_q_pipeline_runs_end_to_end(tmp_path: Path) -> None:
+def test_toy_manifold_tiling_evaluation_accepts_vanilla_mfa_config(
+    tmp_path: Path,
+) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    config = _config(tmp_path, shard_dir)
+    config["evaluation"] = {
+        "enabled": True,
+        "kind": "toy_manifold_tiling",
+        "device": "cpu",
+    }
+
+    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+
+    assert run["training"]["model_kind"] == "mfa"
+    assert run["evaluation"]["kind"] == "toy_manifold_tiling"
+    assert run["evaluation"]["rank_threshold"] == 1.0
+    assert run["evaluation"]["max_mean_to_manifold_distance"] == 0.1
+
+
+@pytest.mark.parametrize("distance", [0.0, -0.1, float("inf"), float("nan")])
+def test_toy_manifold_tiling_rejects_invalid_mean_distance(
+    tmp_path: Path,
+    distance: float,
+) -> None:
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    config = _config(tmp_path, shard_dir)
+    config["evaluation"] = {
+        "enabled": True,
+        "kind": "toy_manifold_tiling",
+        "max_mean_to_manifold_distance": distance,
+    }
+
+    with pytest.raises(
+        PipelineConfigError,
+        match="max_mean_to_manifold_distance must be finite and positive",
+    ):
+        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+
+
+def test_real_toy_manifold_tiling_pipeline_runs_end_to_end(tmp_path: Path) -> None:
     shard_dir = save_toy_manifold_shards(
         tmp_path / "toy_shards",
         ToyManifoldConfig(
             ambient_dim=8,
-            n_train=64,
-            n_val=32,
+            n_samples=96,
             calibration_size=32,
             manifolds_per_type=1,
             offset_radius=2.0,
@@ -676,7 +773,7 @@ def test_real_adaptive_q_pipeline_runs_end_to_end(tmp_path: Path) -> None:
     config["assignments"].update({"batch_size": 32})
     config["evaluation"] = {
         "enabled": True,
-        "kind": "adaptive_q_toy",
+        "kind": "toy_manifold_tiling",
         "batch_size": 32,
         "device": "cpu",
     }
@@ -685,8 +782,45 @@ def test_real_adaptive_q_pipeline_runs_end_to_end(tmp_path: Path) -> None:
     run_dir = execute_run(run)
 
     metrics = json.loads((run_dir / "metrics.json").read_text())
-    assert metrics["evaluation"] == "adaptive_q_toy"
+    assert metrics["schema_version"] == 1
+    assert metrics["evaluation"] == "toy_manifold_tiling"
+    assert metrics["rank"]["threshold"] == 1.0
+    assert metrics["association"]["max_mean_to_manifold_distance"] == 0.1
     assert metrics["identity_hash"] == run["identity_hash"]
     assert metrics["dataset"]["selected_rows"] == 96
+    assert metrics["bic"]["n"] == metrics["dataset"]["train_rows"]
+    assert metrics["bic"]["parameters"] > 0
+    assert metrics["bic"]["convention"] == "lower_is_better"
+    assert torch.isfinite(torch.tensor(metrics["bic"]["value"]))
+    association_counts = sum(
+        metrics["association"][key]
+        for key in (
+            "associated_components",
+            "outside_cutoff_components",
+            "ambiguous_components",
+        )
+    )
+    assert association_counts == metrics["K"]
+    assert len(metrics["per_manifold"]) == 8
+    assert sum(
+        manifold["components"]["associated"]
+        for manifold in metrics["per_manifold"]
+    ) == metrics["association"]["associated_components"]
+    alignment = metrics["tangent_alignment"]
+    assert alignment["definition"] == (
+        "leading_intrinsic_dim_covariance_subspace_principal_angles"
+    )
+    containment = metrics["tangent_containment"]
+    assert containment["definition"] == (
+        "leading_effective_rank_covariance_subspace_principal_angles"
+    )
+    for metric in (alignment, containment):
+        for score_name in ("subspace_overlap", "worst_direction_cosine"):
+            summary = metric[score_name]
+            assert summary["valid_components"] + summary["undefined_components"] == (
+                metrics["association"]["associated_components"]
+            )
+            if summary["mean"] is not None:
+                assert 0.0 <= summary["mean"] <= 1.0
     assert (run_dir / "EVALUATION_COMPLETED.json").is_file()
     assert pipeline_status([run])[0]["pipeline"] is True

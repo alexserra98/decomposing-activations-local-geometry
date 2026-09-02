@@ -13,6 +13,7 @@ import copy
 import hashlib
 import itertools
 import json
+import math
 import os
 import re
 import shlex
@@ -70,6 +71,8 @@ _EVALUATION_DEFAULTS = {
     "kind": None,
     "batch_size": 4096,
     "device": "cuda",
+    "rank_threshold": 1.0,
+    "max_mean_to_manifold_distance": 0.1,
 }
 
 
@@ -513,7 +516,8 @@ def resolve_run(config: Mapping[str, Any], *, check_inputs: bool = True) -> dict
     if "init_model_path" in values:
         values["init_model_path"] = _resolve_init_model_path(values["init_model_path"])
 
-    training_mode = str(values.get("training_mode", "vanilla"))
+    default_training_mode = "single_process" if model_kind == "hddc" else "vanilla"
+    training_mode = str(values.get("training_mode", default_training_mode))
     world_size = resources["gpus"] if training_mode == "component_shard" else 1
     if training_mode == "component_shard" and resources["gpus"] <= 1:
         raise PipelineConfigError(
@@ -555,12 +559,17 @@ def resolve_run(config: Mapping[str, Any], *, check_inputs: bool = True) -> dict
     evaluation["enabled"] = bool(evaluation["enabled"])
     if evaluation["enabled"] and not assignments["enabled"]:
         raise PipelineConfigError("evaluation requires assignments.enabled: true")
-    if evaluation["enabled"] and evaluation["kind"] != "adaptive_q_toy":
+    if evaluation["enabled"] and evaluation["kind"] != "toy_manifold_tiling":
         raise PipelineConfigError(
-            "the first pipeline version supports evaluation.kind: adaptive_q_toy"
+            "the pipeline supports evaluation.kind: toy_manifold_tiling"
         )
-    if evaluation["kind"] == "adaptive_q_toy" and model_kind not in {"ard", "hddc"}:
-        raise PipelineConfigError("adaptive_q_toy evaluation requires an ARD or HDDC model")
+    if float(evaluation["rank_threshold"]) <= 0:
+        raise PipelineConfigError("evaluation.rank_threshold must be positive")
+    max_mean_distance = float(evaluation["max_mean_to_manifold_distance"])
+    if not math.isfinite(max_mean_distance) or max_mean_distance <= 0:
+        raise PipelineConfigError(
+            "evaluation.max_mean_to_manifold_distance must be finite and positive"
+        )
     if assignments["seed"] is None:
         assignments["seed"] = training_args.get("seed") or 0
 
@@ -754,8 +763,15 @@ def _evaluation_artifact_valid(run: Mapping[str, Any]) -> bool:
         metrics = json.loads(path.read_text())
     except (OSError, TypeError, json.JSONDecodeError):
         return False
+    bic_metrics = metrics.get("bic")
+    if not isinstance(bic_metrics, Mapping):
+        return False
+    bic_value = bic_metrics.get("value")
     return (
-        metrics.get("evaluation") == run["evaluation"]["kind"]
+        metrics.get("schema_version") == 1
+        and isinstance(bic_value, (int, float))
+        and math.isfinite(float(bic_value))
+        and metrics.get("evaluation") == run["evaluation"]["kind"]
         and metrics.get("identity_hash") == run["identity_hash"]
     )
 
@@ -860,10 +876,12 @@ def execute_run(run: Mapping[str, Any]) -> Path:
                     f"refusing to overwrite invalid evaluation artifact: {metrics_path}"
                 )
             print(f"[{run['run_id']}] evaluation", flush=True)
-            if run["evaluation"]["kind"] == "adaptive_q_toy":
-                from dalg.analysis.adaptive_q_evaluation import evaluate_adaptive_q_toy
+            if run["evaluation"]["kind"] == "toy_manifold_tiling":
+                from dalg.evaluation.toy_manifold_tiling import (
+                    evaluate_toy_manifold_tiling,
+                )
 
-                metrics = evaluate_adaptive_q_toy(
+                metrics = evaluate_toy_manifold_tiling(
                     run_dir,
                     shard_dir=run["dataset"]["shard_dir"],
                     layer=int(run["dataset"]["layer"]),
@@ -871,6 +889,10 @@ def execute_run(run: Mapping[str, Any]) -> Path:
                     assignments_path=assignments_path,
                     batch_size=int(run["evaluation"]["batch_size"]),
                     device=str(run["evaluation"]["device"]),
+                    rank_threshold=float(run["evaluation"]["rank_threshold"]),
+                    max_mean_to_manifold_distance=float(
+                        run["evaluation"]["max_mean_to_manifold_distance"]
+                    ),
                 )
             else:
                 raise PipelineConfigError(

@@ -43,7 +43,7 @@ assignments:
 
 evaluation:
   enabled: true
-  kind: adaptive_q_toy
+  kind: toy_manifold_tiling
   batch_size: 4096
   device: cuda
 

@@ -13,7 +13,8 @@ description: Inspect a user-supplied DALG experiment or sweep folder and compare
 4. Read each `metrics.json`. When present, also read the sibling `run_spec.json`
    to identify the configuration values that differ between runs.
 5. Return one compact Markdown table with one row per run. Include the run name,
-   differing configuration values, and scalar metrics. Always include these
+   differing configuration values, and scalar metrics outside `per_manifold`.
+   Always include these
    clustering columns when they exist, even when their values are identical
    across runs:
    - `clustering.homogeneity`
@@ -25,8 +26,16 @@ description: Inspect a user-supplied DALG experiment or sweep folder and compare
    nested names into clear labels such as `nll.validation`. Omit paths, hashes,
    repeated configuration constants, and large arrays; do not omit a metric
    merely because it is constant across runs.
-6. Sort rows by the differing configuration values when possible; otherwise
-   sort by run name. Briefly list malformed `metrics.json` files after the table
-   instead of silently dropping them.
+6. When one or more runs contain `per_manifold` metrics, follow the overall
+   table with a separate compact Markdown table for each manifold. Name each
+   table from `type_name` (falling back to `manifold_id`) and include its
+   intrinsic dimension in the heading when available. Use one row per run,
+   ordered as in the overall table. Include the per-manifold scalar metrics,
+   such as component counts, rank-recovery metrics, and tangent-alignment
+   metrics; place identifier fields in the table heading rather than repeating
+   them as columns. Show `—` when a run lacks that manifold or metric.
+7. Sort rows by the differing configuration values when possible; otherwise
+   sort by run name. Briefly list malformed `metrics.json` files after all
+   tables instead of silently dropping them.
 
 Do not modify the folder or its artifacts.

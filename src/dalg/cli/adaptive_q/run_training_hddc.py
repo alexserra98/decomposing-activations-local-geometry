@@ -13,7 +13,7 @@ diverge without touching the production entrypoint. Same arrangement as
   equivalent to `run_training.py` at the same settings
 
 Training modes:
-- vanilla: one process, one full MFA model.
+- single_process: one process, one full HDDC model.
 - component_shard: N processes, each owns a slice of the MFA components.
 """
 
@@ -550,8 +550,8 @@ def _surgery_config(args):
 # Top-level training commands
 
 
-def cmd_train(args):
-    """Single-process MFA training on activation shards."""
+def cmd_train_single_process(args):
+    """Single-process HDDC training on activation shards."""
     from dalg.models.adaptive_q.mfa_hddc import (
         MFA_HDDC,
         load_mfa_hddc,
@@ -570,7 +570,7 @@ def cmd_train(args):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     wandb_run = _maybe_init_wandb(
-        args, data, training_mode="vanilla", world_size=1, is_main=True,
+        args, data, training_mode="single_process", world_size=1, is_main=True,
     )
 
     train_loader, steps_per_epoch, _ = _build_train_loader(
@@ -589,7 +589,7 @@ def cmd_train(args):
         data,
         out_dir,
         args=args,
-        training_mode="vanilla",
+        training_mode="single_process",
         world_size=1,
     )
 
@@ -705,7 +705,7 @@ def cmd_train(args):
         data,
         out_dir,
         args=args,
-        training_mode="vanilla",
+        training_mode="single_process",
         world_size=1,
     )
     print(f"Model saved to {out_dir}/mfa_model.pt")
@@ -713,7 +713,7 @@ def cmd_train(args):
 
 
 def cmd_train_component_shard(args):
-    """Component-sharded MFA training.
+    """Component-sharded HDDC training.
 
     Each rank owns a contiguous slice of the K components. Every rank consumes
     identical activation batches, so rank 0 loads each batch and broadcasts it.
@@ -935,9 +935,9 @@ def validate_args(args) -> None:
             "train: --shared-b and --isotropic-psi select different noise modes; "
             "set only one"
         )
-    if mode == "vanilla" and world_size > 1:
+    if mode == "single_process" and world_size > 1:
         raise SystemExit(
-            "train: --training-mode vanilla was requested under torchrun; "
+            "train: --training-mode single_process was requested under torchrun; "
             "run a single process or use --training-mode component_shard"
         )
     if mode == "component_shard":
@@ -946,9 +946,13 @@ def validate_args(args) -> None:
         if args.device != "cuda":
             raise SystemExit("train: component_shard requires --device cuda")
         if args.init_model_path:
-            raise SystemExit("train: --init-model-path currently supports vanilla mode only")
+            raise SystemExit(
+                "train: --init-model-path currently supports single_process mode only"
+            )
         if args.shared_b:
-            raise SystemExit("train: --shared-b supports --training-mode vanilla only")
+            raise SystemExit(
+                "train: --shared-b supports --training-mode single_process only"
+            )
     if args.init_model_path and args.centroids_path:
         raise SystemExit(
             "train: set only one of --init-model-path and --centroids-path; "
@@ -982,8 +986,10 @@ def validate_args(args) -> None:
         args.surgery_every_epochs = surgery_every
     if mode == "component_shard" and 0 < surgery_every < 1:
         raise SystemExit(
-            "train: fractional-epoch surgery currently supports vanilla mode only"
+            "train: fractional-epoch surgery currently supports single_process mode only"
         )
+    if not math.isfinite(args.surgery_min_count) or args.surgery_min_count < 0:
+        raise SystemExit("train: --surgery-min-count must be finite and non-negative")
     if args.surgery_every_epochs and args.surgery_every_epochs > 0:
         if not (args.isotropic_psi or args.shared_b):
             raise SystemExit(
@@ -1057,7 +1063,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Cattell scree threshold t, relative to the leading eigenvalue.")
     p.add_argument("--surgery-min-count", type=float, default=0.0,
                    help="n_min: components with fewer effective points are left "
-                        "untouched. 0 => max(5 * q_max, 50).")
+                        "untouched. 0 disables the cutoff and includes every "
+                        "component with positive soft membership.")
     p.add_argument("--surgery-warmup-steps", type=int, default=0,
                    help="Linear LR warmup steps after each surgery (0 = none).")
     p.add_argument("--epochs", type=int, default=10,
@@ -1089,8 +1096,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-pool-size", type=int, default=2_000_000)
     p.add_argument(
         "--training-mode",
-        default="vanilla",
-        choices=["vanilla", "component_shard"],
+        default="single_process",
+        choices=["single_process", "component_shard"],
     )
     p.add_argument("--compile", action="store_true")
     p.add_argument("--wandb", action="store_true", help="Log training to Weights & Biases (rank 0 only)")
@@ -1100,7 +1107,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 _DISPATCH = {
-    "vanilla": cmd_train,
+    "single_process": cmd_train_single_process,
     "component_shard": cmd_train_component_shard,
 }
 

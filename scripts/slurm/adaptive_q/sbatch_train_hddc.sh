@@ -41,7 +41,7 @@ MAX_STEPS=${MAX_STEPS:-}
 # ── HDDC surgery ─────────────────────────────────────────────────────────
 SURGERY_EVERY=${SURGERY_EVERY:-3}          # epochs between surgeries; 0 = fixed-q baseline
 SURGERY_THRESHOLD=${SURGERY_THRESHOLD:-0.01}   # Cattell t, relative to the leading eigenvalue
-SURGERY_MIN_COUNT=${SURGERY_MIN_COUNT:-0}      # n_min; 0 => max(5 * q_max, 50)
+SURGERY_MIN_COUNT=${SURGERY_MIN_COUNT:-0}      # n_min; 0 = no membership cutoff
 SURGERY_WARMUP=${SURGERY_WARMUP:-0}            # linear LR warmup steps after each surgery
 SHARED_B=${SHARED_B:-0}                        # 1 = one global b; 0 = per-component b_k
 
