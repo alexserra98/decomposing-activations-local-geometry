@@ -13,7 +13,8 @@ under `.claude/skills/`.
 
 Use only the skill matching the requested stage:
 
-- `/dalg-train-mfa`
+- `/dalg-run-pipeline`
+- `/dalg-wiki`
 - `/dalg-compute-assignments`
 - `/dalg-compute-metrics`
 - `/dalg-label-mfa-clusters`

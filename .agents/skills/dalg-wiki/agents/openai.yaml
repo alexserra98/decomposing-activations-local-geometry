@@ -1,0 +1,4 @@
+interface:
+  display_name: "DALG Wiki"
+  short_description: "Navigate and maintain the DALG documentation wiki"
+  default_prompt: "Use $dalg-wiki to find or update the relevant DALG documentation."

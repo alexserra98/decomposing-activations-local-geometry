@@ -1,5 +1,8 @@
 # HDDC Rank Surgery
 
+> **Kind:** Experiment context · **Status:** Active · **Use when:** Modifying or
+> reproducing the experimental HDDC rank-surgery path.
+
 Attachable context for the periodic HDDC covariance-surgery path, which learns a
 per-component rank `d_k <= q_max` instead of fixing it at `--rank`.
 
@@ -31,15 +34,28 @@ covariance at an adaptive rank and rewrites it in MFA parameters. Three phases:
 - **A** — one E-pass accumulating, in float64, the responsibility-weighted second
   moment of each component about its *current* `mu_k`.
 - **B** — per component: `eigh(S_k)`, a scale-free Cattell scree test on
-  consecutive eigenvalue differences to pick `d_k`, the noise level
-  `b_k = (Tr(S_k) - sum_{j<=d_k} lam_j) / (D - d_k)`, then the reconstruction of
-  `Sigma_k = W_k W_k^T + b_k I` with `scale_j = sqrt(lam_j - b_k)`. With
-  `--shared-b`, eligible components instead estimate one pooled floor:
+  consecutive eigenvalue differences to propose a rank cap `r_k`, the noise
+  level `b_k = (Tr(S_k) - sum_{j<=r_k} lam_j) / (D - r_k)`, then the
+  reconstruction of `Sigma_k = W_k W_k^T + b_k I` with
+  `scale_j = sqrt(lam_j - b_k)`. With `--shared-b`, eligible components instead
+  estimate one pooled floor:
 
   ```text
-  b = sum_k N_k (Tr(S_k) - sum_{j<=d_k} lam_kj)
-      / sum_k N_k (D - d_k)
+  b = sum_k N_k (Tr(S_k) - sum_{j<=r_k} lam_kj)
+      / sum_k N_k (D - r_k)
   ```
+
+  Shared-b surgery then reconciles the independent Cattell proposals with the
+  common floor. Directions `2..r_k` are considered globally from smallest to
+  largest eigenvalue; any candidate with `lam_kj <= b` enters the pooled noise
+  estimate before `b` is updated and the next candidate is considered. The
+  remaining prefix defines `d_k`. Direction one stays mandatory, so an eligible
+  component with `lam_k1 <= b` still raises instead of silently becoming rank
+  zero. The implementation docstring in `_solve_shared_b_active_set` contains
+  the full derivation, stopping rule, numerical-floor handling, scope, and
+  rank-one policy. Reconstruction round-trips `b` through the model dtype before
+  validating retained directions, so the check and loading scales use the floor
+  that is actually written rather than only its float64 target.
 - **C** — Adam state for the rewritten tensors is dropped, optionally followed by
   a short LR warmup.
 
@@ -52,8 +68,8 @@ Invariants worth preserving when editing:
   a retained `mu_k` is inconsistent and inflates apparent rank when the SGD means
   lag the data.
 - `--isotropic-psi` selects component-specific `b_k`; `--shared-b` selects a
-  global `b`. Exactly one is required for surgery, and shared-b is vanilla-mode
-  only.
+  global `b`. Exactly one is required for surgery, and shared-b is supported
+  only in `single_process` mode.
 - All `q_max` columns are rewritten every time and only the mask records `d_k`,
   so a rank *increase* needs no revival logic.
 - Surgery is a partial M-step, so it competes for best-model selection on the
@@ -71,7 +87,7 @@ dalg-run-training-hddc \
   --shard-dir dalg-cache/pile_gemma2b_activations --layer 5 \
   --K 1000 --q-max 16 --isotropic-psi \
   --surgery-every-epochs 3 --surgery-threshold 0.01 --surgery-min-count 80 \
-  --epochs 30 --device cuda
+  --epochs 30 --device cuda --training-mode single_process
 ```
 
 `--surgery-every-epochs 0` gives a fixed-q baseline on the same stack.
@@ -79,13 +95,17 @@ dalg-run-training-hddc \
 For the single-process shared-noise model, replace `--isotropic-psi` with
 `--shared-b`. The two flags are mutually exclusive. The pooled `b` excludes
 components below `surgery_min_count`, although their covariance floor still
-changes because the scalar is global. Surgery stops explicitly if pooled `b`
-is not below every retained signal eigenvalue. The Slurm launcher makes the
-same selection with `SHARED_B=1`; its default remains component-specific `b_k`.
+changes because the scalar is global. A value of zero disables the cutoff and
+includes every component with positive soft responsibility mass; exact-zero
+membership raises because `S_k / N_k` is undefined. The active set lowers
+Cattell rank caps when optional signal eigenvalues do not clear the common
+floor. Surgery stops explicitly only when even a mandatory first eigenvalue is
+not above `b`. The Slurm launcher makes the same selection with `SHARED_B=1`;
+its default remains component-specific `b_k`.
 
 To warm-start from a saved HDDC model, pass `--init-model-path mfa_model.pt` in
-vanilla mode. The source must exactly match `K`, `D`, `q_max`, and the Psi noise
-mode. The trainer records this state as an epoch-0 checkpoint
+`single_process` mode. The source must exactly match `K`, `D`, `q_max`, and the
+Psi noise mode. The trainer records this state as an epoch-0 checkpoint
 with the initial validation NLL and a fresh Adam state, after which normal
 checkpoint resume behavior applies.
 
@@ -97,7 +117,7 @@ import it and write activation-compatible shards under `dalg-cache/assets/`:
 ```python
 from dalg.data import ToyManifoldConfig, save_toy_manifold_shards
 
-cfg = ToyManifoldConfig(ambient_dim=128, n_train=300_000, n_val=100_000,
+cfg = ToyManifoldConfig(ambient_dim=128, n_samples=400_000,
                         manifolds_per_type=8, offset_radius=4.0, seed=0)
 save_toy_manifold_shards(
     "dalg-cache/assets/toy_manifolds_D128_shards",
@@ -133,5 +153,6 @@ tiling. Reading `d_k` against the planted per-manifold dimensions still works.
 - **Live component count** matters as much as NLL. A mixture that collapses onto
   far fewer components than `K` is reporting the dimension of whatever each
   survivor covers, which may be a whole manifold rather than a local patch.
-- **BIC** is not computed in the training loop. Log val NLL and
-  `hddc_surgery.parameter_count(model)` per run and plot it post hoc.
+- **BIC** is not computed in the training loop. The toy-manifold evaluator adds
+  standard training-set BIC to `metrics.json`; compare its `bic.value` across
+  runs with lower values preferred.

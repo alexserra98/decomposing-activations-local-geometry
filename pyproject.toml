@@ -25,6 +25,7 @@ dependencies = [
     "scikit-learn-extra>=0.3.0",
     "scipy>=1.17.1",
     "streamlit>=1.45.0",
+    "umap-learn>=0.5.12",
     "wandb>=0.17",
 ]
 

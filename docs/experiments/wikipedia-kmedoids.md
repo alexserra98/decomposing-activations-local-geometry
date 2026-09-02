@@ -1,5 +1,8 @@
 # Wikipedia KMedoids Slice
 
+> **Kind:** Experiment context · **Status:** Experimental · **Use when:** Running
+> or interpreting the temporary Wikipedia-slice KMedoids analysis.
+
 This is an attachable context file for the temporary Wikipedia KMedoids workflow. It is experimental analysis code, not core library API.
 
 ## Overview

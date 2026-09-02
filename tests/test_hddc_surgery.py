@@ -7,6 +7,8 @@ Coverage:
   component-sharded save/load path, and pre-mask checkpoints still load
 - surgery on a planted low-rank Gaussian recovers Q, lambda, b and d_k, with
   the b_k > 0 and lam_j >= b_k guarantees holding
+- shared-b surgery reconciles Cattell rank caps with the common floor without
+  the over-pruning caused by dropping all initial violations at once
 - rank can go back up at a later surgery (all q_max columns are rewritten)
 - the train_nll hook runs surgery on schedule without blowing up the NLL
 """
@@ -363,6 +365,48 @@ def test_component_shard_round_trip_preserves_mask_and_isotropic_psi():
 # --------------------------------------------------------------------------
 
 
+def test_zero_min_count_disables_the_membership_cutoff():
+    model = MFA_HDDC(torch.zeros(2, 4), rank=2, isotropic_psi=True)
+    N = torch.tensor([0.25, 2.0], dtype=torch.float64)
+    cfg = SurgeryConfig(enabled=True, every=1, threshold=0.1, min_count=0.0)
+    covariances = torch.stack(
+        [
+            torch.diag(torch.tensor([5.0, 2.0, 1.0, 1.0], dtype=torch.float64)),
+            torch.diag(torch.tensor([7.0, 3.0, 1.0, 1.0], dtype=torch.float64)),
+        ]
+    )
+
+    stats = reconstruct_components(
+        model,
+        N,
+        covariances * N[:, None, None],
+        cfg,
+    )
+
+    assert cfg.n_min() == 0.0
+    assert stats["eligible"].tolist() == [True, True]
+    assert stats["n_updated"] == 2
+    assert stats["n_skipped"] == 0
+
+
+def test_zero_min_count_rejects_exactly_zero_soft_membership():
+    model = MFA_HDDC(torch.zeros(1, 4), rank=2, isotropic_psi=True)
+
+    with pytest.raises(RuntimeError, match="non-positive effective membership"):
+        reconstruct_components(
+            model,
+            torch.zeros(1, dtype=torch.float64),
+            torch.zeros(1, 4, 4, dtype=torch.float64),
+            SurgeryConfig(enabled=True, every=1, min_count=0.0),
+        )
+
+
+def test_negative_or_nonfinite_min_count_is_rejected():
+    for value in (-1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            SurgeryConfig(min_count=value).n_min()
+
+
 def test_surgery_recovers_a_planted_low_rank_covariance():
     x, mu, U, lam = _planted_gaussian(D=32, d_true=3, b_true=0.02)
     q = 8
@@ -420,6 +464,150 @@ def test_shared_b_surgery_uses_membership_weighted_pooled_residual():
     assert torch.equal(model._psi()[0], model._psi()[1])
 
 
+def test_shared_b_active_set_prunes_infeasible_cattell_directions():
+    model = MFA_HDDC(torch.zeros(2, 4), rank=3, shared_b=True, psi_init=0.5)
+    N = torch.tensor([100.0, 100.0], dtype=torch.float64)
+    covariances = torch.stack(
+        [
+            torch.diag(torch.tensor([20.0, 4.0, 3.0, 2.0], dtype=torch.float64)),
+            torch.diag(torch.tensor([100.0, 10.0, 10.0, 10.0], dtype=torch.float64)),
+        ]
+    )
+
+    stats = reconstruct_components(
+        model,
+        N,
+        covariances * N[:, None, None],
+        SurgeryConfig(enabled=True, every=1, threshold=0.04, min_count=1.0),
+    )
+
+    # Cattell proposes [3, 1], whose mandatory tails give b=8. Directions with
+    # eigenvalues 3 and 4 enter the noise pool in that order, giving final b=6.5.
+    assert stats["d_k"].tolist() == [1, 1]
+    assert float(stats["b_shared_at_cattell"]) == pytest.approx(8.0)
+    assert float(stats["b_shared"]) == pytest.approx(6.5)
+    assert stats["n_shared_b_pruned_components"] == 1
+    assert stats["n_shared_b_pruned_directions"] == 2
+    assert model.rank_mask.tolist() == [[1, 0, 0], [1, 0, 0]]
+
+
+def test_shared_b_active_set_does_not_batch_prune_a_later_valid_direction():
+    model = MFA_HDDC(torch.zeros(2, 4), rank=3, shared_b=True, psi_init=0.5)
+    N = torch.tensor([100.0, 100.0], dtype=torch.float64)
+    covariances = torch.stack(
+        [
+            torch.diag(torch.tensor([20.0, 9.0, 1.0, 0.0], dtype=torch.float64)),
+            torch.diag(torch.tensor([100.0, 14.0, 13.0, 13.0], dtype=torch.float64)),
+        ]
+    )
+
+    stats = reconstruct_components(
+        model,
+        N,
+        covariances * N[:, None, None],
+        SurgeryConfig(enabled=True, every=1, threshold=0.04, min_count=1.0),
+    )
+
+    # Cattell proposes [3, 1] and its pooled floor is 10. Moving lambda=1 into
+    # the noise pool lowers b to 8.2, so lambda=9 is valid and must stay active.
+    # A simultaneous prune against the initial b would incorrectly return [1, 1].
+    assert stats["d_k"].tolist() == [2, 1]
+    assert float(stats["b_shared_at_cattell"]) == pytest.approx(10.0)
+    assert float(stats["b_shared"]) == pytest.approx(41.0 / 5.0)
+    assert stats["n_shared_b_pruned_components"] == 1
+    assert stats["n_shared_b_pruned_directions"] == 1
+    assert model.rank_mask.tolist() == [[1, 1, 0], [1, 0, 0]]
+
+
+def test_shared_b_active_set_treats_equality_with_floor_as_noise():
+    model = MFA_HDDC(torch.zeros(1, 5), rank=4, shared_b=True, psi_init=0.5)
+    N = torch.tensor([100.0], dtype=torch.float64)
+    covariance = torch.diag(
+        torch.tensor([10.0, 3.0, 2.0, 1.0, 0.5], dtype=torch.float64)
+    )[None, :, :]
+
+    stats = reconstruct_components(
+        model,
+        N,
+        covariance * N[:, None, None],
+        SurgeryConfig(
+            enabled=True,
+            every=1,
+            threshold=0.04,
+            min_count=1.0,
+            psi_floor=2.0,
+        ),
+    )
+
+    # The configured floor binds. lambda=1 and then lambda=2 enter the noise
+    # pool; equality is not reported as a zero-variance signal direction.
+    assert stats["d_k"].tolist() == [2]
+    assert float(stats["b_shared_at_cattell"]) == pytest.approx(2.0)
+    assert float(stats["b_shared"]) == pytest.approx(2.0)
+    assert stats["n_shared_b_pruned_directions"] == 2
+
+
+def test_surgery_floor_respects_model_psi_parameterization_floor():
+    model = MFA_HDDC(
+        torch.zeros(1, 2),
+        rank=1,
+        shared_b=True,
+        psi_init=0.5,
+        eps_floor=0.1,
+    )
+    N = torch.tensor([100.0], dtype=torch.float64)
+    covariance = torch.diag(torch.tensor([1.0, 0.0], dtype=torch.float64))[None, :, :]
+
+    stats = reconstruct_components(
+        model,
+        N,
+        covariance * N[:, None, None],
+        SurgeryConfig(
+            enabled=True,
+            every=1,
+            threshold=0.01,
+            min_count=1.0,
+            psi_floor=1e-6,
+        ),
+    )
+
+    written_b = float(model._psi()[0, 0].detach())
+    assert float(stats["b_shared"]) > model._eps
+    assert written_b == pytest.approx(float(stats["b_shared"]), abs=1e-6)
+
+
+def test_component_specific_surgery_rejects_floor_above_retained_eigenvalue():
+    model = MFA_HDDC(
+        torch.zeros(1, 2),
+        rank=1,
+        isotropic_psi=True,
+        psi_init=0.5,
+        eps_floor=0.1,
+    )
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    N = torch.tensor([100.0], dtype=torch.float64)
+    covariance = torch.diag(torch.tensor([0.05, 0.0], dtype=torch.float64))[None, :, :]
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"component-b surgery.*component=0, direction=1, lambda=.* <= b=",
+    ):
+        reconstruct_components(
+            model,
+            N,
+            covariance * N[:, None, None],
+            SurgeryConfig(
+                enabled=True,
+                every=1,
+                threshold=0.01,
+                min_count=1.0,
+                psi_floor=1e-6,
+            ),
+        )
+    for key, value in model.state_dict().items():
+        assert torch.equal(value, before[key])
+
+
 def test_hddc_surgery_reports_shared_b_without_dropping_b_k_mean():
     x, mu, _U, _lam = _planted_gaussian(
         D=16, d_true=2, b_true=0.05, n=20_000, seed=104
@@ -433,26 +621,35 @@ def test_hddc_surgery_reports_shared_b_without_dropping_b_k_mean():
 
     assert summary["b_shared"] == pytest.approx(0.05, rel=0.1)
     assert summary["b_k_mean"] == pytest.approx(summary["b_shared"])
+    assert summary["b_shared_at_cattell"] == pytest.approx(summary["b_shared"])
+    assert summary["n_shared_b_pruned_components"] == 0
+    assert summary["n_shared_b_pruned_directions"] == 0
 
 
-def test_shared_b_surgery_rejects_retained_eigenvalue_below_common_floor():
-    model = MFA_HDDC(torch.zeros(2, 4), rank=1, shared_b=True)
+def test_shared_b_surgery_still_rejects_mandatory_first_direction_below_floor():
+    model = MFA_HDDC(torch.zeros(2, 4), rank=3, shared_b=True)
+    before = {key: value.clone() for key, value in model.state_dict().items()}
     N = torch.tensor([100.0, 100.0], dtype=torch.float64)
     covariances = torch.stack(
         [
-            torch.diag(torch.tensor([1.0, 0.9, 0.9, 0.9], dtype=torch.float64)),
+            torch.diag(torch.tensor([5.0, 4.0, 3.0, 2.0], dtype=torch.float64)),
             torch.diag(torch.tensor([100.0, 50.0, 50.0, 50.0], dtype=torch.float64)),
         ]
     )
     S_acc = covariances * N[:, None, None]
 
-    with pytest.raises(RuntimeError, match=r"lambda=.* <= b="):
+    with pytest.raises(
+        RuntimeError,
+        match=r"component=0, direction=1, lambda=.* <= b=",
+    ):
         reconstruct_components(
             model,
             N,
             S_acc,
-            SurgeryConfig(enabled=True, every=1, threshold=0.01, min_count=1.0),
+            SurgeryConfig(enabled=True, every=1, threshold=0.1, min_count=1.0),
         )
+    for key, value in model.state_dict().items():
+        assert torch.equal(value, before[key])
 
 
 def test_shared_b_surgery_with_no_eligible_components_is_a_no_op():
@@ -466,6 +663,9 @@ def test_shared_b_surgery_with_no_eligible_components_is_a_no_op():
     )
 
     assert stats["b_shared"] is None
+    assert stats["b_shared_at_cattell"] is None
+    assert stats["n_shared_b_pruned_components"] == 0
+    assert stats["n_shared_b_pruned_directions"] == 0
     assert stats["n_updated"] == 0
     for key, value in model.state_dict().items():
         assert torch.equal(value, before[key])

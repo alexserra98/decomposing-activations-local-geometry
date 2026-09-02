@@ -1,5 +1,9 @@
 # Training Pipeline YAML Reference
 
+> **Kind:** Reference · **Status:** Current · **Use when:** Looking up an exact
+> pipeline YAML field, default, or model-specific constraint. **Related:**
+> [YAML training workflow](../workflows/training-pipeline.md)
+
 This file documents every field accepted by the experimental YAML training
 pipeline. The source of truth is `src/dalg/pipeline.py` together with the three
 existing trainer parsers selected by `model.kind`.
@@ -97,15 +101,39 @@ component sharding.
 | --- | --- | --- | --- |
 | `q_max` | integer | `10` | YAML alias for `rank`. Use one of `q_max` or `rank`, never both. |
 | `isotropic_psi` | boolean | `false` | Use one isotropic noise value per component. One isotropic mode is required when surgery is enabled. |
-| `shared_b` | boolean | `false` | Use one isotropic noise scalar for the full mixture. Mutually exclusive with `isotropic_psi` and supported only in vanilla training mode. |
-| `surgery_every_epochs` | float | `0` | Run covariance surgery every N epochs. Positive integers run at epoch boundaries; fractions below 1 run on the first optimizer step crossing each fractional boundary. `0` disables surgery and provides the fixed-rank baseline. |
+| `shared_b` | boolean | `false` | Use one trainable isotropic noise scalar `b` for every component, so `Psi_k = b I` throughout the mixture. Mutually exclusive with `isotropic_psi` and supported only in `single_process` training mode. |
+| `surgery_every_epochs` | float | `0` | Surgery cadence in epochs. Supported values are `0`, a fraction strictly between 0 and 1, or a positive integer. Fractions run on the first optimizer step crossing each global fractional-epoch boundary and are `single_process`-only. `0` disables surgery and provides the fixed-rank baseline. |
 | `surgery_threshold` | float | `0.01` | Relative Cattell scree threshold. Must be positive when surgery is enabled. |
-| `surgery_min_count` | float | `0.0` | Components with fewer effective points are not rewritten. `0` selects `max(5 * q_max, 50)`. |
+| `surgery_min_count` | non-negative float | `0.0` | Components with `N_k` below this soft-responsibility-mass threshold are not rewritten. `0` disables the cutoff and includes every component with positive soft membership; an exact-zero membership cannot define `S_k / N_k` and raises. |
 | `surgery_warmup_steps` | integer | `0` | Linear learning-rate warmup steps after each surgery; `0` disables it. |
 
 When `surgery_every_epochs > 0`, exactly one of `isotropic_psi` or `shared_b`
 must be `true`. HDDC surgery materializes a `(K, D, D)` scatter and is intended
-for D=128-scale data. `shared_b` cannot be used with component sharding.
+for D=128-scale data. `shared_b` cannot be used with component sharding. In
+shared-b mode, surgery pools the responsibility-weighted residual covariance of
+all components meeting `surgery_min_count` to update the single `b`; components
+below the threshold are not otherwise rewritten, but they still inherit the new
+global noise floor.
+
+The cadence is resolved against `S`, the number of training batches in an epoch
+after applying an optional `training.steps_per_epoch` cap:
+
+| Value | Surgery timing |
+| --- | --- |
+| `0` | Disabled. |
+| `1` | At the end of every epoch, after validation. |
+| `3` | At the end of epochs 3, 6, 9, and so on. |
+| `0.5` | After optimizer step `ceil(S / 2)` and at the end of each epoch. |
+| `0.3` | On the first optimizer step crossing every 0.3 epochs of global progress; boundaries continue across epochs rather than resetting. |
+
+Every surgery runs an additional full E-pass over the training split. A cadence
+shorter than one optimizer step is rejected. Fractional cadences are supported
+only in `single_process` mode; component-sharded HDDC accepts integer cadences.
+
+The two relevant complete examples are
+[`adaptive_q_toy_20k_hddc_shared_b.yaml`](../../configs/experiments/adaptive_q_toy_20k_hddc_shared_b.yaml)
+and
+[`adaptive_q_toy_20k_hddc_shared_b_surgery_half.yaml`](../../configs/experiments/adaptive_q_toy_20k_hddc_shared_b_surgery_half.yaml).
 
 ## `training`
 
@@ -123,8 +151,14 @@ These arguments are shared by MFA, ARD, and HDDC unless noted otherwise.
 | `split_seed` | integer | `42` | Seed for the deterministic stratified train/validation row split. |
 | `val_on_gpu` | boolean | `false` | Materialize validation activations on the selected device in single-process training. |
 | `centroids_path` | `.pt` path or `null` | `null` | Reuse a precomputed centroid artifact instead of fitting KMeans. It may be a legacy `(K, D)` tensor or a bundle containing `centroids` and `principal_components`. The pipeline accepts only a direct lowercase `.pt` file, resolves it to an absolute path, and validates `K` and `D`. |
-| `direction_init` | `random` or `cluster_pca` | `random` | Initialize each component's loading directions randomly, or from the first `rank/q_max` principal components stored in the centroid artifact. |
-| `init_model_path` | `.pt` path or `null` | `null` | HDDC only. Seed an epoch-0 training checkpoint from a saved `MFA_HDDC` whose `K`, `D`, `q`, and isotropic-Psi setting exactly match the YAML model configuration. |
+| `direction_init` | `random` or `cluster_pca` | `random` | Initialize each component's loading directions randomly, or from the first `rank/q_max` principal components stored in the centroid artifact. The `cluster_pca` path is a temporary experimental option. |
+| `init_model_path` | `.pt` path or `null` | `null` | HDDC only. Seed an epoch-0 training checkpoint from a saved `MFA_HDDC` whose `K`, `D`, `q`, and Psi noise mode exactly match the YAML model configuration. |
+
+> **Temporary experimental feature:** `direction_init: cluster_pca` and the
+> enriched artifact's `principal_components` field support the current
+> W-initialization experiments and are not a stable pipeline contract. Reusing
+> centroid means with `centroids_path` does not depend on this feature;
+> `direction_init: random` remains the default.
 
 When `centroids_path` is set, the trainer copies that artifact into the run
 directory and skips centroid fitting. The initialization arguments below have
@@ -134,12 +168,23 @@ when `Q_stored < rank/q_max`. The trainer slices the first requested directions;
 loading scales still initialize to 1. Legacy tensor-only artifacts remain valid
 with `direction_init: random`.
 
+Example using the enriched bundle to initialize `W_k`:
+
+```yaml
+training:
+  centroids_path: dalg-cache/toy_manifold_models_1M/centroids/kmeans_k5000/centroids.pt
+  direction_init: cluster_pca
+```
+
+This option is available for all three model kinds. PCA is not fitted by the
+trainer; `principal_components` must already be stored in `centroids.pt`.
+
 `init_model_path` and `centroids_path` are mutually exclusive because the full
 model already supplies its means. The initial model must exactly match `K`, `D`,
-`q_max`, and the isotropic-Psi setting. Only vanilla HDDC training supports this
-option. The saved model has no optimizer history, so the epoch-0 checkpoint
-starts with a fresh Adam state; subsequent restarts use the normal local
-checkpoint exactly.
+`q_max`, and the Psi noise mode (`diagonal`, component-specific
+`isotropic_psi`, or `shared_b`). Only `single_process` HDDC training supports this option.
+The saved model has no optimizer history, so the epoch-0 checkpoint starts with
+a fresh Adam state; subsequent restarts use the normal local checkpoint exactly.
 
 | Field | Type | Default | Meaning when fitting centroids |
 | --- | --- | --- | --- |
@@ -189,7 +234,7 @@ To disable all early stopping while retaining an epoch cap, set
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `training_mode` | `vanilla` or `component_shard` | `vanilla` | MFA/HDDC only. `vanilla` uses one process. `component_shard` shards K across GPUs and requires `resources.gpus > 1` plus `device: cuda`. |
+| `training_mode` | MFA: `vanilla` or `component_shard`; HDDC: `single_process` or `component_shard` | MFA: `vanilla`; HDDC: `single_process` | `vanilla` names the original fixed-q MFA implementation. `single_process` holds one full HDDC model in one process. `component_shard` shards K across GPUs and requires `resources.gpus > 1` plus `device: cuda`. |
 | `compile` | boolean | `false` | Accepted by the current trainer parsers but not currently consumed by their implementations. |
 | `wandb` | boolean | `false` | Enable Weights & Biases logging. Only rank 0 logs in component-sharded mode. |
 | `wandb_project` | string or `null` | `null` | W&B project name. |
@@ -222,14 +267,49 @@ assignment count before the stage is marked complete.
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `false` | Run evaluation after assignments. |
-| `kind` | string or `null` | `null` | The only current evaluator is `adaptive_q_toy`. |
+| `kind` | string or `null` | `null` | The only current evaluator is `toy_manifold_tiling`. |
 | `batch_size` | integer | `4096` | Batch size used for evaluation NLL. |
 | `device` | string | `cuda` | Evaluation device. |
+| `rank_threshold` | float | `1.0` | A loading column is effectively active when its variance exceeds this multiple of its component's mean unique variance. Applied identically to MFA, ARD, and HDDC. |
+| `max_mean_to_manifold_distance` | float | `0.1` | Maximum ambient Euclidean distance between a Gaussian mean and its unique nearest exact manifold projection for proximity association. |
 
 `evaluation.enabled: true` requires `assignments.enabled: true`.
-`adaptive_q_toy` additionally requires `model.kind: ard` or `hddc` and shards
-created by the toy-manifold shard writer. It produces NLL, clustering-recovery,
-live/dead-component, and learned-rank metrics in `<run_dir>/metrics.json`.
+`toy_manifold_tiling` accepts `model.kind: mfa`, `ard`, or `hddc` and requires
+shards created by the toy-manifold shard writer. It produces NLL, training-set
+BIC, clustering-recovery, live/dead-component, effective-rank,
+tangent-alignment, and tangent-containment metrics in
+`<run_dir>/metrics.json`. The effective-rank
+rule is deliberately
+common across model kinds: even a configured fixed-q MFA can make a loading
+column negligible relative to its learned noise floor. The output calls the
+configured number of available columns `q_capacity`, since it is fixed `q` for
+vanilla MFA and an upper bound for adaptive-rank models.
+
+Each Gaussian is associated with its unique nearest planted manifold when its
+exact projection distance is within `max_mean_to_manifold_distance`. Tied
+nearest distances remain ambiguous and unassociated. Rank recovery and tangent
+alignment use all proximity-associated components; assignments continue to
+define clustering metrics and the separately reported assignment-live/dead
+counts.
+
+For a manifold with intrinsic dimension `r_i`, tangent alignment compares the
+ground-truth tangent space with the full covariance's leading `r_i`-dimensional
+eigenspace. It reports the mean squared principal-angle cosine as
+`subspace_overlap` and the smallest cosine as `worst_direction_cosine`. The
+subspace requires only the relative boundary eigengap between eigenvalues
+`r_i` and `r_i + 1` to exceed `1e-6`; internal eigenvalue ties are valid. Each
+global and per-manifold summary contains an unweighted mean plus valid and
+undefined component counts. A summary with no valid components has a JSON
+`null` mean.
+
+`tangent_containment` uses the same scores against the leading effective-rank
+covariance subspace. Missing tangent dimensions score zero, effective rank zero
+produces defined zero scores for both tangent metrics, and containment uses its
+own effective-rank covariance eigengap boundary.
+
+See [Toy-Manifold Tiling Evaluation](../evaluation/toy-manifold-tiling.md) for
+the exact geometry, metric equations, population definitions, undefined cases,
+and `metrics.json` schema.
 
 ## `resources`
 

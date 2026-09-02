@@ -1,0 +1,4 @@
+interface:
+  display_name: "Run DALG Pipeline"
+  short_description: "Configure and run manifest-based MFA training"
+  default_prompt: "Use $dalg-run-pipeline with this YAML config to train vanilla or adaptive-rank MFA, with the requested downstream stages."

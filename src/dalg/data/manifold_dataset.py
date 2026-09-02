@@ -41,8 +41,7 @@ class ToyManifoldConfig:
     """
 
     ambient_dim: int = 128
-    n_train: int = 300_000
-    n_val: int = 100_000
+    n_samples: int = 400_000
     calibration_size: int = 50_000
     manifolds_per_type: int = 8
     manifold_types: tuple[str, ...] = MANIFOLD_NAMES
@@ -67,8 +66,7 @@ class ToyManifoldConfig:
 def _validate_config(config: ToyManifoldConfig) -> None:
     for name in (
         "ambient_dim",
-        "n_train",
-        "n_val",
+        "n_samples",
         "calibration_size",
         "manifolds_per_type",
     ):
@@ -77,8 +75,8 @@ def _validate_config(config: ToyManifoldConfig) -> None:
             raise TypeError(f"{name} must be an integer")
     if config.ambient_dim < 3:
         raise ValueError("ambient_dim must be at least 3")
-    if config.n_train <= 0 or config.n_val <= 0:
-        raise ValueError("n_train and n_val must be positive")
+    if config.n_samples <= 0:
+        raise ValueError("n_samples must be positive")
     if config.calibration_size < 2:
         raise ValueError("calibration_size must be at least 2")
     if config.manifolds_per_type <= 0:
@@ -407,7 +405,7 @@ def _balanced_counts(total: int, num_manifolds: int) -> list[int]:
     ]
 
 
-def _make_split(
+def _make_dataset(
     n_samples: int,
     *,
     config: ToyManifoldConfig,
@@ -453,18 +451,15 @@ def _make_split(
     return TensorDataset(x[permutation].float(), y[permutation])
 
 
-def make_toy_manifold_datasets(
+def make_toy_manifold_dataset(
     config: ToyManifoldConfig | None = None,
-) -> tuple[TensorDataset, TensorDataset, dict[str, object]]:
-    """Generate train and validation points from shared manifold instances.
+) -> tuple[TensorDataset, dict[str, object]]:
+    """Generate points sampled from shared manifold instances.
 
-    The first tensor in each dataset is the ambient observation and the second
-    is its manifold-instance ID. Train and validation independently sample
-    noisy points from the same instances. Observation noise is isotropic in the
-    ambient space, with a type-specific standard deviation set by
-    ``config.noise_ratio``. This ordering lets the datasets pass directly
-    through a normal ``DataLoader`` into ``train_nll`` while retaining
-    ground-truth instance membership for evaluation.
+    The first tensor is the ambient observation and the second is its
+    manifold-instance ID. Observation noise is isotropic in the ambient space,
+    with a type-specific standard deviation set by ``config.noise_ratio``.
+    The activation-shard training path creates the train/validation split.
     """
 
     config = ToyManifoldConfig() if config is None else config
@@ -529,8 +524,8 @@ def make_toy_manifold_datasets(
     offset_directions = _offset_directions(config, num_manifolds)
     offsets = float(config.offset_radius) * offset_directions
 
-    train_dataset = _make_split(
-        config.n_train,
+    dataset = _make_dataset(
+        config.n_samples,
         config=config,
         stream=400,
         means=means_tuple,
@@ -541,19 +536,6 @@ def make_toy_manifold_datasets(
         offsets=offsets,
         manifold_type_ids=manifold_type_ids,
     )
-    val_dataset = _make_split(
-        config.n_val,
-        config=config,
-        stream=500,
-        means=means_tuple,
-        scales=scales_tensor,
-        noise_stds=noise_stds,
-        samplers=samplers,
-        embeddings=embeddings_tuple,
-        offsets=offsets,
-        manifold_type_ids=manifold_type_ids,
-    )
-
     manifolds = []
     for manifold_id, type_id_tensor in enumerate(manifold_type_ids):
         type_id = int(type_id_tensor)
@@ -595,7 +577,7 @@ def make_toy_manifold_datasets(
         "offsets": offsets,
         "manifolds": manifolds,
     }
-    return train_dataset, val_dataset, metadata
+    return dataset, metadata
 
 
 def save_toy_manifold_shards(
@@ -609,9 +591,7 @@ def save_toy_manifold_shards(
 
     Every point is represented as a one-position activation window, so layer
     shards have shape ``(rows, 1, ambient_dim)`` and ``drop_prefix`` is zero.
-    The independently sampled train and validation tensors from
-    :func:`make_toy_manifold_datasets` are concatenated into one canonical
-    stream; downstream training creates its own split with the standard
+    Downstream training creates the train/validation split with the standard
     ``val_frac`` and ``split_seed`` arguments.
 
     Per-row JSON metadata records the manifold instance and type. The larger
@@ -639,7 +619,7 @@ def save_toy_manifold_shards(
             raise FileExistsError(f"output directory is not empty: {root}")
 
     config = ToyManifoldConfig() if config is None else config
-    train_dataset, val_dataset, metadata = make_toy_manifold_datasets(config)
+    dataset, metadata = make_toy_manifold_dataset(config)
     manifold_type_ids = metadata["manifold_type_ids"]
     manifold_types = metadata["manifold_types"]
     intrinsic_dims = metadata["intrinsic_dims"]
@@ -652,55 +632,52 @@ def save_toy_manifold_shards(
 
     global_row = 0
     shard_id = 0
-    row_manifold_ids = []
-    for dataset in (train_dataset, val_dataset):
-        points, manifold_ids = dataset.tensors
-        row_manifold_ids.append(manifold_ids)
-        for start in range(0, len(dataset), shard_size):
-            end = min(start + shard_size, len(dataset))
-            shard_points = points[start:end].clone().unsqueeze(1)
-            shard_manifold_ids = manifold_ids[start:end].tolist()
-            row_indices = list(range(global_row, global_row + len(shard_points)))
+    points, manifold_ids = dataset.tensors
+    for start in range(0, len(dataset), shard_size):
+        end = min(start + shard_size, len(dataset))
+        shard_points = points[start:end].clone().unsqueeze(1)
+        shard_manifold_ids = manifold_ids[start:end].tolist()
+        row_indices = list(range(global_row, global_row + len(shard_points)))
 
-            rows = []
-            for manifold_id in shard_manifold_ids:
-                type_id = int(manifold_type_ids[manifold_id])
-                rows.append(
-                    {
-                        "subset": manifold_types[type_id],
-                        "manifold_id": int(manifold_id),
-                        "manifold_type_id": type_id,
-                        "intrinsic_dim": intrinsic_dims[type_id],
-                    }
-                )
-
-            shard_path = layer_dir / f"shard_{shard_id:05d}.pt"
-            shard_tmp = shard_path.with_suffix(".pt.tmp")
-            torch.save(shard_points, shard_tmp)
-            shard_tmp.replace(shard_path)
-
-            meta_path = meta_dir / f"shard_{shard_id:05d}.json"
-            meta_tmp = meta_path.with_suffix(".json.tmp")
-            meta_tmp.write_text(
-                json.dumps(
-                    {
-                        "start": global_row,
-                        "end": global_row + len(shard_points),
-                        "row_indices": row_indices,
-                        "rows": rows,
-                    }
-                )
+        rows = []
+        for manifold_id in shard_manifold_ids:
+            type_id = int(manifold_type_ids[manifold_id])
+            rows.append(
+                {
+                    "subset": manifold_types[type_id],
+                    "manifold_id": int(manifold_id),
+                    "manifold_type_id": type_id,
+                    "intrinsic_dim": intrinsic_dims[type_id],
+                }
             )
-            meta_tmp.replace(meta_path)
 
-            global_row += len(shard_points)
-            shard_id += 1
+        shard_path = layer_dir / f"shard_{shard_id:05d}.pt"
+        shard_tmp = shard_path.with_suffix(".pt.tmp")
+        torch.save(shard_points, shard_tmp)
+        shard_tmp.replace(shard_path)
+
+        meta_path = meta_dir / f"shard_{shard_id:05d}.json"
+        meta_tmp = meta_path.with_suffix(".json.tmp")
+        meta_tmp.write_text(
+            json.dumps(
+                {
+                    "start": global_row,
+                    "end": global_row + len(shard_points),
+                    "row_indices": row_indices,
+                    "rows": rows,
+                }
+            )
+        )
+        meta_tmp.replace(meta_path)
+
+        global_row += len(shard_points)
+        shard_id += 1
 
     saved_metadata = dict(metadata)
     saved_metadata.update(
         {
-            "row_manifold_ids": torch.cat(row_manifold_ids),
-            "canonical_order": "generated_train_then_generated_val",
+            "row_manifold_ids": manifold_ids,
+            "canonical_order": "generated",
             "layer": layer,
         }
     )
@@ -735,6 +712,6 @@ def save_toy_manifold_shards(
 __all__ = [
     "MANIFOLD_NAMES",
     "ToyManifoldConfig",
-    "make_toy_manifold_datasets",
+    "make_toy_manifold_dataset",
     "save_toy_manifold_shards",
 ]

@@ -1,5 +1,9 @@
 # Adaptive-q MFA toy-manifold experiments
 
+> **Kind:** Experiment snapshot · **Status:** Completed single-seed comparison ·
+> **Use when:** Interpreting the original toy-manifold comparison between MFA-ARD
+> and MFA-HDDC.
+
 ## Scope
 
 Two completed single-seed experiments compare adaptive per-component rank in an
@@ -136,5 +140,9 @@ meaningful rank diagnostics.
 - The ARD setting is a column-collapse result at `lambda=1`, not evidence of
   successful rank recovery. A useful ARD study needs a lambda/warmup sweep.
 
-The executable evaluation is in `notebooks/evaluate_adaptive_q.ipynb`; switch
-`MODEL_DIR` between the two artifact directories above.
+The executable evaluation is
+`src/dalg/evaluation/toy_manifold_tiling.py`. It is model-agnostic across vanilla
+MFA, ARD, and HDDC; use the pipeline's `toy_manifold_tiling` evaluation kind for
+new runs. See
+[Toy-Manifold Tiling Evaluation](../evaluation/toy-manifold-tiling.md) for the
+current association, rank, and tangent-alignment definitions.

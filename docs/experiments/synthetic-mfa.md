@@ -1,5 +1,8 @@
 # Synthetic MFA Analyses
 
+> **Kind:** Experiment context · **Status:** Experimental · **Use when:** Running
+> or interpreting the temporary synthetic MFA sweep.
+
 This is an attachable context file for the temporary synthetic MFA research workflow under `scripts/` and `notebooks/`. Treat it as analysis code, not core library API.
 
 ## Main sweep

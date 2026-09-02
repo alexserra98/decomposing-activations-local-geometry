@@ -1,5 +1,8 @@
 # Recreating Pile Activations on a New Cluster
 
+> **Kind:** Workflow · **Status:** Current · **Use when:** Rebuilding Pile token
+> windows or Gemma-2B activation shards on a new cluster.
+
 This guide walks through rebuilding two datasets from scratch:
 
 1. **`pile_gemma2b_100M_windows`** — tokenised Pile windows (HF Arrow format)
@@ -107,7 +110,7 @@ Expected output:
 
 This step streams the 17 Timaeus Pile subsets from HuggingFace, tokenises each document with the Gemma-2B tokenizer, samples one 256-token window per document, and writes an HF Arrow dataset to disk.
 
-**Estimated wall time:** 3–6 hours (network-bound; no GPU needed)  
+**Estimated wall time:** 3–6 hours (network-bound; no GPU needed)<br>
 **Estimated disk space:** ~25 GB
 
 ### SLURM (recommended)
@@ -165,7 +168,7 @@ HF dataset columns:
 
 This step runs the full Gemma-2B model on each window and saves the residual-stream activations at layers 5 and 17.
 
-**Estimated wall time:** ~4–6 hours on a single A100 for 100M tokens  
+**Estimated wall time:** ~4–6 hours on a single A100 for 100M tokens<br>
 **Estimated disk space:** ~200 GB total (float16, 2 layers, 256 window, 2048 d_model)
 
 ### SLURM (recommended)
