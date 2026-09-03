@@ -66,9 +66,22 @@ p_{ki} = \operatorname*{argmin}_{p \in M_i} \|\mu_k - p\|_2
 on the noiseless manifold and records \(\delta_{ki}=\|\mu_k-p_{ki}\|_2\). The
 projection uses the instance's saved calibration, orthonormal embedding, and
 ambient offset; it does not use sampled noisy dataset points. Segment, circle,
-flat disk, sphere, and torus projections are analytic. Mobius, Swiss-roll, and
-helix projections enumerate coarse local minima of their one-dimensional
-objectives and refine every candidate before choosing the global minimum.
+flat disk, sphere, torus, 10D-hypersphere, and 12D-product-torus projections are
+analytic. Mobius, Swiss-roll, and helix projections enumerate coarse local
+minima of their one-dimensional objectives and refine every candidate before
+choosing the global minimum.
+
+For the two high-dimensional types, the closed-form raw-local projections are:
+
+- hypersphere: normalize a nonzero 11-vector, with its 10D tangent given by the
+  orthogonal complement of the projected radius;
+- product torus: split a 24-vector into twelve pairs, normalize each nonzero
+  pair independently, and use its 90-degree rotation as that circle factor's
+  tangent direction.
+
+"Raw-local origin" and "raw-local zero pair" below refer to coordinates after
+reversing the saved ambient offset, embedding, and calibration. They are not in
+general the zero vector or a zero pair in the model's ambient coordinates.
 
 A component is associated with manifold \(i\) exactly when:
 
@@ -76,18 +89,32 @@ A component is associated with manifold \(i\) exactly when:
 2. \(\delta_{ki}\) is at most
    `evaluation.max_mean_to_manifold_distance`.
 
-The cutoff is inclusive. A tie between nearest manifold instances is marked
-ambiguous and left unassociated. These three global counts partition all \(K\)
-components:
+The cutoff is inclusive. Projection has two distinct uniqueness questions:
+
+1. **Nearest-instance uniqueness.** A distance tie between separate planted
+   manifold instances is marked `ambiguous` and left unassociated.
+2. **Within-manifold uniqueness.** The uniquely nearest instance may itself
+   have multiple equally near projected points. This occurs at the raw-local
+   origin of `hypersphere_10d`, where every sphere point is equally near, or
+   when any raw-local pair of `product_torus_12d` is zero, where every angle on
+   that circle factor is equally near.
+
+Noiseless generated samples do not occupy these degenerate locations, but a
+learned component mean can. In a within-manifold degeneracy, the projector
+returns a deterministic representative point so its distance remains finite
+and marks the projection non-unique because neither the point nor its tangent
+is identified. If the nearest instance is unique and the representative
+distance passes the cutoff, the component remains associated and contributes
+to rank recovery, but both tangent metrics are undefined.
+
+These three global counts partition all \(K\) components:
 
 - `associated_components`
 - `outside_cutoff_components`
 - `ambiguous_components`
 
-The nearest manifold instance can be unique even when projection within that
-manifold does not determine a unique tangent, for example for a mean at the
-center of a circle. Such a component remains associated and contributes to
-rank recovery, but its alignment is undefined.
+The same within-manifold rule applies to existing degeneracies such as a mean
+at the center of a circle: this is not reported as cross-manifold ambiguity.
 
 ## Effective-rank recovery
 
@@ -184,10 +211,10 @@ The scores are
 \]
 
 When \(s_k\ge r_i\), both scores equal one exactly when the tangent is contained
-in the effective-rank PC subspace. An effective-rank-zero component has no
-learned signal subspace and receives defined zero scores under both
-`tangent_alignment` and `tangent_containment`; noise-only covariance axes are
-not treated as learned tangent directions.
+in the effective-rank PC subspace. When projection supplies a unique tangent,
+an effective-rank-zero component has no learned signal subspace and receives
+defined zero scores under both `tangent_alignment` and `tangent_containment`;
+noise-only covariance axes are not treated as learned tangent directions.
 
 Containment becomes easier as effective rank grows and is trivially perfect
 when \(s_k=D\). Interpret it together with the rank-recovery metrics rather than
@@ -213,9 +240,10 @@ at zero, or when \(s_k=D\), because the retained subspace is the full ambient
 space. One metric can therefore be defined while the other is undefined.
 
 Both metrics are undefined when projection geometry does not determine a unique
-tangent or the tangent Jacobian is rank-deficient. Undefined components remain
-in the associated population and are counted explicitly rather than assigned a
-zero score.
+tangent or the tangent Jacobian is rank-deficient. This projection rule takes
+precedence over the effective-rank-zero and eigengap rules: a non-unique tangent
+is never assigned an artificial zero score. Undefined components remain in the
+associated population and are counted explicitly.
 
 Both lie in \([0,1]\) and are invariant to eigenvector signs and basis rotations
 within either subspace. `subspace_overlap` measures average tangent coverage;
@@ -354,7 +382,7 @@ The evaluator requires:
 ## Code organization
 
 - `toy_manifold_geometry.py` implements noiseless projections and orthonormal
-  tangent construction for all eight manifold types.
+  tangent construction for all ten manifold types.
 - `toy_manifold_metrics.py` implements proximity association, covariance
   eigenspaces, effective rank, principal-angle scores, and aggregation.
 - `toy_manifold_tiling.py` loads artifacts and models, reconstructs the

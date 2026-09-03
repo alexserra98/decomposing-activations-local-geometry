@@ -19,6 +19,9 @@ from dalg.data.manifold_dataset import (
     EMBEDDING_DIMS,
     INTRINSIC_DIMS,
     MANIFOLD_NAMES,
+    _generator,
+    _sample_hypersphere_10d,
+    _sample_product_torus_12d,
 )
 from dalg.models.mfa import MFA
 from dalg.models.train import train_nll
@@ -26,7 +29,7 @@ from dalg.models.train import train_nll
 
 def _tiny_config(**overrides) -> ToyManifoldConfig:
     config = ToyManifoldConfig(
-        ambient_dim=16,
+        ambient_dim=32,
         n_samples=120,
         calibration_size=256,
         seed=17,
@@ -39,10 +42,10 @@ def test_shapes_dtypes_labels_and_metadata() -> None:
     points, manifold_ids = dataset.tensors
 
     assert isinstance(dataset, TensorDataset)
-    assert points.shape == (124, 16)
+    assert points.shape == (124, 32)
     assert points.dtype == torch.float32
     assert manifold_ids.dtype == torch.long
-    assert metadata["num_manifolds"] == 64
+    assert metadata["num_manifolds"] == 80
     assert tuple(metadata["manifold_types"]) == MANIFOLD_NAMES
     assert tuple(metadata["intrinsic_dims"]) == INTRINSIC_DIMS
     assert tuple(metadata["embedding_dims"]) == EMBEDDING_DIMS
@@ -51,9 +54,9 @@ def test_shapes_dtypes_labels_and_metadata() -> None:
         "maximum absolute extrinsic principal curvature"
     )
     assert metadata["flat_radius_convention"] == "unit RMS radius"
-    assert metadata["max_abs_curvatures"].shape == (8,)
-    assert metadata["curvature_radii"].shape == (8,)
-    assert metadata["noise_stds"].shape == (8,)
+    assert metadata["max_abs_curvatures"].shape == (10,)
+    assert metadata["curvature_radii"].shape == (10,)
+    assert metadata["noise_stds"].shape == (10,)
     assert torch.equal(
         metadata["max_abs_curvatures"][[0, 2]],
         torch.zeros(2, dtype=torch.float64),
@@ -62,17 +65,17 @@ def test_shapes_dtypes_labels_and_metadata() -> None:
     assert torch.all(metadata["noise_stds"] > 0)
     assert torch.allclose(
         metadata["curvature_radii"] / metadata["noise_stds"],
-        torch.full((8,), 10_000.0, dtype=torch.float64),
+        torch.full((10,), 10_000.0, dtype=torch.float64),
     )
 
-    counts = torch.bincount(manifold_ids, minlength=64)
+    counts = torch.bincount(manifold_ids, minlength=80)
     assert int(counts.max() - counts.min()) <= 1
 
     manifolds = metadata["manifolds"]
-    assert len(manifolds) == 64
-    assert [item["manifold_id"] for item in manifolds] == list(range(64))
-    type_counts = torch.bincount(metadata["manifold_type_ids"], minlength=8)
-    assert torch.equal(type_counts, torch.full((8,), 8))
+    assert len(manifolds) == 80
+    assert [item["manifold_id"] for item in manifolds] == list(range(80))
+    type_counts = torch.bincount(metadata["manifold_type_ids"], minlength=10)
+    assert torch.equal(type_counts, torch.full((10,), 8))
     for item in manifolds:
         type_id = item["type_id"]
         assert item["type_name"] == MANIFOLD_NAMES[type_id]
@@ -104,6 +107,31 @@ def test_selected_manifold_types() -> None:
         "circle",
         "helix",
     ]
+
+
+def test_high_dimensional_raw_samples_satisfy_manifold_constraints() -> None:
+    config = _tiny_config()
+    hypersphere = _sample_hypersphere_10d(128, _generator(config.seed, 1), config)
+    product_torus = _sample_product_torus_12d(
+        128,
+        _generator(config.seed, 2),
+        config,
+    )
+
+    assert hypersphere.shape == (128, 11)
+    assert torch.allclose(
+        hypersphere.norm(dim=1),
+        torch.ones(128, dtype=torch.float64),
+        atol=1e-12,
+        rtol=0.0,
+    )
+    assert product_torus.shape == (128, 24)
+    assert torch.allclose(
+        product_torus.reshape(128, 12, 2).norm(dim=2),
+        torch.ones((128, 12), dtype=torch.float64),
+        atol=1e-12,
+        rtol=0.0,
+    )
 
 
 def test_generation_is_deterministic_and_seeded() -> None:
@@ -140,6 +168,7 @@ def test_raw_curvatures_match_manifold_geometry() -> None:
     assert curvatures[5] > 0.0
     assert float(curvatures[6]) == pytest.approx(6.0 / 5.0**1.5)
     assert float(curvatures[7]) == pytest.approx(0.8)
+    assert torch.equal(curvatures[8:], torch.ones(2, dtype=torch.float64))
     assert torch.allclose(
         metadata["max_abs_curvatures"],
         curvatures * metadata["calibration_scales"],
@@ -152,7 +181,7 @@ def test_instances_have_independent_embeddings_and_offset_directions() -> None:
     for manifold in metadata["manifolds"]:
         local_dim = manifold["embedding_dim"]
         embedding = manifold["embedding"]
-        assert embedding.shape == (local_dim, 16)
+        assert embedding.shape == (local_dim, 32)
         assert torch.allclose(
             embedding @ embedding.T,
             torch.eye(local_dim, dtype=embedding.dtype),
@@ -162,13 +191,13 @@ def test_instances_have_independent_embeddings_and_offset_directions() -> None:
 
     directions = metadata["offset_directions"]
     offsets = metadata["offsets"]
-    assert directions.shape == (64, 16)
+    assert directions.shape == (80, 32)
     assert torch.allclose(
-        directions.norm(dim=1), torch.ones(64, dtype=directions.dtype)
+        directions.norm(dim=1), torch.ones(80, dtype=directions.dtype)
     )
     assert torch.allclose(
         offsets.norm(dim=1),
-        torch.full((64,), 2.0, dtype=offsets.dtype),
+        torch.full((80,), 2.0, dtype=offsets.dtype),
         atol=1e-10,
         rtol=0.0,
     )
@@ -186,7 +215,7 @@ def test_centered_manifolds_have_zero_mean_and_unit_rms() -> None:
     )
     x, manifold_ids = dataset.tensors
 
-    for manifold_id in range(64):
+    for manifold_id in range(80):
         points = x[manifold_ids == manifold_id]
         assert points.mean(dim=0).norm() < 0.12
         rms = points.square().sum(dim=1).mean().sqrt()
@@ -224,7 +253,7 @@ def test_ambient_noise_matches_curvature_scaled_standard_deviation() -> None:
     )
     assert torch.allclose(
         metadata["curvature_radii"] / metadata["noise_stds"],
-        torch.full((8,), 1_000.0, dtype=torch.float64),
+        torch.full((10,), 1_000.0, dtype=torch.float64),
     )
 
 
@@ -286,7 +315,7 @@ def test_shard_writer_matches_activation_training_protocol(tmp_path) -> None:
     assert shard_config["layers"] == [0]
     assert shard_config["window"] == 1
     assert shard_config["drop_prefix"] == 0
-    assert shard_config["d_model"] == 16
+    assert shard_config["d_model"] == 32
     assert shard_config["dtype"] == "float32"
     assert shard_config["num_rows"] == 124
     assert shard_config["num_shards"] == 5
@@ -299,7 +328,7 @@ def test_shard_writer_matches_activation_training_protocol(tmp_path) -> None:
         for path in shard_paths
     )
     assert all(
-        torch.load(path, mmap=True, weights_only=True).shape[1:] == (1, 16)
+        torch.load(path, mmap=True, weights_only=True).shape[1:] == (1, 32)
         for path in shard_paths
     )
     for path in shard_paths:
@@ -358,6 +387,13 @@ def test_shard_writer_rejects_nonempty_output(tmp_path) -> None:
     ("overrides", "message"),
     [
         ({"ambient_dim": 2}, "ambient_dim"),
+        (
+            {
+                "ambient_dim": 23,
+                "manifold_types": ("product_torus_12d",),
+            },
+            "largest selected native embedding dimension",
+        ),
         ({"n_samples": 0}, "n_samples"),
         ({"calibration_size": 1}, "calibration_size"),
         ({"manifolds_per_type": 0}, "manifolds_per_type"),

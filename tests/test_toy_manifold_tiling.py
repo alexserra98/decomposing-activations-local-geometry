@@ -34,7 +34,7 @@ def _build_evaluation_artifacts(tmp_path: Path, model_kind: str) -> tuple[Path, 
     shard_dir = save_toy_manifold_shards(
         tmp_path / "toy_shards",
         ToyManifoldConfig(
-            ambient_dim=8,
+            ambient_dim=32,
             n_samples=96,
             calibration_size=32,
             manifolds_per_type=1,
@@ -109,6 +109,7 @@ def test_toy_manifold_tiling_evaluation_supports_all_model_kinds(
 
     assert metrics["evaluation"] == "toy_manifold_tiling"
     assert metrics["model_kind"] == model_kind
+    assert metrics["K"] == 10
     assert metrics["components"]["dead"] == 0
     assert metrics["association"] == {
         "rule": "unique_nearest_exact_projection_within_cutoff",

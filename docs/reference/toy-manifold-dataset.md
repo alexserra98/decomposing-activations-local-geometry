@@ -19,7 +19,7 @@ CLI or workflow skill; import these functions directly.
 
 ## Dataset construction
 
-The generator defines eight manifold types:
+The generator defines ten manifold types:
 
 | Type | Intrinsic dimension | Native embedding dimension |
 | --- | ---: | ---: |
@@ -31,28 +31,50 @@ The generator defines eight manifold types:
 | `mobius` | 2 | 3 |
 | `swiss_roll` | 2 | 3 |
 | `helix` | 1 | 3 |
+| `hypersphere_10d` | 10 | 11 |
+| `product_torus_12d` | 12 | 24 |
 
 `manifolds_per_type` independently embedded instances are created for every
 selected type. Each instance is normalized by a deterministic calibration
 sample, embedded in `ambient_dim` through an independently sampled orthonormal
 basis, and translated by its recorded ambient offset.
 
+The two high-dimensional types have fixed geometry. In raw local coordinates,
+the hypersphere is
+
+\[
+S^{10}=\{x\in\mathbb{R}^{11}:\lVert x\rVert_2=1\},
+\]
+
+so it is the sphere surface, not the filled unit ball. The product torus is
+
+\[
+T^{12}=(S^1)^{12}
+ = \{(\cos\theta_1,\sin\theta_1,\ldots,
+       \cos\theta_{12},\sin\theta_{12})\}\subset\mathbb{R}^{24}.
+\]
+
+The hypersphere is sampled by normalizing isotropic Gaussian directions. The
+product torus is sampled from twelve independent uniform angles. Both have raw
+maximum absolute extrinsic curvature `1.0`. Their intrinsic dimensions and
+unit radii are fixed rather than configurable.
+
 The main configuration fields are:
 
 | Field | Default | Meaning |
 | --- | ---: | --- |
-| `ambient_dim` | `128` | Ambient dimension of every generated point; must be at least 3. |
+| `ambient_dim` | `128` | Ambient dimension of every generated point; must be at least 3 and at least the largest selected native embedding dimension. The default ten-type selection therefore requires at least 24. |
 | `n_samples` | `400_000` | Total number of points across all manifold instances. |
 | `calibration_size` | `50_000` | Per-type sample count used to compute deterministic centering and RMS normalization. |
 | `manifolds_per_type` | `8` | Number of independently embedded instances of each selected type. |
-| `manifold_types` | all eight types | Unique tuple of types to include. |
+| `manifold_types` | all ten types | Unique tuple of types to include. |
 | `offset_radius` | `4.0` | Radius of the sphere on which instance centers are placed; `0` centers every instance at the origin. |
 | `noise_ratio` | `10_000.0` | Ratio between normalized curvature radius and per-coordinate ambient Gaussian-noise standard deviation. |
 | `seed` | `0` | Seed for calibration, embeddings, offsets, sampling, noise, and final row order. |
 
 The remaining fields control the native parameter ranges and geometry of the
-segment, torus, Mobius strip, Swiss roll, and helix. Read the frozen
-`ToyManifoldConfig` dataclass before changing those shapes.
+low-dimensional segment, torus, Mobius strip, Swiss roll, and helix. Read the
+frozen `ToyManifoldConfig` dataclass before changing those shapes.
 
 Use the same seed and configuration except for `offset_radius` to generate a
 paired centered and separated condition. The point geometry, embeddings,
@@ -147,6 +169,25 @@ reports rank and tangent-subspace metrics; assignments are used for clustering
 and component-liveness diagnostics. Read the
 [Toy-Manifold Tiling Evaluation](../evaluation/toy-manifold-tiling.md) for the
 metric and artifact contract.
+
+### Non-unique high-dimensional projections
+
+Projection degeneracies concern MFA component means during evaluation, not
+noiseless samples emitted by these generators. Here, the hypersphere's
+"origin" and a product-torus "zero pair" mean raw local coordinates obtained
+*after* reversing the saved ambient offset, orthonormal embedding, and
+calibration. They do not generally coincide with the ambient zero vector.
+
+- At the hypersphere origin, every point of the sphere is equally near.
+- If any two-coordinate product-torus pair is zero, every angle on that circle
+  factor is equally near.
+
+The geometry evaluator returns a deterministic representative point so that
+the exact distance stays finite, but marks either case as non-unique because
+the projected point and its tangent are not identified. See
+[Exact proximity association](../evaluation/toy-manifold-tiling.md#exact-proximity-association)
+for how this differs from a tie between separate planted manifolds and how it
+affects rank and tangent metrics.
 
 The generator contract is covered by `tests/test_manifold_dataset.py`; exact
 geometry and pipeline consumption are covered by

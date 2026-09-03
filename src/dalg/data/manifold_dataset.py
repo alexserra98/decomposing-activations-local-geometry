@@ -21,9 +21,11 @@ MANIFOLD_NAMES = (
     "mobius",
     "swiss_roll",
     "helix",
+    "hypersphere_10d",
+    "product_torus_12d",
 )
-INTRINSIC_DIMS = (1, 1, 2, 2, 2, 2, 2, 1)
-EMBEDDING_DIMS = (1, 2, 2, 3, 3, 3, 3, 3)
+INTRINSIC_DIMS = (1, 1, 2, 2, 2, 2, 2, 1, 10, 12)
+EMBEDDING_DIMS = (1, 2, 2, 3, 3, 3, 3, 3, 11, 24)
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,18 @@ def _validate_config(config: ToyManifoldConfig) -> None:
     unknown_types = set(config.manifold_types) - set(MANIFOLD_NAMES)
     if unknown_types:
         raise ValueError(f"unknown manifold types: {sorted(unknown_types)}")
+    required_ambient_dim = max(
+        3,
+        max(
+            EMBEDDING_DIMS[MANIFOLD_NAMES.index(name)]
+            for name in config.manifold_types
+        ),
+    )
+    if config.ambient_dim < required_ambient_dim:
+        raise ValueError(
+            "ambient_dim must be at least the largest selected native embedding "
+            f"dimension ({required_ambient_dim})"
+        )
     if not isinstance(config.seed, int) or isinstance(config.seed, bool):
         raise TypeError("seed must be an integer")
 
@@ -248,6 +262,28 @@ def _sample_helix(
     )
 
 
+def _sample_hypersphere_10d(
+    n: int, generator: torch.Generator, _config: ToyManifoldConfig
+) -> torch.Tensor:
+    points = torch.randn(n, 11, generator=generator, dtype=torch.float64)
+    norms = points.norm(dim=1, keepdim=True)
+    if torch.any(norms == 0.0):
+        raise RuntimeError("hypersphere sampler produced a zero direction")
+    return points / norms
+
+
+def _sample_product_torus_12d(
+    n: int, generator: torch.Generator, _config: ToyManifoldConfig
+) -> torch.Tensor:
+    angles = 2.0 * math.pi * torch.rand(
+        n,
+        12,
+        generator=generator,
+        dtype=torch.float64,
+    )
+    return torch.stack((torch.cos(angles), torch.sin(angles)), dim=2).reshape(n, 24)
+
+
 def _surface_max_abs_principal_curvature(
     xu: torch.Tensor,
     xv: torch.Tensor,
@@ -354,6 +390,8 @@ def _raw_max_abs_curvatures(config: ToyManifoldConfig) -> torch.Tensor:
             _mobius_max_abs_curvature(config),
             swiss_curvature,
             helix_curvature,
+            1.0,
+            1.0,
         ),
         dtype=torch.float64,
     )
@@ -369,6 +407,8 @@ _SAMPLERS: tuple[_Sampler, ...] = (
     _sample_mobius,
     _sample_swiss_roll,
     _sample_helix,
+    _sample_hypersphere_10d,
+    _sample_product_torus_12d,
 )
 
 

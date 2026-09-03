@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from dalg.data.manifold_dataset import ToyManifoldConfig, make_toy_manifold_dataset
+from dalg.evaluation.toy_manifold_geometry import _project_mean_to_manifold
 from dalg.evaluation.toy_manifold_metrics import (
     _associate_component_means,
     _subspace_alignment,
@@ -52,6 +53,43 @@ def _flat_disk_frame(metadata):
     normal_0, normal_1 = vh[2], vh[3]
     mean = _ambient_point(metadata, 0, torch.zeros(2)).float()
     return mean, tangent_0, tangent_1, normal_0, normal_1
+
+
+def _high_dimensional_metadata(type_name: str):
+    _, metadata = make_toy_manifold_dataset(
+        ToyManifoldConfig(
+            ambient_dim=32,
+            n_samples=16,
+            calibration_size=128,
+            manifolds_per_type=1,
+            manifold_types=(type_name,),
+            offset_radius=3.0,
+            seed=13,
+        )
+    )
+    return metadata
+
+
+def _high_dimensional_raw_point(type_name: str) -> torch.Tensor:
+    if type_name == "hypersphere_10d":
+        point = torch.arange(1, 12, dtype=torch.float64)
+        return point / point.norm()
+    if type_name == "product_torus_12d":
+        angles = torch.linspace(0.2, 2.4, 12, dtype=torch.float64)
+        return torch.stack((torch.cos(angles), torch.sin(angles)), dim=1).reshape(-1)
+    raise AssertionError(f"unexpected high-dimensional manifold: {type_name}")
+
+
+def _high_dimensional_frame(type_name: str):
+    metadata = _high_dimensional_metadata(type_name)
+    mean = _ambient_point(metadata, 0, _high_dimensional_raw_point(type_name))
+    projection = _project_mean_to_manifold(
+        mean,
+        metadata["manifolds"][0],
+        metadata,
+    )
+    assert projection.unique
+    return metadata, mean, projection.tangent
 
 
 def test_subspace_alignment_is_basis_invariant() -> None:
@@ -118,6 +156,130 @@ def test_subspace_alignment_penalizes_missing_tangent_dimensions() -> None:
 
     assert overlap == pytest.approx(0.5, abs=1e-12)
     assert worst == pytest.approx(0.0, abs=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("type_name", "intrinsic_dim"),
+    [("hypersphere_10d", 10), ("product_torus_12d", 12)],
+)
+def test_high_dimensional_rotated_pc_span_matches_tangent(
+    type_name: str,
+    intrinsic_dim: int,
+) -> None:
+    metadata, mean, tangent = _high_dimensional_frame(type_name)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(23)
+    rotation, _ = torch.linalg.qr(
+        torch.randn(
+            intrinsic_dim,
+            intrinsic_dim,
+            generator=generator,
+            dtype=torch.float64,
+        )
+    )
+    directions = (tangent @ rotation)[None]
+    model = MFA(
+        mean[None],
+        rank=intrinsic_dim,
+        init_directions=directions,
+        psi_init=0.1,
+    )
+    _set_scales(
+        model,
+        torch.linspace(2.0, 1.0, intrinsic_dim, dtype=torch.float64)[None],
+    )
+
+    metrics = evaluate_toy_manifold_metrics(
+        model,
+        metadata,
+        torch.tensor([True]),
+        max_mean_to_manifold_distance=0.1,
+    )
+
+    assert metrics["rank"]["exact_match"] == 1.0
+    for metric_name in ("tangent_alignment", "tangent_containment"):
+        assert metrics[metric_name]["subspace_overlap"] == {
+            "mean": pytest.approx(1.0, abs=1e-10),
+            "valid_components": 1,
+            "undefined_components": 0,
+        }
+        assert metrics[metric_name]["worst_direction_cosine"]["mean"] == (
+            pytest.approx(1.0, abs=1e-10)
+        )
+
+
+def test_twelve_dimensional_pc_span_penalizes_one_missing_direction() -> None:
+    metadata, mean, tangent = _high_dimensional_frame("product_torus_12d")
+    _, _, vh = torch.linalg.svd(tangent.T, full_matrices=True)
+    normal = vh[12]
+    directions = torch.cat((tangent[:, :11], normal[:, None]), dim=1)[None]
+    model = MFA(mean[None], rank=12, init_directions=directions, psi_init=0.1)
+    _set_scales(
+        model,
+        torch.linspace(2.0, 1.0, 12, dtype=torch.float64)[None],
+    )
+
+    metrics = evaluate_toy_manifold_metrics(
+        model,
+        metadata,
+        torch.tensor([True]),
+        max_mean_to_manifold_distance=0.1,
+    )
+
+    for metric_name in ("tangent_alignment", "tangent_containment"):
+        assert metrics[metric_name]["subspace_overlap"]["mean"] == pytest.approx(
+            11.0 / 12.0,
+            abs=1e-10,
+        )
+        assert metrics[metric_name]["worst_direction_cosine"]["mean"] == (
+            pytest.approx(0.0, abs=1e-10)
+        )
+
+
+@pytest.mark.parametrize(
+    "type_name",
+    ["hypersphere_10d", "product_torus_12d"],
+)
+def test_non_unique_high_dimensional_projection_keeps_rank_but_undefines_tangents(
+    type_name: str,
+) -> None:
+    metadata = _high_dimensional_metadata(type_name)
+    manifold = metadata["manifolds"][0]
+    if type_name == "hypersphere_10d":
+        raw_target = torch.zeros(11, dtype=torch.float64)
+    else:
+        raw_target = _high_dimensional_raw_point(type_name).reshape(12, 2)
+        raw_target[5] = 0.0
+        raw_target = raw_target.reshape(-1)
+    mean = _ambient_point(metadata, 0, raw_target)
+    projection = _project_mean_to_manifold(mean, manifold, metadata)
+    model = MFA(
+        mean[None],
+        rank=1,
+        init_directions=torch.eye(32, dtype=torch.float64)[None, :, :1],
+        psi_init=0.1,
+    )
+    cutoff = projection.distance_squared**0.5 + 0.1
+
+    metrics = evaluate_toy_manifold_metrics(
+        model,
+        metadata,
+        torch.tensor([True]),
+        max_mean_to_manifold_distance=cutoff,
+    )
+
+    assert not projection.unique
+    assert metrics["association"]["associated_components"] == 1
+    assert metrics["association"]["ambiguous_components"] == 0
+    assert metrics["rank"]["components"] == 1
+    undefined = {
+        "mean": None,
+        "valid_components": 0,
+        "undefined_components": 1,
+    }
+    for metric_name in ("tangent_alignment", "tangent_containment"):
+        assert metrics[metric_name]["subspace_overlap"] == undefined
+        assert metrics[metric_name]["worst_direction_cosine"] == undefined
 
 
 def test_proximity_association_accepts_cutoff_and_rejects_far_mean() -> None:

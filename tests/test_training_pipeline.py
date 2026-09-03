@@ -744,7 +744,7 @@ def test_real_toy_manifold_tiling_pipeline_runs_end_to_end(tmp_path: Path) -> No
     shard_dir = save_toy_manifold_shards(
         tmp_path / "toy_shards",
         ToyManifoldConfig(
-            ambient_dim=8,
+            ambient_dim=32,
             n_samples=96,
             calibration_size=32,
             manifolds_per_type=1,
@@ -801,7 +801,7 @@ def test_real_toy_manifold_tiling_pipeline_runs_end_to_end(tmp_path: Path) -> No
         )
     )
     assert association_counts == metrics["K"]
-    assert len(metrics["per_manifold"]) == 8
+    assert len(metrics["per_manifold"]) == 10
     assert sum(
         manifold["components"]["associated"]
         for manifold in metrics["per_manifold"]

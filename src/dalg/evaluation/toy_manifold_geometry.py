@@ -250,6 +250,19 @@ def _project_raw_point(
         _, _, vh = torch.linalg.svd(point[None, :], full_matrices=True)
         return _RawProjection(point, vh[1:].T.contiguous(), unique)
 
+    if type_name == "hypersphere_10d":
+        if target.numel() != 11:
+            raise ValueError(
+                "10D-hypersphere projection expects eleven local coordinates"
+            )
+        radius = float(target.norm())
+        unique = radius > _GEOMETRY_EPS
+        point = target / radius if radius > 0.0 else target.new_zeros(11)
+        if radius == 0.0:
+            point[0] = 1.0
+        _, _, vh = torch.linalg.svd(point[None, :], full_matrices=True)
+        return _RawProjection(point, vh[1:].T.contiguous(), unique)
+
     if type_name == "torus":
         if target.numel() != 3:
             raise ValueError("torus projection expects three local coordinates")
@@ -279,6 +292,28 @@ def _project_raw_point(
         )
         tangent = torch.stack((tangent_theta, tangent_phi), dim=1)
         return _RawProjection(point, tangent, theta_unique and phi_unique)
+
+    if type_name == "product_torus_12d":
+        if target.numel() != 24:
+            raise ValueError(
+                "12D-product-torus projection expects twenty-four local coordinates"
+            )
+        target_pairs = target.reshape(12, 2)
+        pair_radii = target_pairs.norm(dim=1)
+        nonzero_pairs = pair_radii > _GEOMETRY_EPS
+        point_pairs = target_pairs / pair_radii.clamp_min(_GEOMETRY_EPS)[:, None]
+        point_pairs[~nonzero_pairs] = target.new_tensor((1.0, 0.0))
+
+        tangent = target.new_zeros((24, 12))
+        for circle_id, pair in enumerate(point_pairs):
+            tangent[2 * circle_id : 2 * circle_id + 2, circle_id] = torch.stack(
+                (-pair[1], pair[0])
+            )
+        return _RawProjection(
+            point_pairs.reshape(-1),
+            tangent,
+            bool(nonzero_pairs.all()),
+        )
 
     if type_name == "mobius":
         if target.numel() != 3:
