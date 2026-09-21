@@ -9,7 +9,7 @@ It does not change their implementations. One resolved run executes these
 stages in order:
 
 ```text
-training -> MFA assignments -> configured evaluation
+optional KMeans/PCA initialization -> training -> MFA assignments -> configured evaluation
 ```
 
 Each stage validates its output and writes a completion marker. Re-running the
@@ -62,15 +62,17 @@ For every supported YAML field, default, and model-specific constraint, see the
   a precomputed initialization instead of fitting KMeans separately for every
   run. Set `training.direction_init: cluster_pca` to initialize loading
   directions from principal components stored with those centroids; this
-  direction-initialization path is a temporary experimental feature.
+  direction-initialization path is a temporary experimental feature. When no
+  centroids or initial model are supplied, new MFA, ARD, and Adam-based HDDC
+  pipelines generate training-only KMeans/PCA initialization automatically.
 - `assignments`: full MFA responsibility assignments. Partial `max_batches`
   output is deliberately not part of the completed pipeline contract.
 - `evaluation`: currently supports `toy_manifold_tiling`, which measures NLL,
-  BIC, planted-manifold clustering recovery, component use, and effective local
-  rank for vanilla MFA, ARD, or HDDC runs on toy-manifold shards. It associates each
-  Gaussian with a nearby planted manifold by exact projection and measures how
-  well its leading intrinsic-dimensional covariance subspace aligns with the
-  ground-truth tangent space.
+  augmented BIC, planted-manifold clustering recovery, component use, and effective local
+  rank for vanilla MFA, ARD, or HDDC runs on toy-manifold shards. It associates
+  each Gaussian with its closest planted manifold by exact projection and
+  measures how well its leading intrinsic-dimensional covariance subspace
+  aligns with the ground-truth tangent space.
 - `resources`: Slurm allocation and maximum array concurrency.
 
 Relative paths are resolved against the repository root. The shard subset can
@@ -79,11 +81,68 @@ be written either in `shard_dir` (`path#pile_wikipedia_1M`) or as a separate
 
 ### Reusing centroids and experimental W initialization
 
+For new MFA, ARD, and Adam-based HDDC runs, omitting both `centroids_path` and
+`init_model_path` adds a KMeans/PCA initialization step before training. The
+pipeline uses the existing toy KMeans builder with the trainer's exact
+`val_frac`, `split_seed`, subset selection, and prefix-token dropping. Every
+training activation is available to KMeans and PCA; validation activations are
+excluded. `direction_init` defaults to `cluster_pca` on this path. Explicit
+`direction_init: random` still saves PCA but initializes loading directions
+randomly. Standalone training CLI defaults are unchanged.
+
+The initialization uses Euclidean KMeans in the original activation dimensions:
+KMeans++, 100 maximum iterations, 10 restarts, and tolerance `1e-6`. It uses the
+training device and seed (or seed 0 when omitted), and saves `rank/q_max` local
+PCA directions. Reservoir options such as `pool_size`, `max_pool_size`,
+`proj_dim`, and `refine_epochs` have no effect on this path.
+
+The builder materializes all training activations in host memory and on the
+selected device; PCA also allocates float64 `(K, D, D)` scatter. Size the job
+accordingly. By default PCA uses hard cluster assignments: every cluster must
+contain at least `rank/q_max + 1` points; empty or undersized clusters fail.
+
+To compute PCA from each centroid's 64 nearest training activations instead,
+add this top-level section:
+
+```yaml
+initialization:
+  pca_method: knn
+  pca_neighbors: 64
+```
+
+Both methods fit the same KMeans centroids. KNN neighborhoods can overlap and
+use covariance around the stored centroid; they need not follow hard cluster
+membership. The neighbor count must exceed `rank/q_max` and cannot exceed the
+training population. KNN computes covariance in batches instead of allocating
+scatter for every cluster at once. Omit this section or set
+`initialization.pca_method: cluster` for the original method. See the
+[exact options and sweep example](../reference/training-pipeline-config.md#initialization).
+
+Generated artifacts live in `<run_dir>/initialization/centroids.pt` and
+`initialization/config.json`. Their metadata records the split, activation
+counts, and a SHA-256 fingerprint of sorted training-row positions. Planning
+records initialization settings, including the selected PCA method and KNN
+neighbor count, in the immutable manifest without fitting anything. Changing
+the method or neighbor count creates a separate run identity. Execution
+validates the bundle and metadata, records
+`INITIALIZATION_COMPLETED.json`, and reuses valid initialization on retries.
+Invalid existing artifacts are rejected without being overwritten. Status
+reports initialization completion as well as subsequent stages. Older manifests
+without the initialization specification retain their original behavior.
+
+For full EM, use `model.kind: hddc`, `model.shared_b: true` and
+`training.fit_method: em`. The
+[one-million-activation example](../../configs/experiments/hddc_em_D128_1M.yaml)
+uses the same plan, submit and resume commands above. EM initializes all
+parameters from the nearest-centroid partition, so omit `direction_init`;
+ordinary `centroids_path` reuse and compatible `init_model_path` warm starts
+remain available. See the [EM contract](../models/mfa-hddc.md#streamed-full-data-em).
+
 > **Temporary experimental feature:** `direction_init: cluster_pca` and the
 > `principal_components` payload in `centroids.pt` exist to support the current
 > W-initialization experiments. Do not treat this path as a stable pipeline
-> interface. Ordinary centroid reuse through `centroids_path` is separate, and
-> `direction_init: random` remains the default.
+> interface. With a supplied centroid artifact, `direction_init: random`
+> remains the default.
 
 Point `training.centroids_path` directly at a `.pt` centroid artifact:
 
@@ -99,8 +158,16 @@ centroid shape matches both `model.K` and the activation dimension. The resolved
 path is stored in every manifest row and passed to the existing trainer. Each
 run copies the artifact into its own output directory and does not run centroid
 fitting. If the path is a directory or does not have the lowercase `.pt`
-extension, planning fails. If the field is omitted, the trainer keeps its normal
-fit-from-scratch behavior.
+extension, planning fails. Automatic initialization applies when both centroid
+and initial-model paths are omitted, as described above.
+
+Supplied artifacts are reused as provided; the pipeline does not establish that
+their fitting excluded the current validation split. For MFA, ARD, and
+Adam-based HDDC, centroids with no nearest-centroid assignments
+in the training split receive one pseudocount when initializing mixture weights.
+This is automatic and logged; see the
+[initialization contract](../reference/training-pipeline-config.md#data-loading-validation-and-initialization)
+for the formula, diagnostics, and EM exception.
 
 Legacy artifacts are bare `(K, D)` tensors. Enriched artifacts are mappings:
 
@@ -127,9 +194,9 @@ training:
   direction_init: cluster_pca
 ```
 
-This initialization is available for `mfa`, `ard`, and `hddc`. It does not
-compute PCA during training: the directions must already be present inside the
-centroid artifact.
+This initialization is available for `mfa`, `ard`, and `hddc`. The trainer reads
+PCA from its centroid artifact; the pipeline generates that artifact beforehand
+when automatic initialization is selected.
 
 For the D=128, K=5000 toy experiment, upgrade the existing centroid tensor
 without refitting KMeans:
@@ -217,6 +284,9 @@ A completed run contains the normal model outputs plus:
 
 ```text
 run_spec.json
+initialization/centroids.pt       # automatic initialization only
+initialization/config.json
+INITIALIZATION_COMPLETED.json
 TRAINING_COMPLETED.json
 mfa_model_assignments.pt
 ASSIGNMENTS_COMPLETED.json
@@ -230,12 +300,16 @@ training, assignment, and evaluation configuration. An existing `run_spec.json`
 must match before the pipeline will resume that directory.
 
 For toy-manifold runs, each Gaussian is associated with its unique nearest
-planted manifold only when the exact mean-to-manifold distance is at most
-`evaluation.max_mean_to_manifold_distance`. Distance ties are ambiguous and
-remain unassociated. `metrics.json` records global association counts and one
-entry per planted manifold with associated, assignment-live, and
-assignment-dead counts. Rank recovery uses the proximity association;
-assignments are used only for clustering and the explicit liveness diagnostic.
+planted manifold by default. Setting
+`evaluation.max_mean_to_manifold_distance` to a finite positive number adds an
+exact mean-to-manifold distance cutoff. Distance ties are ambiguous and remain
+unassociated. `metrics.json` records global association counts and one entry
+per planted manifold with associated, assignment-live, and assignment-dead
+counts. Rank recovery uses the proximity association; assignments define
+clustering, the explicit liveness diagnostic, and augmented BIC's training-only
+activity reward. `bic.value` uses the
+[augmented BIC contract](../evaluation/toy-manifold-tiling.md#augmented-bic),
+with higher values preferred.
 
 For a manifold of intrinsic dimension `r_i`, tangent alignment compares its
 ground-truth tangent basis with the covariance subspace spanned by exactly
@@ -245,7 +319,8 @@ sign- and basis-invariant and lie in `[0, 1]`. Tangent directions that occur
 only in later PCs do not rescue the score.
 
 Tangent containment separately compares the tangent with `PC1..PCs_k`, where
-`s_k` is the component's effective rank. It gives full credit when the tangent
+`s_k` is the saved rank-mask count for HDDC, or the component's thresholded
+effective rank for vanilla MFA and ARD. It gives full credit when the tangent
 is contained in that possibly larger space, pads missing tangent directions
 with zero when `s_k < r_i`, and assigns defined zero scores when `s_k = 0`.
 

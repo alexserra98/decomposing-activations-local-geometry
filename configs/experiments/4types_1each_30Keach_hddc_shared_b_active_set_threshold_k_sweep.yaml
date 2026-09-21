@@ -1,0 +1,64 @@
+# Shared-b HDDC sweep on four manifold types with one 30K-point instance each.
+# Each K value fits its own centroids because centroid artifacts are K-specific.
+
+experiment:
+  name: 4types_1each_30Keach_hddc_shared_b_active_set_threshold_k_sweep
+  output_root: dalg-cache/toy_manifold_models_4types_1each_30Keach
+
+dataset:
+  id: toy_manifolds_circle_helix_torus_helix4d_D128_30Keach_noise1e4
+  shard_dir: /u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/assets/toy_manifolds_circle_helix_torus_helix4d_D128_30K_each_noise1e4_shards
+  layer: 0
+
+model:
+  kind: hddc
+  K: 400
+  q_max: 16
+  shared_b: true
+  surgery_every_epochs: 0.5
+  surgery_threshold: 0.005
+  surgery_min_count: 20
+
+training:
+  centroids_path: dalg-cache/toy_manifold_models_4types_1each_30Keach/centroids/kmeans_k400_sample35pct_pca16/centroids.pt
+  direction_init: cluster_pca
+  epochs: 1000
+  early_stop_patience: 10
+  early_stop_min_delta: 0.001
+  early_stop_delta: 0.0
+  epoch_snapshot_every: 1
+  batch_size: 2048
+  num_workers: 2
+  pool_size: 4096
+  refine_epochs: 0
+  val_frac: 0.1
+  split_seed: 42
+  seed: 42
+  device: cuda
+  wandb: false
+
+assignments:
+  enabled: true
+  batch_size: 4096
+  device: cuda
+
+evaluation:
+  enabled: true
+  kind: toy_manifold_tiling
+  batch_size: 4096
+  device: cuda
+
+resources:
+  partition: H100
+  account: LADE
+  nodes: 1
+  ntasks_per_node: 1
+  cpus_per_task: 8
+  gpus: 1
+  gpu_type: H100
+  memory: 80G
+  time: "01:00:00"
+  max_parallel: 12
+
+sweep:
+  model.surgery_threshold: [0.005, 0.01, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 1.0]

@@ -44,10 +44,12 @@ prerequisites to report. The pipeline never performs activation extraction.
 - **ARD adaptive-rank MFA:** the pipeline still supports `model.kind: ard`, but
   use it only when the config explicitly selects the ARD experiment.
 
-Do not infer effective rank solely from the model kind. The
-`toy_manifold_tiling` evaluator applies the same loading-variance versus noise
-floor threshold to vanilla MFA, ARD, and HDDC, because any of them can make a
-loading column effectively inactive.
+The `toy_manifold_tiling` evaluator uses HDDC's saved `rank_mask.sum(-1)`
+directly for rank recovery and tangent containment. `evaluation.rank_threshold`
+is ignored for HDDC; it applies the loading-variance versus noise-floor rule
+only to vanilla MFA and ARD. Existing immutable manifests may retain that
+legacy field for HDDC; the metrics record `definition: hddc_rank_mask_count`
+without an evaluation threshold.
 
 ## Workflow
 
@@ -73,8 +75,21 @@ loading column effectively inactive.
 
 ## Resume and stage behavior
 
-- One manifest row executes in fixed order: training, optional assignments,
-  optional evaluation.
+- New MFA, ARD, and Adam-based HDDC pipelines without `centroids_path` or
+  `init_model_path` first run automatic KMeans/PCA on the exact training split.
+  Validation rows are excluded. Loading directions default to `cluster_pca`;
+  explicit `random` is respected while PCA is still saved. Supplied artifacts,
+  standalone trainers, and older manifests retain their existing behavior.
+- Initialization uses all training activations in their original dimensions,
+  with 100 KMeans iterations, 10 restarts, tolerance `1e-6`, and `rank/q_max`
+  PCA directions. Reservoir parameters have no effect here. Check host/device
+  memory for the training activations and float64 `(K, D, D)` PCA scatter;
+  undersized clusters fail rather than changing the requested rank.
+- One manifest row executes in fixed order: optional initialization, training,
+  optional assignments, optional evaluation. Planning never fits centroids.
+- Generated initialization lives under `<run_dir>/initialization/`, records
+  split provenance, and is reused after validation on retries. Status includes
+  initialization completion; invalid existing artifacts must not be overwritten.
 - There is no `--stage` or `--only` flag. Existing valid artifacts cause their
   stages to be skipped, so rerunning the same manifest resumes at the first
   incomplete stage.

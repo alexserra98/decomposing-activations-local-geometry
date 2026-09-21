@@ -11,6 +11,7 @@ from dalg.evaluation.toy_manifold_metrics import (
     evaluate_toy_manifold_metrics,
 )
 from dalg.models.mfa import MFA
+from dalg.models.adaptive_q.mfa_hddc import MFA_HDDC
 
 
 def _set_scales(model: MFA, scales: torch.Tensor) -> None:
@@ -53,6 +54,44 @@ def _flat_disk_frame(metadata):
     normal_0, normal_1 = vh[2], vh[3]
     mean = _ambient_point(metadata, 0, torch.zeros(2)).float()
     return mean, tangent_0, tangent_1, normal_0, normal_1
+
+
+@pytest.mark.parametrize("shared_b", [False, True])
+@pytest.mark.parametrize("rank_threshold", [0.01, 1000.0])
+def test_hddc_rank_and_containment_keep_weak_active_directions(
+    shared_b: bool, rank_threshold: float,
+) -> None:
+    metadata = _flat_disk_metadata()
+    mean, tangent_0, tangent_1, normal, _ = _flat_disk_frame(metadata)
+    model = MFA_HDDC(
+        mean[None],
+        rank=3,
+        init_directions=torch.stack((tangent_0, tangent_1, normal), dim=1)[None],
+        psi_init=1.0,
+        shared_b=shared_b,
+        isotropic_psi=not shared_b,
+    )
+    # The second tangent direction is below noise; the strong normal is masked.
+    _set_scales(model, torch.tensor([[2.0, 0.2, 10.0]]))
+    with torch.no_grad():
+        model.rank_mask.copy_(torch.tensor([[1.0, 1.0, 0.0]]))
+
+    metrics = evaluate_toy_manifold_metrics(
+        model, metadata, torch.tensor([True]), rank_threshold=rank_threshold,
+    )
+
+    for name in ("rank", "ambient_rank"):
+        assert metrics[name]["definition"] == "hddc_rank_mask_count"
+        assert "threshold" not in metrics[name]
+        assert metrics[name]["mean_learned"] == 2.0
+        assert metrics[name]["exact_match"] == 1.0
+        assert metrics["per_manifold"][0][name]["mean_learned"] == 2.0
+    assert metrics["tangent_containment"]["definition"] == (
+        "leading_learned_rank_covariance_subspace_principal_angles"
+    )
+    for name in ("tangent_alignment", "tangent_containment"):
+        assert metrics[name]["subspace_overlap"]["mean"] == pytest.approx(1.0)
+        assert metrics[name]["worst_direction_cosine"]["mean"] == pytest.approx(1.0)
 
 
 def _high_dimensional_metadata(type_name: str):
@@ -208,6 +247,45 @@ def test_high_dimensional_rotated_pc_span_matches_tangent(
         )
 
 
+def test_rank_recovery_also_targets_native_ambient_dimension() -> None:
+    _, metadata = make_toy_manifold_dataset(
+        ToyManifoldConfig(
+            ambient_dim=4,
+            n_samples=16,
+            calibration_size=64,
+            manifolds_per_type=1,
+            manifold_types=("circle",),
+            offset_radius=3.0,
+            seed=19,
+        )
+    )
+    mean = _ambient_point(metadata, 0, torch.tensor([1.0, 0.0])).float()
+    model = MFA(
+        mean[None],
+        rank=2,
+        init_directions=torch.eye(4)[None, :, :2],
+        psi_init=0.1,
+    )
+    _set_scales(model, torch.tensor([[2.0, 1.0]]))
+
+    metrics = evaluate_toy_manifold_metrics(
+        model,
+        metadata,
+        torch.tensor([True]),
+        max_mean_to_manifold_distance=0.1,
+    )
+
+    assert metrics["rank"]["exact_match"] == 0.0
+    assert metrics["rank"]["mean_absolute_error"] == 1.0
+    assert metrics["ambient_rank"]["exact_match"] == 1.0
+    assert metrics["ambient_rank"]["mean_absolute_error"] == 0.0
+    manifold = metrics["per_manifold"][0]
+    assert manifold["intrinsic_dim"] == 1
+    assert manifold["embedding_dim"] == 2
+    assert manifold["rank"]["target_intrinsic_dim"] == 1
+    assert manifold["ambient_rank"]["target_ambient_dim"] == 2
+
+
 def test_twelve_dimensional_pc_span_penalizes_one_missing_direction() -> None:
     metadata, mean, tangent = _high_dimensional_frame("product_torus_12d")
     _, _, vh = torch.linalg.svd(tangent.T, full_matrices=True)
@@ -298,6 +376,18 @@ def test_proximity_association_accepts_cutoff_and_rejects_far_mean() -> None:
     assert associations.associated.tolist() == [True, False]
     assert associations.outside_cutoff.tolist() == [False, True]
     assert associations.nearest_distances.tolist() == pytest.approx([0.1, 0.2])
+
+
+def test_proximity_association_defaults_to_nearest_without_cutoff() -> None:
+    metadata = _flat_disk_metadata()
+    mean, _, _, normal, _ = _flat_disk_frame(metadata)
+
+    associations = _associate_component_means(mean[None] + 100.0 * normal, metadata)
+
+    assert associations.manifold_indices.tolist() == [0]
+    assert associations.associated.tolist() == [True]
+    assert associations.outside_cutoff.tolist() == [False]
+    assert associations.nearest_distances.tolist() == pytest.approx([100.0])
 
 
 def test_proximity_association_rejects_tied_nearest_manifolds() -> None:
@@ -566,6 +656,7 @@ def test_non_unique_tangent_is_associated_but_alignment_is_undefined() -> None:
         "type_id": 0,
         "type_name": "circle",
         "intrinsic_dim": 1,
+        "embedding_dim": 2,
         "position": torch.zeros(4, dtype=torch.float64),
         "embedding": embedding,
     }

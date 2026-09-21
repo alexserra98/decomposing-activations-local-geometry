@@ -178,7 +178,7 @@ class MFA_HDDC(nn.Module):
         return self.rank_mask.sum(-1).long()
 
     @torch.no_grad()
-    def _build_inference_cache(self) -> Dict[str, Any]:
+    def _build_inference_cache(self, *, dtype=None) -> Dict[str, Any]:
         """
         Precompute frozen MFA likelihood terms for repeated eval calls.
 
@@ -186,9 +186,10 @@ class MFA_HDDC(nn.Module):
         can be large for big K, but they avoid rebuilding model-only quantities
         for every activation batch during analysis.
         """
-        psi = self._psi()
+        psi = self._psi().to(dtype=dtype)
         psi_inv = 1.0 / psi
-        W = self._W()
+        W = self._W().to(dtype=dtype)
+        mu = self.mu.to(dtype=dtype)
 
         A = W * psi_inv[:, :, None].sqrt()
         M = torch.einsum("kdi,kdj->kij", A, A)
@@ -203,13 +204,15 @@ class MFA_HDDC(nn.Module):
 
         PinvW = psi_inv[:, :, None] * W
         pinvw_flat = PinvW.permute(1, 0, 2).reshape(self.D, self.K * self.q).contiguous()
-        wt_pinv_mu = torch.einsum("kd,kdq->kq", self.mu, PinvW)
-        mu_pinv_t = (psi_inv * self.mu).T.contiguous()
-        mu_quad = (self.mu ** 2 * psi_inv).sum(dim=-1)
+        wt_pinv_mu = torch.einsum("kd,kdq->kq", mu, PinvW)
+        mu_pinv_t = (psi_inv * mu).T.contiguous()
+        mu_quad = (mu ** 2 * psi_inv).sum(dim=-1)
         logdet_psi = torch.log(psi).sum(dim=-1)
         logdet_m = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
 
         return {
+            "mu": mu,
+            "PinvW": PinvW,
             "psi_inv": psi_inv,
             # Only the (D,) parameterization is shared across components; both
             # (K, D) and isotropic (K, 1) vary with k after the expand in _psi.
@@ -223,9 +226,12 @@ class MFA_HDDC(nn.Module):
         }
 
     @contextmanager
-    def inference_cache(self, *, enabled: bool = True):
+    def inference_cache(self, *, enabled: bool = True, dtype=None, component_chunk_size=None):
         """
         Temporarily cache model-only likelihood terms for repeated inference.
+
+        `dtype` chooses the arithmetic precision; `component_chunk_size` bounds
+        centered likelihood workspaces. EM uses float64 and component chunks.
 
         Use this around large eval-only loops:
 
@@ -233,12 +239,15 @@ class MFA_HDDC(nn.Module):
             with torch.no_grad(), model.inference_cache():
                 r = model.responsibilities(x)
         """
+        if component_chunk_size is not None and component_chunk_size <= 0:
+            raise ValueError("component_chunk_size must be positive")
         if not enabled:
             yield self
             return
 
         old_cache = self._inference_cache
-        self._inference_cache = self._build_inference_cache()
+        self._inference_cache = self._build_inference_cache(dtype=dtype)
+        self._inference_cache["component_chunk_size"] = component_chunk_size
         try:
             yield self
         finally:
@@ -255,6 +264,25 @@ class MFA_HDDC(nn.Module):
 
         K, q = self.K, self.q
 
+        chunk = cache.get("component_chunk_size")
+        if chunk is not None:
+            # Center before forming quadratic terms: expanding x^2 - 2*x*mu
+            # loses precision for displaced clusters, especially at small b.
+            x = x.to(dtype=cache["mu"].dtype)
+            result = x.new_empty(B, K)
+            for start in range(0, K, chunk):
+                stop = min(start + chunk, K)
+                centered = x[:, None, :] - cache["mu"][None, start:stop, :]
+                quad = (centered.square() * cache["psi_inv"][None, start:stop]).sum(-1)
+                v = torch.einsum("bkd,kdq->bkq", centered, cache["PinvW"][start:stop])
+                low_rank = (torch.einsum("bkq,kqr->bkr", v, cache["Minv"][start:stop]) * v).sum(-1)
+                result[:, start:stop] = -0.5 * (
+                    self._two_pi_logD + cache["logdet_c"][None, start:stop] + quad - low_rank
+                )
+            return result
+
+        x = x.to(dtype=cache["mu"].dtype)
+
         if cache["shared_psi"]:
             x_quad = torch.matmul(x ** 2, cache["psi_inv"][0])
             quad_Psi = x_quad[:, None]
@@ -269,8 +297,6 @@ class MFA_HDDC(nn.Module):
         WT_Pinv_x = torch.matmul(x, cache["pinvw_flat"]).reshape(B, K, q)
         v = WT_Pinv_x - cache["wt_pinv_mu"][None, :, :]
 
-        v = v.float()
-        quad_Psi = quad_Psi.float()
         low_rank = (torch.einsum("bkq,kqr->bkr", v, cache["Minv"]) * v).sum(dim=-1)
         quad = quad_Psi - low_rank
         return -0.5 * (self._two_pi_logD + cache["logdet_c"][None, :] + quad)
@@ -367,6 +393,37 @@ class MFA_HDDC(nn.Module):
             ll = self._cached_log_prob_components(x)
         log_pi = F.log_softmax(self.pi_logits, dim=0)[None, :]
         return F.softmax((ll + log_pi) / float(tau), dim=1)
+
+    @torch.no_grad()
+    def _propose_mixture_logits(
+        self, counts: torch.Tensor, eligible: torch.Tensor
+    ) -> torch.Tensor:
+        """M-step logits preserving skipped probabilities and their logits.
+
+        Eligible components divide their previous total mixture mass in
+        proportion to their effective counts. Preserving their unnormalized
+        exponential mass also preserves the global softmax normalizer. Counts
+        are finite and non-negative; eligible counts must be strictly positive.
+        Component shards must all participate, including those with no eligible
+        local components.
+        """
+        sharded = isinstance(self, ComponentShardedMFA_HDDC)
+        total_count = counts[eligible].sum().to(torch.float64)
+        if sharded and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(total_count, op=dist.ReduceOp.SUM)
+        proposal = self.pi_logits.detach().clone()
+        if float(total_count) == 0.0:
+            return proposal
+
+        old_logits = self.pi_logits.to(torch.float64).masked_fill(~eligible, -torch.inf)
+        log_mass = (
+            _distributed_logsumexp(old_logits, dim=0)
+            if sharded else torch.logsumexp(old_logits, dim=0)
+        )
+        proposal[eligible] = (
+            log_mass + counts[eligible].to(torch.float64).log() - total_count.log()
+        ).to(proposal.dtype)
+        return proposal
 
     def log_prob_components(self, x: torch.Tensor) -> torch.Tensor:
         if self._inference_cache is None:

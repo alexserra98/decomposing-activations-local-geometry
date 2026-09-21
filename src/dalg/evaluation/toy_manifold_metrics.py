@@ -48,13 +48,13 @@ class _ComponentMetrics:
 
 @torch.no_grad()
 def _effective_component_ranks(model, threshold: float) -> torch.Tensor:
-    """Count loading columns whose variance exceeds the component noise floor."""
+    """Use HDDC's learned rank mask, or threshold loadings for MFA and ARD."""
+    rank_mask = getattr(model, "rank_mask", None)
+    if rank_mask is not None:
+        return rank_mask.sum(dim=1).detach().cpu().long()
     if threshold <= 0.0:
         raise ValueError("rank threshold must be positive")
     scales = model._scale()
-    rank_mask = getattr(model, "rank_mask", None)
-    if rank_mask is not None:
-        scales = scales * rank_mask
     noise_floor = model._psi().mean(dim=1, keepdim=True)
     return (scales.square() > threshold * noise_floor).sum(dim=1).cpu().long()
 
@@ -64,11 +64,12 @@ def _associate_component_means(
     means: torch.Tensor,
     metadata: dict[str, Any],
     *,
-    max_mean_to_manifold_distance: float,
+    max_mean_to_manifold_distance: float | None = None,
 ) -> _ComponentAssociations:
-    """Associate each mean with its unique nearest manifold inside the cutoff."""
-    if not math.isfinite(max_mean_to_manifold_distance) or (
-        max_mean_to_manifold_distance <= 0.0
+    """Associate each mean with its unique nearest manifold and optional cutoff."""
+    if max_mean_to_manifold_distance is not None and (
+        not math.isfinite(max_mean_to_manifold_distance)
+        or max_mean_to_manifold_distance <= 0.0
     ):
         raise ValueError("max mean-to-manifold distance must be finite and positive")
     means = means.detach().cpu().double()
@@ -107,7 +108,10 @@ def _associate_component_means(
         if len(tied) != 1:
             ambiguous[component_id] = True
             continue
-        if nearest_distance > max_mean_to_manifold_distance:
+        if (
+            max_mean_to_manifold_distance is not None
+            and nearest_distance > max_mean_to_manifold_distance
+        ):
             continue
 
         manifold_indices[component_id] = nearest_index
@@ -207,7 +211,7 @@ def _component_metrics(
     metadata: dict[str, Any],
     *,
     rank_threshold: float,
-    max_mean_to_manifold_distance: float,
+    max_mean_to_manifold_distance: float | None,
     relative_boundary_eigengap_threshold: float,
 ) -> _ComponentMetrics:
     if relative_boundary_eigengap_threshold <= 0.0:
@@ -360,7 +364,7 @@ def evaluate_toy_manifold_metrics(
     assignment_live: torch.Tensor,
     *,
     rank_threshold: float = 1.0,
-    max_mean_to_manifold_distance: float = 0.1,
+    max_mean_to_manifold_distance: float | None = None,
     relative_boundary_eigengap_threshold: float = _PC_RELATIVE_EIGENGAP_THRESHOLD,
 ) -> dict[str, Any]:
     """Evaluate proximity association, rank, alignment, and containment."""
@@ -383,14 +387,35 @@ def evaluate_toy_manifold_metrics(
         [int(manifold["intrinsic_dim"]) for manifold in manifolds],
         dtype=torch.long,
     )
-    target_ranks = torch.full((model.K,), -1, dtype=torch.long)
-    target_ranks[associated] = intrinsic_dims[
+    ambient_dims = torch.tensor(
+        [int(manifold["embedding_dim"]) for manifold in manifolds],
+        dtype=torch.long,
+    )
+    if torch.any(ambient_dims < intrinsic_dims) or torch.any(ambient_dims > model.D):
+        raise ValueError(
+            "manifold embedding dimensions must contain the intrinsic dimensions "
+            "and not exceed model D"
+        )
+    target_intrinsic_ranks = torch.full((model.K,), -1, dtype=torch.long)
+    target_intrinsic_ranks[associated] = intrinsic_dims[
+        metrics.associations.manifold_indices[associated]
+    ]
+    target_ambient_ranks = torch.full((model.K,), -1, dtype=torch.long)
+    target_ambient_ranks[associated] = ambient_dims[
         metrics.associations.manifold_indices[associated]
     ]
 
     association = {
-        "rule": "unique_nearest_exact_projection_within_cutoff",
-        "max_mean_to_manifold_distance": float(max_mean_to_manifold_distance),
+        "rule": (
+            "unique_nearest_exact_projection"
+            if max_mean_to_manifold_distance is None
+            else "unique_nearest_exact_projection_within_cutoff"
+        ),
+        "max_mean_to_manifold_distance": (
+            None
+            if max_mean_to_manifold_distance is None
+            else float(max_mean_to_manifold_distance)
+        ),
         "associated_components": int(associated.sum()),
         "outside_cutoff_components": int(metrics.associations.outside_cutoff.sum()),
         "ambiguous_components": int(metrics.associations.ambiguous.sum()),
@@ -405,10 +430,32 @@ def evaluate_toy_manifold_metrics(
     ) != model.K:
         raise RuntimeError("component association populations do not sum to K")
 
+    uses_learned_mask = getattr(model, "rank_mask", None) is not None
+    rank_definition = (
+        {"definition": "hddc_rank_mask_count"}
+        if uses_learned_mask
+        else {
+            "definition": "loading_variance_above_noise_threshold",
+            "threshold": float(rank_threshold),
+        }
+    )
     global_rank = {
-        "threshold": float(rank_threshold),
+        **rank_definition,
         "population": "proximity_associated_components",
-        **_rank_summary(metrics.effective_ranks, target_ranks, associated),
+        **_rank_summary(
+            metrics.effective_ranks,
+            target_intrinsic_ranks,
+            associated,
+        ),
+    }
+    global_ambient_rank = {
+        **rank_definition,
+        "population": "proximity_associated_components",
+        **_rank_summary(
+            metrics.effective_ranks,
+            target_ambient_ranks,
+            associated,
+        ),
     }
     tangent_alignment = {
         "definition": "leading_intrinsic_dim_covariance_subspace_principal_angles",
@@ -424,7 +471,11 @@ def evaluate_toy_manifold_metrics(
         ),
     }
     tangent_containment = {
-        "definition": "leading_effective_rank_covariance_subspace_principal_angles",
+        "definition": (
+            "leading_learned_rank_covariance_subspace_principal_angles"
+            if uses_learned_mask
+            else "leading_effective_rank_covariance_subspace_principal_angles"
+        ),
         "aggregation": "unweighted_component_mean",
         "relative_boundary_eigengap_threshold": float(
             relative_boundary_eigengap_threshold
@@ -443,7 +494,19 @@ def evaluate_toy_manifold_metrics(
         associated_components = int(population.sum())
         manifold_rank = {
             "target_intrinsic_dim": int(manifold["intrinsic_dim"]),
-            **_rank_summary(metrics.effective_ranks, target_ranks, population),
+            **_rank_summary(
+                metrics.effective_ranks,
+                target_intrinsic_ranks,
+                population,
+            ),
+        }
+        manifold_ambient_rank = {
+            "target_ambient_dim": int(manifold["embedding_dim"]),
+            **_rank_summary(
+                metrics.effective_ranks,
+                target_ambient_ranks,
+                population,
+            ),
         }
         per_manifold.append(
             {
@@ -451,12 +514,14 @@ def evaluate_toy_manifold_metrics(
                 "type_id": int(manifold["type_id"]),
                 "type_name": str(manifold["type_name"]),
                 "intrinsic_dim": int(manifold["intrinsic_dim"]),
+                "embedding_dim": int(manifold["embedding_dim"]),
                 "components": {
                     "associated": associated_components,
                     "assignment_live": int((population & assignment_live).sum()),
                     "assignment_dead": int((population & ~assignment_live).sum()),
                 },
                 "rank": manifold_rank,
+                "ambient_rank": manifold_ambient_rank,
                 "tangent_alignment": _alignment_summary(
                     metrics.subspace_overlap,
                     metrics.worst_direction_cosine,
@@ -475,6 +540,7 @@ def evaluate_toy_manifold_metrics(
     return {
         "association": association,
         "rank": global_rank,
+        "ambient_rank": global_ambient_rank,
         "tangent_alignment": tangent_alignment,
         "tangent_containment": tangent_containment,
         "per_manifold": per_manifold,

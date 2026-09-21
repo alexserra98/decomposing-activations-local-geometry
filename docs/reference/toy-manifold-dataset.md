@@ -19,7 +19,7 @@ CLI or workflow skill; import these functions directly.
 
 ## Dataset construction
 
-The generator defines ten manifold types:
+The generator defines twelve manifold types:
 
 | Type | Intrinsic dimension | Native embedding dimension |
 | --- | ---: | ---: |
@@ -31,8 +31,10 @@ The generator defines ten manifold types:
 | `mobius` | 2 | 3 |
 | `swiss_roll` | 2 | 3 |
 | `helix` | 1 | 3 |
+| `helix_4d` | 1 | 4 |
 | `hypersphere_10d` | 10 | 11 |
 | `product_torus_12d` | 12 | 24 |
+| `cylinder` | 2 | 3 |
 
 `manifolds_per_type` independently embedded instances are created for every
 selected type. Each instance is normalized by a deterministic calibration
@@ -63,18 +65,44 @@ The main configuration fields are:
 
 | Field | Default | Meaning |
 | --- | ---: | --- |
-| `ambient_dim` | `128` | Ambient dimension of every generated point; must be at least 3 and at least the largest selected native embedding dimension. The default ten-type selection therefore requires at least 24. |
+| `ambient_dim` | `128` | Ambient dimension of every generated point; must be at least 3 and at least the largest selected native embedding dimension. The default twelve-type selection therefore requires at least 24. |
 | `n_samples` | `400_000` | Total number of points across all manifold instances. |
 | `calibration_size` | `50_000` | Per-type sample count used to compute deterministic centering and RMS normalization. |
 | `manifolds_per_type` | `8` | Number of independently embedded instances of each selected type. |
-| `manifold_types` | all ten types | Unique tuple of types to include. |
+| `manifold_types` | all twelve types | Unique tuple of types to include. |
 | `offset_radius` | `4.0` | Radius of the sphere on which instance centers are placed; `0` centers every instance at the origin. |
-| `noise_ratio` | `10_000.0` | Ratio between normalized curvature radius and per-coordinate ambient Gaussian-noise standard deviation. |
+| `noise_ratio` | `10_000.0` | Ratio between normalized curvature radius and per-coordinate ambient Gaussian-noise standard deviation; `None` disables observation noise exactly. |
 | `seed` | `0` | Seed for calibration, embeddings, offsets, sampling, noise, and final row order. |
 
 The remaining fields control the native parameter ranges and geometry of the
-low-dimensional segment, torus, Mobius strip, Swiss roll, and helix. Read the
-frozen `ToyManifoldConfig` dataclass before changing those shapes.
+low-dimensional segment, torus, Mobius strip, Swiss roll, and helices. The 4D
+helix is a one-dimensional curve rotating simultaneously in the orthogonal
+`xy` and `zw` planes:
+
+\[
+(x,y,z,w) = (r_{xy}\cos(\omega_{xy}t),
+             r_{xy}\sin(\omega_{xy}t),
+             r_{zw}\cos(\omega_{zw}t),
+             r_{zw}\sin(\omega_{zw}t)).
+\]
+
+Its parameter range, two radii, and two positive frequencies are configurable
+through the `helix_4d_*` fields. Read the frozen `ToyManifoldConfig` dataclass
+before changing those shapes.
+
+The Swiss roll uses `(theta * cos(theta), height, theta * sin(theta))`.
+Its default outer radius is `4.5 * pi`, and its default height range is
+`[0, 10 * 4.5 * pi]`, giving a height ten times the outer radius. Height and
+angle bounds are independent configuration fields; changing the angle bounds
+does not automatically adjust the height. RMS normalization divides all
+coordinates by one scalar, so it preserves this aspect ratio.
+
+The cylinder is the lateral surface `(cos(theta), height, sin(theta))`, with
+independent uniform `theta` in `[0, 2 * pi)` and `height` in `[0, 5]`. It has
+fixed unit radius and height five, with no end caps or filled interior. Its
+raw maximum absolute principal curvature is `1.0`. RMS normalization preserves
+its height-to-radius ratio of five. Select it with `manifold_types=("cylinder",)`
+or include it as part of the default twelve-type dataset.
 
 Use the same seed and configuration except for `offset_radius` to generate a
 paired centered and separated condition. The point geometry, embeddings,
@@ -103,6 +131,11 @@ own deterministic train/validation split; do not introduce a second split in
 the generator.
 
 ## Observation noise
+
+Set `noise_ratio=None` to generate noiseless points. Gaussian noise is skipped,
+all recorded `noise_stds` are exactly zero, and the saved JSON configuration
+records `noise_ratio: null`. Geometry, sampling, and row order remain paired
+with otherwise identical noisy configurations.
 
 Noise is isotropic in the ambient space and is constant within each manifold
 type. Its standard deviation is

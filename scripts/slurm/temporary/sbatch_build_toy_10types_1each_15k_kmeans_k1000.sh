@@ -38,6 +38,6 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
   --load-batch-size 20000 \
   --block-x 8192 \
   --block-c 8192 \
-  --pca-rank 32
+  --pca-rank 0
 
 echo "=== $(date) === centroid construction complete ==="

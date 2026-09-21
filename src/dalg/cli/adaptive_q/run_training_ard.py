@@ -19,6 +19,8 @@ from typing import Optional
 import torch
 from torch.utils.data import DataLoader
 
+from dalg.init.mixture_weights import initialize_mixture_weights
+
 
 # Dataset setup
 
@@ -465,6 +467,10 @@ def cmd_train_ard(args):
         ard_weight=ard_weight,
         rank_threshold=args.rank_threshold,
     ).to(args.device)
+    if not (out_dir / "checkpoint.pt").exists():
+        initialize_mixture_weights(
+            model, centroids, train_loader, n_train_tokens=data["n_train_tokens"],
+        )
     if getattr(args, "compile", False):
         print("Compiling model with torch.compile...")
         model = torch.compile(model)

@@ -21,11 +21,13 @@ MANIFOLD_NAMES = (
     "mobius",
     "swiss_roll",
     "helix",
+    "helix_4d",
     "hypersphere_10d",
     "product_torus_12d",
+    "cylinder",
 )
-INTRINSIC_DIMS = (1, 1, 2, 2, 2, 2, 2, 1, 10, 12)
-EMBEDDING_DIMS = (1, 2, 2, 3, 3, 3, 3, 3, 11, 24)
+INTRINSIC_DIMS = (1, 1, 2, 2, 2, 2, 2, 1, 1, 10, 12, 2)
+EMBEDDING_DIMS = (1, 2, 2, 3, 3, 3, 3, 3, 4, 11, 24, 3)
 
 
 @dataclass(frozen=True)
@@ -39,7 +41,7 @@ class ToyManifoldConfig:
     changing their local geometry.
     ``noise_ratio`` is the ratio between a type's normalized radius of
     curvature and the per-coordinate standard deviation of its ambient
-    Gaussian observation noise.
+    Gaussian observation noise. Set it to ``None`` for noiseless observations.
     """
 
     ambient_dim: int = 128
@@ -48,7 +50,7 @@ class ToyManifoldConfig:
     manifolds_per_type: int = 8
     manifold_types: tuple[str, ...] = MANIFOLD_NAMES
     offset_radius: float = 4.0
-    noise_ratio: float = 10_000.0
+    noise_ratio: float | None = 10_000.0
     seed: int = 0
 
     segment_min: float = -1.0
@@ -59,10 +61,16 @@ class ToyManifoldConfig:
     swiss_theta_min: float = 1.5 * math.pi
     swiss_theta_max: float = 4.5 * math.pi
     swiss_height_min: float = 0.0
-    swiss_height_max: float = 21.0
+    swiss_height_max: float = 10.0 * 4.5 * math.pi
     helix_theta_min: float = 0.0
     helix_theta_max: float = 4.0 * math.pi
     helix_alpha: float = 0.2
+    helix_4d_theta_min: float = 0.0
+    helix_4d_theta_max: float = 4.0 * math.pi
+    helix_4d_radius_xy: float = 1.0
+    helix_4d_radius_zw: float = 1.0
+    helix_4d_frequency_xy: float = 1.0
+    helix_4d_frequency_zw: float = 2.0
 
 
 def _validate_config(config: ToyManifoldConfig) -> None:
@@ -109,7 +117,6 @@ def _validate_config(config: ToyManifoldConfig) -> None:
 
     finite_values = {
         "offset_radius": config.offset_radius,
-        "noise_ratio": config.noise_ratio,
         "segment_min": config.segment_min,
         "segment_max": config.segment_max,
         "torus_major_radius": config.torus_major_radius,
@@ -122,6 +129,12 @@ def _validate_config(config: ToyManifoldConfig) -> None:
         "helix_theta_min": config.helix_theta_min,
         "helix_theta_max": config.helix_theta_max,
         "helix_alpha": config.helix_alpha,
+        "helix_4d_theta_min": config.helix_4d_theta_min,
+        "helix_4d_theta_max": config.helix_4d_theta_max,
+        "helix_4d_radius_xy": config.helix_4d_radius_xy,
+        "helix_4d_radius_zw": config.helix_4d_radius_zw,
+        "helix_4d_frequency_xy": config.helix_4d_frequency_xy,
+        "helix_4d_frequency_zw": config.helix_4d_frequency_zw,
     }
     for name, value in finite_values.items():
         if not math.isfinite(float(value)):
@@ -129,8 +142,9 @@ def _validate_config(config: ToyManifoldConfig) -> None:
 
     if config.offset_radius < 0:
         raise ValueError("offset_radius must be non-negative")
-    if config.noise_ratio <= 0:
-        raise ValueError("noise_ratio must be positive")
+    if config.noise_ratio is not None:
+        if not math.isfinite(float(config.noise_ratio)) or config.noise_ratio <= 0:
+            raise ValueError("noise_ratio must be finite and positive, or None")
     if config.segment_min >= config.segment_max:
         raise ValueError("segment_min must be smaller than segment_max")
     if not (
@@ -147,6 +161,18 @@ def _validate_config(config: ToyManifoldConfig) -> None:
         raise ValueError("helix_theta_min must be smaller than helix_theta_max")
     if config.helix_alpha <= 0:
         raise ValueError("helix_alpha must be positive")
+    if config.helix_4d_theta_min >= config.helix_4d_theta_max:
+        raise ValueError(
+            "helix_4d_theta_min must be smaller than helix_4d_theta_max"
+        )
+    for name in (
+        "helix_4d_radius_xy",
+        "helix_4d_radius_zw",
+        "helix_4d_frequency_xy",
+        "helix_4d_frequency_zw",
+    ):
+        if getattr(config, name) <= 0:
+            raise ValueError(f"{name} must be positive")
 
 
 def _generator(seed: int, stream: int) -> torch.Generator:
@@ -262,6 +288,28 @@ def _sample_helix(
     )
 
 
+def _sample_helix_4d(
+    n: int, generator: torch.Generator, config: ToyManifoldConfig
+) -> torch.Tensor:
+    theta = _uniform(
+        n,
+        config.helix_4d_theta_min,
+        config.helix_4d_theta_max,
+        generator=generator,
+    )
+    angle_xy = config.helix_4d_frequency_xy * theta
+    angle_zw = config.helix_4d_frequency_zw * theta
+    return torch.stack(
+        (
+            config.helix_4d_radius_xy * torch.cos(angle_xy),
+            config.helix_4d_radius_xy * torch.sin(angle_xy),
+            config.helix_4d_radius_zw * torch.cos(angle_zw),
+            config.helix_4d_radius_zw * torch.sin(angle_zw),
+        ),
+        dim=1,
+    )
+
+
 def _sample_hypersphere_10d(
     n: int, generator: torch.Generator, _config: ToyManifoldConfig
 ) -> torch.Tensor:
@@ -282,6 +330,15 @@ def _sample_product_torus_12d(
         dtype=torch.float64,
     )
     return torch.stack((torch.cos(angles), torch.sin(angles)), dim=2).reshape(n, 24)
+
+
+def _sample_cylinder(
+    n: int, generator: torch.Generator, config: ToyManifoldConfig
+) -> torch.Tensor:
+    """Sample the lateral surface of a unit-radius cylinder of height five."""
+    circle = _sample_circle(n, generator, config)
+    height = _uniform(n, 0.0, 5.0, generator=generator)
+    return torch.stack((circle[:, 0], height, circle[:, 1]), dim=1)
 
 
 def _surface_max_abs_principal_curvature(
@@ -379,6 +436,15 @@ def _raw_max_abs_curvatures(config: ToyManifoldConfig) -> torch.Tensor:
         closest_swiss_theta**2 + 1.0
     ) ** 1.5
     helix_curvature = 1.0 / (1.0 + config.helix_alpha**2)
+    helix_4d_speed_squared = (
+        (config.helix_4d_radius_xy * config.helix_4d_frequency_xy) ** 2
+        + (config.helix_4d_radius_zw * config.helix_4d_frequency_zw) ** 2
+    )
+    helix_4d_acceleration_norm = math.sqrt(
+        (config.helix_4d_radius_xy * config.helix_4d_frequency_xy**2) ** 2
+        + (config.helix_4d_radius_zw * config.helix_4d_frequency_zw**2) ** 2
+    )
+    helix_4d_curvature = helix_4d_acceleration_norm / helix_4d_speed_squared
 
     return torch.tensor(
         (
@@ -390,6 +456,8 @@ def _raw_max_abs_curvatures(config: ToyManifoldConfig) -> torch.Tensor:
             _mobius_max_abs_curvature(config),
             swiss_curvature,
             helix_curvature,
+            helix_4d_curvature,
+            1.0,
             1.0,
             1.0,
         ),
@@ -407,8 +475,10 @@ _SAMPLERS: tuple[_Sampler, ...] = (
     _sample_mobius,
     _sample_swiss_roll,
     _sample_helix,
+    _sample_helix_4d,
     _sample_hypersphere_10d,
     _sample_product_torus_12d,
+    _sample_cylinder,
 )
 
 
@@ -472,12 +542,13 @@ def _make_dataset(
         )
         normalized = (raw - means[type_id]) / scales[type_id]
         ambient = normalized @ embeddings[manifold_id] + offsets[manifold_id]
-        ambient += noise_stds[type_id] * torch.randn(
-            count,
-            config.ambient_dim,
-            generator=_generator(config.seed, stream + 2_000 + manifold_id),
-            dtype=torch.float64,
-        )
+        if config.noise_ratio is not None:
+            ambient += noise_stds[type_id] * torch.randn(
+                count,
+                config.ambient_dim,
+                generator=_generator(config.seed, stream + 2_000 + manifold_id),
+                dtype=torch.float64,
+            )
         samples.append(ambient)
         manifold_ids.append(
             torch.full((count,), manifold_id, dtype=torch.long)
@@ -543,7 +614,11 @@ def make_toy_manifold_dataset(
         max_abs_curvatures.reciprocal(),
         torch.ones_like(max_abs_curvatures),
     )
-    noise_stds = curvature_radii / float(config.noise_ratio)
+    noise_stds = (
+        torch.zeros_like(curvature_radii)
+        if config.noise_ratio is None
+        else curvature_radii / float(config.noise_ratio)
+    )
 
     num_manifolds = len(config.manifold_types) * config.manifolds_per_type
     manifold_type_ids = torch.arange(len(config.manifold_types)).repeat_interleave(

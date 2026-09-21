@@ -1,53 +1,600 @@
-# HDDC shared-b half-epoch surgery sweep
+**HDDC learned-rank evaluation — noise ratio 10**
 
-The six completed runs differ only in `surgery_threshold`. The folder also
-contains a prior run with threshold `0.0001`.
+Source: [toy_noise10_k1000_hddc_cluster_pca](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca). All nine runs were reevaluated by Slurm job 1562588 using their existing models and assignments. Rows are sorted by training surgery threshold.
 
-| Surgery threshold | Associated / outside / ambiguous | Live / dead | Clustering H / C / ARI / NMI | NLL train / validation | Rank: n / mean / MAE / exact / ±1 | Tangent overlap / worst cosine [valid / undefined] |
-|---:|---:|---:|---:|---:|---:|---:|
-| 0.0001 | 209 / 91 / 0 | 35 / 265 | 1.000 / .380 / .357 / .551 | -601.091 / -601.095 | 209 / 14.742 / 12.828 / .000 / .033 | .096 / .132 [209 / 0] |
-| 0.001 | 209 / 91 / 0 | 41 / 259 | 1.000 / .384 / .388 / .555 | **-601.374 / -601.391** | 209 / 14.684 / 12.770 / .005 / .081 | .102 / .138 [209 / 0] |
-| 0.01 | 235 / 65 / 0 | 48 / 252 | 1.000 / **.405 / .482 / .576** | -601.149 / -601.045 | 235 / 13.149 / 11.336 / .128 / .187 | .164 / .207 [235 / 0] |
-| 0.1 | 243 / 57 / 0 | 162 / 138 | 1.000 / .242 / .051 / .389 | -599.722 / -599.787 | 243 / 7.284 / 5.901 / .395 / .593 | .481 / .508 [196 / 47] |
-| 1 | 299 / 1 / 0 | 297 / 3 | 1.000 / .211 / .032 / .348 | -589.907 / -587.210 | 299 / 1.050 / .682 / .361 / .997 | **.755 / .805** [109 / 190] |
-| 10 | 299 / 1 / 0 | 297 / 3 | 1.000 / .211 / .032 / .348 | -589.907 / -587.210 | 299 / 1.050 / .682 / .361 / .997 | **.755 / .805** [109 / 190] |
+Shared configuration: K=1,000, D=128, q_max=32, seed=42, shared isotropic noise, Adam with learning rate 0.001, and direction_init=cluster_pca. Initialization uses full-data KMeans centroids and 32 PCs from each centroid’s 64 nearest points. Surgery runs every 0.5 epochs with minimum count 64. Only surgery_threshold differs between runs.
 
-## Circle — intrinsic dimension 1
+Evaluation uses the final learned HDDC rank directly: `q_k = rank_mask[k].sum()`. Every active direction counts, regardless of its variance relative to noise. No evaluation rank threshold or additional rank filtering is applied. Rank summaries record `definition: hddc_rank_mask_count` and omit `threshold`. The legacy evaluation threshold in immutable run specifications is ignored.
 
-| Threshold | Associated / live / dead | Rank: n / mean / MAE / exact / ±1 | Tangent overlap / worst [valid / undefined] |
-|---:|---:|---:|---:|
-| 0.0001 | 9 / 3 / 6 | 9 / 2.778 / 1.778 / .000 / .222 | .583 / .626 [9 / 0] |
-| 0.001 | 6 / 4 / 2 | 6 / 2.000 / 1.000 / .167 / .833 | .735 / .782 [6 / 0] |
-| 0.01 | 17 / 12 / 5 | 17 / 1.235 / .235 / .765 / 1.000 | .737 / .821 [17 / 0] |
-| 0.1 | 30 / 28 / 2 | 30 / 1.000 / .000 / 1.000 / 1.000 | **.928 / .951** [30 / 0] |
-| 1 | 43 / 43 / 0 | 43 / 1.000 / .000 / 1.000 / 1.000 | .687 / .748 [43 / 0] |
-| 10 | 43 / 43 / 0 | 43 / 1.000 / .000 / 1.000 / 1.000 | .687 / .748 [43 / 0] |
+Each evaluation covers 300,000 points across 10 manifolds, with 270,000 training and 30,000 validation points. Assignments use maximum MFA responsibility. Means are associated with the unique nearest exact manifold without a distance cutoff. All 1,000 components are associated, including components with zero hard assignments; there is no 26-point eligibility filter.
 
-## Helix — intrinsic dimension 1
+Intrinsic rank recovery compares learned q with the planted intrinsic dimension. Ambient rank recovery compares the same q with the manifold’s native embedding dimension. Alignment uses the leading intrinsic-dimension covariance subspace. Containment uses the full learned-rank covariance subspace. The boundary eigengap check (1e-6) determines whether a geometric subspace is identifiable; it does not change the reported rank.
 
-| Threshold | Associated / live / dead | Rank: n / mean / MAE / exact / ±1 | Tangent overlap / worst [valid / undefined] |
-|---:|---:|---:|---:|
-| 0.0001 | 9 / 7 / 2 | 9 / 2.889 / 1.889 / .000 / .333 | .697 / .747 [9 / 0] |
-| 0.001 | 12 / 8 / 4 | 12 / 2.250 / 1.250 / .000 / .833 | .688 / .754 [12 / 0] |
-| 0.01 | 27 / 21 / 6 | 27 / 1.481 / .481 / .593 / .926 | .634 / .714 [27 / 0] |
-| 0.1 | 26 / 24 / 2 | 26 / 1.038 / .038 / .962 / 1.000 | **.873 / .914** [26 / 0] |
-| 1 | 65 / 62 / 3 | 65 / 1.000 / .000 / 1.000 / 1.000 | .810 / .855 [65 / 0] |
-| 10 | 65 / 62 / 3 | 65 / 1.000 / .000 / 1.000 / 1.000 | .810 / .855 [65 / 0] |
+Scores and match rates are fractions rounded to six decimal places. ±1 is the fraction within one dimension of the target; MAE is mean absolute rank error. Geometry scores are unweighted means over valid associated components. Worst cosine is the mean per-component worst-direction cosine. Valid / undefined counts are separate; — indicates an undefined score. Lower NLL and BIC are better.
 
-## Torus — intrinsic dimension 2
+**Overall likelihood and clustering**
 
-| Threshold | Associated / live / dead | Rank: n / mean / MAE / exact / ±1 | Tangent overlap / worst [valid / undefined] |
-|---:|---:|---:|---:|
-| 0.0001 | 191 / 2 / 189 | 191 / 15.864 / 13.864 / .000 / .010 | .045 / .079 [191 / 0] |
-| 0.001 | 191 / 2 / 189 | 191 / 15.864 / 13.864 / .000 / .010 | .045 / .079 [191 / 0] |
-| 0.01 | 191 / 2 / 189 | 191 / 15.859 / 13.859 / .005 / .010 | .046 / .081 [191 / 0] |
-| 0.1 | 187 / 97 / 90 | 187 / 9.160 / 7.663 / .219 / .471 | **.313 / .338** [140 / 47] |
-| 1 | 191 / 191 / 0 | 191 / 1.079 / 1.068 / .000 / .995 | .056 / .095 [1 / 190] |
-| 10 | 191 / 191 / 0 | 191 / 1.079 / 1.068 / .000 / .995 | .056 / .095 [1 / 190] |
+| Run | Surgery threshold | NLL train | NLL validation | BIC train | BIC parameters | Homogeneity | Completeness | ARI | NMI | Live / dead |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [HDDC-1](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__9f7e4181/metrics.json) | 0.00025 | -143.511870 | -136.440924 | -43932919.083351 | 2,683,753 | 1.000000 | 0.412780 | 0.255464 | 0.584351 | 829 / 171 |
+| [HDDC-2](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__40feae6f/metrics.json) | 0.005 | -136.380352 | -134.629232 | -59913945.400364 | 1,097,973 | 1.000000 | 0.421584 | 0.341278 | 0.593118 | 817 / 183 |
+| [HDDC-3](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__3b1f1910/metrics.json) | 0.01 | -135.846491 | -134.508933 | -61318033.386277 | 962,650 | 1.000000 | 0.421713 | 0.341594 | 0.593247 | 818 / 182 |
+| [HDDC-4](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__b87638e3/metrics.json) | 0.05 | -135.803306 | -134.522793 | -61497701.662943 | 946,419 | 1.000000 | 0.421664 | 0.377203 | 0.593197 | 824 / 176 |
+| [HDDC-5](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__1c948a2a/metrics.json) | 0.1 | -135.803306 | -134.522793 | -61497701.662943 | 946,419 | 1.000000 | 0.421664 | 0.377203 | 0.593197 | 824 / 176 |
+| [HDDC-6](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__e3a7c962/metrics.json) | 0.15 | -135.803306 | -134.522793 | -61497701.662943 | 946,419 | 1.000000 | 0.421664 | 0.377203 | 0.593197 | 824 / 176 |
+| [HDDC-7](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__0fd7cd55/metrics.json) | 0.2 | -135.803306 | -134.522793 | -61497701.662943 | 946,419 | 1.000000 | 0.421664 | 0.377203 | 0.593197 | 824 / 176 |
+| [HDDC-8](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__8cda8948/metrics.json) | 0.5 | -136.667617 | -134.756343 | -65788117.987595 | 640,675 | 1.000000 | 0.373345 | 0.061596 | 0.543702 | 990 / 10 |
+| [HDDC-9](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__c8bd5611/metrics.json) | 1 | -132.333849 | -130.382249 | -67191569.779550 | 341,328 | 1.000000 | 0.364823 | 0.054511 | 0.534609 | 996 / 4 |
 
-## Takeaways
+BIC uses n=270,000 training observations. Every run has zero ambiguous associations and zero components outside a cutoff. Intrinsic and ambient rank summaries each cover 1,000 components.
 
-- `0.01` has the strongest clustering metrics.
-- `0.1` is the more balanced geometry result.
-- Although `1` and `10` have high global tangent scores, 190 of 299 components
-  have undefined leading-subspace alignment, almost entirely from the torus.
+**Overall rank and geometry by surgery threshold**
+
+| Run | Surgery threshold | Mean rank | Intrinsic exact | Intrinsic ±1 | Intrinsic MAE | Ambient exact | Ambient ±1 | Ambient MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| HDDC-1 | 0.00025 | 22.351000 | 0.000000 | 0.119000 | 18.489000 | 0.295000 | 0.299000 | 16.270000 | 0.611119 | 0.438476 | 940 / 60 | 0.979178 | 0.986192 | 940 / 60 |
+| HDDC-2 | 0.005 | 8.101000 | 0.121000 | 0.497000 | 4.239000 | 0.793000 | 0.805000 | 2.020000 | 0.613384 | 0.447196 | 941 / 59 | 0.975069 | 0.983732 | 941 / 59 |
+| HDDC-3 | 0.01 | 6.898000 | 0.121000 | 0.617000 | 3.036000 | 0.913000 | 0.950000 | 0.817000 | 0.613384 | 0.447196 | 941 / 59 | 0.973772 | 0.982758 | 941 / 59 |
+| HDDC-4 | 0.05 | 6.761000 | 0.121000 | 0.680000 | 2.927000 | 0.962000 | 0.962000 | 0.736000 | 0.601333 | 0.425703 | 931 / 69 | 0.966415 | 0.968076 | 945 / 55 |
+| HDDC-5 | 0.1 | 6.761000 | 0.121000 | 0.680000 | 2.927000 | 0.962000 | 0.962000 | 0.736000 | 0.601333 | 0.425703 | 931 / 69 | 0.966415 | 0.968076 | 945 / 55 |
+| HDDC-6 | 0.15 | 6.761000 | 0.121000 | 0.680000 | 2.927000 | 0.962000 | 0.962000 | 0.736000 | 0.601333 | 0.425703 | 931 / 69 | 0.966415 | 0.968076 | 945 / 55 |
+| HDDC-7 | 0.2 | 6.761000 | 0.121000 | 0.680000 | 2.927000 | 0.962000 | 0.962000 | 0.736000 | 0.601333 | 0.425703 | 931 / 69 | 0.966415 | 0.968076 | 945 / 55 |
+| HDDC-8 | 0.5 | 4.281000 | 0.334000 | 0.718000 | 3.717000 | 0.484000 | 0.494000 | 3.216000 | 0.586011 | 0.558084 | 690 / 310 | 0.636273 | 0.604768 | 969 / 31 |
+| HDDC-9 | 1 | 1.744000 | 0.451000 | 0.708000 | 3.592000 | 0.121000 | 0.248000 | 5.753000 | 0.434229 | 0.544465 | 473 / 527 | 0.317386 | 0.268461 | 998 / 2 |
+
+Removing the former evaluation filter changes mean rank from 21.437 to 22.351 at surgery threshold 0.00025, and from 1.742 to 1.744 at threshold 1.0. Mean ranks for the other seven runs are unchanged. Alignment retains the same definition and validity counts; recomputation differences are at floating-point rounding precision.
+
+Runs at surgery thresholds 0.05, 0.1, 0.15, and 0.2 have byte-for-byte identical exported models and identical metric payloads apart from run identifiers. Each stopped at epoch 11 and restored the best state from epoch 1. Their later snapshots and validation scores differ. Each remains listed separately; their learned mean rank is 6.761.
+
+**segment — intrinsic dimension 1; native embedding dimension 1**
+
+| Run | Surgery threshold | Associated / rank N | Live / dead | Mean rank | Intrinsic exact | Intrinsic ±1 | Intrinsic MAE | Ambient exact | Ambient ±1 | Ambient MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| HDDC-1 | 0.00025 | 125 | 125 / 0 | 27.360001 | 0.000000 | 0.000000 | 26.360001 | 0.000000 | 0.000000 | 26.360001 | 0.967657 | 0.983497 | 125 / 0 | 0.978484 | 0.989170 | 125 / 0 |
+| HDDC-2 | 0.005 | 125 | 125 / 0 | 1.992000 | 0.968000 | 0.968000 | 0.992000 | 0.968000 | 0.968000 | 0.992000 | 0.967754 | 0.983547 | 125 / 0 | 0.972966 | 0.986379 | 125 / 0 |
+| HDDC-3 | 0.01 | 125 | 125 / 0 | 1.992000 | 0.968000 | 0.968000 | 0.992000 | 0.968000 | 0.968000 | 0.992000 | 0.967754 | 0.983547 | 125 / 0 | 0.972966 | 0.986379 | 125 / 0 |
+| HDDC-4 | 0.05 | 125 | 125 / 0 | 1.992000 | 0.968000 | 0.968000 | 0.992000 | 0.968000 | 0.968000 | 0.992000 | 0.967782 | 0.983561 | 125 / 0 | 0.972996 | 0.986393 | 125 / 0 |
+| HDDC-5 | 0.1 | 125 | 125 / 0 | 1.992000 | 0.968000 | 0.968000 | 0.992000 | 0.968000 | 0.968000 | 0.992000 | 0.967782 | 0.983561 | 125 / 0 | 0.972996 | 0.986393 | 125 / 0 |
+| HDDC-6 | 0.15 | 125 | 125 / 0 | 1.992000 | 0.968000 | 0.968000 | 0.992000 | 0.968000 | 0.968000 | 0.992000 | 0.967782 | 0.983561 | 125 / 0 | 0.972996 | 0.986393 | 125 / 0 |
+| HDDC-7 | 0.2 | 125 | 125 / 0 | 1.992000 | 0.968000 | 0.968000 | 0.992000 | 0.968000 | 0.968000 | 0.992000 | 0.967782 | 0.983561 | 125 / 0 | 0.972996 | 0.986393 | 125 / 0 |
+| HDDC-8 | 0.5 | 125 | 125 / 0 | 1.992000 | 0.968000 | 0.968000 | 0.992000 | 0.968000 | 0.968000 | 0.992000 | 0.957436 | 0.978299 | 125 / 0 | 0.962453 | 0.981033 | 125 / 0 |
+| HDDC-9 | 1 | 125 | 125 / 0 | 1.992000 | 0.968000 | 0.968000 | 0.992000 | 0.968000 | 0.968000 | 0.992000 | 0.946814 | 0.972523 | 125 / 0 | 0.952387 | 0.975807 | 125 / 0 |
+
+**circle — intrinsic dimension 1; native embedding dimension 2**
+
+| Run | Surgery threshold | Associated / rank N | Live / dead | Mean rank | Intrinsic exact | Intrinsic ±1 | Intrinsic MAE | Ambient exact | Ambient ±1 | Ambient MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| HDDC-1 | 0.00025 | 134 | 134 / 0 | 31.410448 | 0.000000 | 0.000000 | 30.410448 | 0.000000 | 0.000000 | 29.410448 | 0.451025 | 0.588509 | 134 / 0 | 0.974353 | 0.987026 | 134 / 0 |
+| HDDC-2 | 0.005 | 134 | 134 / 0 | 3.567164 | 0.000000 | 0.947761 | 2.567164 | 0.947761 | 0.947761 | 1.567164 | 0.457052 | 0.599955 | 134 / 0 | 0.966155 | 0.982874 | 134 / 0 |
+| HDDC-3 | 0.01 | 134 | 134 / 0 | 3.567164 | 0.000000 | 0.947761 | 2.567164 | 0.947761 | 0.947761 | 1.567164 | 0.457052 | 0.599955 | 134 / 0 | 0.966155 | 0.982874 | 134 / 0 |
+| HDDC-4 | 0.05 | 134 | 134 / 0 | 3.567164 | 0.000000 | 0.947761 | 2.567164 | 0.947761 | 0.947761 | 1.567164 | 0.447707 | 0.586732 | 134 / 0 | 0.965648 | 0.982616 | 134 / 0 |
+| HDDC-5 | 0.1 | 134 | 134 / 0 | 3.567164 | 0.000000 | 0.947761 | 2.567164 | 0.947761 | 0.947761 | 1.567164 | 0.447707 | 0.586732 | 134 / 0 | 0.965648 | 0.982616 | 134 / 0 |
+| HDDC-6 | 0.15 | 134 | 134 / 0 | 3.567164 | 0.000000 | 0.947761 | 2.567164 | 0.947761 | 0.947761 | 1.567164 | 0.447707 | 0.586732 | 134 / 0 | 0.965648 | 0.982616 | 134 / 0 |
+| HDDC-7 | 0.2 | 134 | 134 / 0 | 3.567164 | 0.000000 | 0.947761 | 2.567164 | 0.947761 | 0.947761 | 1.567164 | 0.447707 | 0.586732 | 134 / 0 | 0.965648 | 0.982616 | 134 / 0 |
+| HDDC-8 | 0.5 | 134 | 134 / 0 | 3.567164 | 0.000000 | 0.947761 | 2.567164 | 0.947761 | 0.947761 | 1.567164 | 0.535890 | 0.665988 | 134 / 0 | 0.932223 | 0.965478 | 134 / 0 |
+| HDDC-9 | 1 | 134 | 134 / 0 | 2.619403 | 0.947761 | 0.947761 | 1.619403 | 0.000000 | 0.947761 | 2.514925 | 0.311052 | 0.463169 | 134 / 0 | 0.335402 | 0.486250 | 134 / 0 |
+
+**sphere — intrinsic dimension 2; native embedding dimension 3**
+
+| Run | Surgery threshold | Associated / rank N | Live / dead | Mean rank | Intrinsic exact | Intrinsic ±1 | Intrinsic MAE | Ambient exact | Ambient ±1 | Ambient MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| HDDC-1 | 0.00025 | 145 | 145 / 0 | 31.737930 | 0.000000 | 0.000000 | 29.737930 | 0.000000 | 0.000000 | 28.737930 | 0.620547 | 0.458874 | 145 / 0 | 0.972484 | 0.984102 | 145 / 0 |
+| HDDC-2 | 0.005 | 145 | 145 / 0 | 4.503448 | 0.000000 | 0.875862 | 2.503448 | 0.875862 | 0.931035 | 1.503448 | 0.638446 | 0.487964 | 145 / 0 | 0.961853 | 0.978073 | 145 / 0 |
+| HDDC-3 | 0.01 | 145 | 145 / 0 | 4.413793 | 0.000000 | 0.937931 | 2.413793 | 0.937931 | 0.951724 | 1.413793 | 0.638446 | 0.487964 | 145 / 0 | 0.961787 | 0.978024 | 145 / 0 |
+| HDDC-4 | 0.05 | 145 | 145 / 0 | 4.400000 | 0.000000 | 0.951724 | 2.400000 | 0.951724 | 0.951724 | 1.400000 | 0.610433 | 0.440056 | 145 / 0 | 0.961776 | 0.978013 | 145 / 0 |
+| HDDC-5 | 0.1 | 145 | 145 / 0 | 4.400000 | 0.000000 | 0.951724 | 2.400000 | 0.951724 | 0.951724 | 1.400000 | 0.610433 | 0.440056 | 145 / 0 | 0.961776 | 0.978013 | 145 / 0 |
+| HDDC-6 | 0.15 | 145 | 145 / 0 | 4.400000 | 0.000000 | 0.951724 | 2.400000 | 0.951724 | 0.951724 | 1.400000 | 0.610433 | 0.440056 | 145 / 0 | 0.961776 | 0.978013 | 145 / 0 |
+| HDDC-7 | 0.2 | 145 | 145 / 0 | 4.400000 | 0.000000 | 0.951724 | 2.400000 | 0.951724 | 0.951724 | 1.400000 | 0.610433 | 0.440056 | 145 / 0 | 0.961776 | 0.978013 | 145 / 0 |
+| HDDC-8 | 0.5 | 145 | 145 / 0 | 4.400000 | 0.000000 | 0.951724 | 2.400000 | 0.951724 | 0.951724 | 1.400000 | 0.621711 | 0.498173 | 145 / 0 | 0.915916 | 0.951985 | 145 / 0 |
+| HDDC-9 | 1 | 145 | 145 / 0 | 2.496552 | 0.000000 | 0.951724 | 2.400000 | 0.000000 | 0.000000 | 3.303448 | 0.152011 | 0.148069 | 7 / 138 | 0.165591 | 0.029652 | 145 / 0 |
+
+**torus — intrinsic dimension 2; native embedding dimension 3**
+
+| Run | Surgery threshold | Associated / rank N | Live / dead | Mean rank | Intrinsic exact | Intrinsic ±1 | Intrinsic MAE | Ambient exact | Ambient ±1 | Ambient MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| HDDC-1 | 0.00025 | 46 | 6 / 40 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.500122 | 0.014183 | 46 / 0 | 0.999938 | 0.999953 | 46 / 0 |
+| HDDC-2 | 0.005 | 46 | 4 / 42 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.500117 | 0.013748 | 46 / 0 | 0.999937 | 0.999952 | 46 / 0 |
+| HDDC-3 | 0.01 | 46 | 4 / 42 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.500117 | 0.013748 | 46 / 0 | 0.999937 | 0.999952 | 46 / 0 |
+| HDDC-4 | 0.05 | 46 | 4 / 42 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.500117 | 0.013814 | 46 / 0 | 0.999938 | 0.999953 | 46 / 0 |
+| HDDC-5 | 0.1 | 46 | 4 / 42 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.500117 | 0.013814 | 46 / 0 | 0.999938 | 0.999953 | 46 / 0 |
+| HDDC-6 | 0.15 | 46 | 4 / 42 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.500117 | 0.013814 | 46 / 0 | 0.999938 | 0.999953 | 46 / 0 |
+| HDDC-7 | 0.2 | 46 | 4 / 42 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.500117 | 0.013814 | 46 / 0 | 0.999938 | 0.999953 | 46 / 0 |
+| HDDC-8 | 0.5 | 46 | 46 / 0 | 1.217391 | 0.217391 | 1.000000 | 0.782609 | 0.000000 | 0.217391 | 1.782609 | 0.572238 | 0.323878 | 10 / 36 | 0.500889 | 0.070408 | 46 / 0 |
+| HDDC-9 | 1 | 46 | 46 / 0 | 1.000000 | 0.000000 | 1.000000 | 1.000000 | 0.000000 | 0.000000 | 2.000000 | — | — | 0 / 46 | 0.490891 | 0.000000 | 46 / 0 |
+
+**swiss_roll — intrinsic dimension 2; native embedding dimension 3**
+
+| Run | Surgery threshold | Associated / rank N | Live / dead | Mean rank | Intrinsic exact | Intrinsic ±1 | Intrinsic MAE | Ambient exact | Ambient ±1 | Ambient MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| HDDC-1 | 0.00025 | 14 | 4 / 10 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.987567 | 0.987474 | 14 / 0 | 0.999988 | 0.999988 | 14 / 0 |
+| HDDC-2 | 0.005 | 14 | 4 / 10 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.987443 | 0.987342 | 14 / 0 | 0.999988 | 0.999988 | 14 / 0 |
+| HDDC-3 | 0.01 | 14 | 4 / 10 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.987443 | 0.987342 | 14 / 0 | 0.999988 | 0.999988 | 14 / 0 |
+| HDDC-4 | 0.05 | 14 | 14 / 0 | 1.000000 | 0.000000 | 1.000000 | 1.000000 | 0.000000 | 0.000000 | 2.000000 | — | — | 0 / 14 | 0.499505 | 0.000000 | 14 / 0 |
+| HDDC-5 | 0.1 | 14 | 14 / 0 | 1.000000 | 0.000000 | 1.000000 | 1.000000 | 0.000000 | 0.000000 | 2.000000 | — | — | 0 / 14 | 0.499505 | 0.000000 | 14 / 0 |
+| HDDC-6 | 0.15 | 14 | 14 / 0 | 1.000000 | 0.000000 | 1.000000 | 1.000000 | 0.000000 | 0.000000 | 2.000000 | — | — | 0 / 14 | 0.499505 | 0.000000 | 14 / 0 |
+| HDDC-7 | 0.2 | 14 | 14 / 0 | 1.000000 | 0.000000 | 1.000000 | 1.000000 | 0.000000 | 0.000000 | 2.000000 | — | — | 0 / 14 | 0.499505 | 0.000000 | 14 / 0 |
+| HDDC-8 | 0.5 | 14 | 14 / 0 | 1.000000 | 0.000000 | 1.000000 | 1.000000 | 0.000000 | 0.000000 | 2.000000 | — | — | 0 / 14 | 0.499966 | 0.000000 | 14 / 0 |
+| HDDC-9 | 1 | 14 | 14 / 0 | 1.000000 | 0.000000 | 1.000000 | 1.000000 | 0.000000 | 0.000000 | 2.000000 | — | — | 0 / 14 | 0.499620 | 0.000000 | 14 / 0 |
+
+**helix — intrinsic dimension 1; native embedding dimension 3**
+
+| Run | Surgery threshold | Associated / rank N | Live / dead | Mean rank | Intrinsic exact | Intrinsic ±1 | Intrinsic MAE | Ambient exact | Ambient ±1 | Ambient MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| HDDC-1 | 0.00025 | 97 | 96 / 1 | 4.391753 | 0.000000 | 0.000000 | 3.391752 | 0.845361 | 0.855670 | 1.391753 | 0.100371 | 0.269422 | 97 / 0 | 0.993834 | 0.996826 | 97 / 0 |
+| HDDC-2 | 0.005 | 97 | 94 / 3 | 3.896907 | 0.000000 | 0.000000 | 2.896907 | 0.969072 | 0.969072 | 0.896907 | 0.097492 | 0.263063 | 97 / 0 | 0.993953 | 0.996886 | 97 / 0 |
+| HDDC-3 | 0.01 | 97 | 94 / 3 | 3.896907 | 0.000000 | 0.000000 | 2.896907 | 0.969072 | 0.969072 | 0.896907 | 0.097492 | 0.263063 | 97 / 0 | 0.993953 | 0.996886 | 97 / 0 |
+| HDDC-4 | 0.05 | 97 | 94 / 3 | 3.896907 | 0.000000 | 0.000000 | 2.896907 | 0.969072 | 0.969072 | 0.896907 | 0.094924 | 0.259794 | 97 / 0 | 0.994029 | 0.996924 | 97 / 0 |
+| HDDC-5 | 0.1 | 97 | 94 / 3 | 3.896907 | 0.000000 | 0.000000 | 2.896907 | 0.969072 | 0.969072 | 0.896907 | 0.094924 | 0.259794 | 97 / 0 | 0.994029 | 0.996924 | 97 / 0 |
+| HDDC-6 | 0.15 | 97 | 94 / 3 | 3.896907 | 0.000000 | 0.000000 | 2.896907 | 0.969072 | 0.969072 | 0.896907 | 0.094924 | 0.259794 | 97 / 0 | 0.994029 | 0.996924 | 97 / 0 |
+| HDDC-7 | 0.2 | 97 | 94 / 3 | 3.896907 | 0.000000 | 0.000000 | 2.896907 | 0.969072 | 0.969072 | 0.896907 | 0.094924 | 0.259794 | 97 / 0 | 0.994029 | 0.996924 | 97 / 0 |
+| HDDC-8 | 0.5 | 97 | 96 / 1 | 1.958763 | 0.969072 | 0.969072 | 0.958763 | 0.000000 | 0.000000 | 2.835052 | 0.334695 | 0.493972 | 97 / 0 | 0.360772 | 0.517066 | 97 / 0 |
+| HDDC-9 | 1 | 97 | 95 / 2 | 1.958763 | 0.969072 | 0.969072 | 0.958763 | 0.000000 | 0.000000 | 2.835052 | 0.333504 | 0.484459 | 97 / 0 | 0.351422 | 0.502597 | 97 / 0 |
+
+**helix_4d — intrinsic dimension 1; native embedding dimension 4**
+
+| Run | Surgery threshold | Associated / rank N | Live / dead | Mean rank | Intrinsic exact | Intrinsic ±1 | Intrinsic MAE | Ambient exact | Ambient ±1 | Ambient MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| HDDC-1 | 0.00025 | 112 | 111 / 1 | 13.446428 | 0.000000 | 0.000000 | 12.446428 | 0.008929 | 0.035714 | 9.446428 | 0.322505 | 0.492959 | 52 / 60 | 0.988348 | 0.994034 | 52 / 60 |
+| HDDC-2 | 0.005 | 112 | 110 / 2 | 4.750000 | 0.000000 | 0.000000 | 3.750000 | 0.973214 | 0.973214 | 0.750000 | 0.281241 | 0.451726 | 53 / 59 | 0.987600 | 0.993662 | 53 / 59 |
+| HDDC-3 | 0.01 | 112 | 110 / 2 | 4.750000 | 0.000000 | 0.000000 | 3.750000 | 0.973214 | 0.973214 | 0.750000 | 0.281241 | 0.451726 | 53 / 59 | 0.987600 | 0.993662 | 53 / 59 |
+| HDDC-4 | 0.05 | 112 | 110 / 2 | 4.750000 | 0.000000 | 0.000000 | 3.750000 | 0.973214 | 0.973214 | 0.750000 | 0.274095 | 0.440839 | 57 / 55 | 0.988562 | 0.994153 | 57 / 55 |
+| HDDC-5 | 0.1 | 112 | 110 / 2 | 4.750000 | 0.000000 | 0.000000 | 3.750000 | 0.973214 | 0.973214 | 0.750000 | 0.274095 | 0.440839 | 57 / 55 | 0.988562 | 0.994153 | 57 / 55 |
+| HDDC-6 | 0.15 | 112 | 110 / 2 | 4.750000 | 0.000000 | 0.000000 | 3.750000 | 0.973214 | 0.973214 | 0.750000 | 0.274095 | 0.440839 | 57 / 55 | 0.988562 | 0.994153 | 57 / 55 |
+| HDDC-7 | 0.2 | 112 | 110 / 2 | 4.750000 | 0.000000 | 0.000000 | 3.750000 | 0.973214 | 0.973214 | 0.750000 | 0.274095 | 0.440839 | 57 / 55 | 0.988562 | 0.994153 | 57 / 55 |
+| HDDC-8 | 0.5 | 112 | 110 / 2 | 1.830357 | 0.973214 | 0.973214 | 0.830357 | 0.000000 | 0.000000 | 3.669643 | 0.377314 | 0.525861 | 81 / 31 | 0.407716 | 0.554248 | 81 / 31 |
+| HDDC-9 | 1 | 112 | 110 / 2 | 1.830357 | 0.973214 | 0.973214 | 0.830357 | 0.000000 | 0.000000 | 3.669643 | 0.108580 | 0.235208 | 110 / 2 | 0.125250 | 0.252176 | 110 / 2 |
+
+**hypersphere_10d — intrinsic dimension 10; native embedding dimension 11**
+
+| Run | Surgery threshold | Associated / rank N | Live / dead | Mean rank | Intrinsic exact | Intrinsic ±1 | Intrinsic MAE | Ambient exact | Ambient ±1 | Ambient MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| HDDC-1 | 0.00025 | 175 | 175 / 0 | 31.994286 | 0.000000 | 0.000000 | 21.994286 | 0.000000 | 0.000000 | 20.994286 | 0.843702 | 0.191478 | 175 / 0 | 0.952923 | 0.960271 | 175 / 0 |
+| HDDC-2 | 0.005 | 175 | 175 / 0 | 18.411428 | 0.000000 | 0.017143 | 8.411428 | 0.017143 | 0.040000 | 7.411428 | 0.854531 | 0.221383 | 175 / 0 | 0.949965 | 0.957247 | 175 / 0 |
+| HDDC-3 | 0.01 | 175 | 175 / 0 | 11.611428 | 0.000000 | 0.651429 | 1.611429 | 0.651429 | 0.851429 | 0.611429 | 0.854531 | 0.221383 | 175 / 0 | 0.943048 | 0.952052 | 175 / 0 |
+| HDDC-4 | 0.05 | 175 | 175 / 0 | 11.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.854046 | 0.196404 | 175 / 0 | 0.943063 | 0.952530 | 175 / 0 |
+| HDDC-5 | 0.1 | 175 | 175 / 0 | 11.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.854046 | 0.196404 | 175 / 0 | 0.943063 | 0.952530 | 175 / 0 |
+| HDDC-6 | 0.15 | 175 | 175 / 0 | 11.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.854046 | 0.196404 | 175 / 0 | 0.943063 | 0.952530 | 175 / 0 |
+| HDDC-7 | 0.2 | 175 | 175 / 0 | 11.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.854046 | 0.196404 | 175 / 0 | 0.943063 | 0.952530 | 175 / 0 |
+| HDDC-8 | 0.5 | 175 | 175 / 0 | 1.571429 | 0.000000 | 0.057143 | 8.542857 | 0.057143 | 0.057143 | 9.428572 | 0.870933 | 0.204185 | 10 / 165 | 0.134245 | 0.055427 | 175 / 0 |
+| HDDC-9 | 1 | 175 | 175 / 0 | 1.000000 | 0.000000 | 0.000000 | 9.000000 | 0.000000 | 0.000000 | 10.000000 | — | — | 0 / 175 | 0.095850 | 0.000000 | 175 / 0 |
+
+**product_torus_12d — intrinsic dimension 12; native embedding dimension 24**
+
+| Run | Surgery threshold | Associated / rank N | Live / dead | Mean rank | Intrinsic exact | Intrinsic ±1 | Intrinsic MAE | Ambient exact | Ambient ±1 | Ambient MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| HDDC-1 | 0.00025 | 93 | 21 / 72 | 24.000000 | 0.000000 | 0.000000 | 12.000000 | 1.000000 | 1.000000 | 0.000000 | 0.506108 | 0.055208 | 93 / 0 | 0.999921 | 0.999936 | 93 / 0 |
+| HDDC-2 | 0.005 | 93 | 15 / 78 | 24.000000 | 0.000000 | 0.000000 | 12.000000 | 1.000000 | 1.000000 | 0.000000 | 0.504133 | 0.066638 | 93 / 0 | 0.999921 | 0.999935 | 93 / 0 |
+| HDDC-3 | 0.01 | 93 | 16 / 77 | 24.000000 | 0.000000 | 0.000000 | 12.000000 | 1.000000 | 1.000000 | 0.000000 | 0.504133 | 0.066638 | 93 / 0 | 0.999921 | 0.999935 | 93 / 0 |
+| HDDC-4 | 0.05 | 93 | 15 / 78 | 24.000000 | 0.000000 | 0.000000 | 12.000000 | 1.000000 | 1.000000 | 0.000000 | 0.509660 | 0.064781 | 93 / 0 | 0.999921 | 0.999935 | 93 / 0 |
+| HDDC-5 | 0.1 | 93 | 15 / 78 | 24.000000 | 0.000000 | 0.000000 | 12.000000 | 1.000000 | 1.000000 | 0.000000 | 0.509660 | 0.064781 | 93 / 0 | 0.999921 | 0.999935 | 93 / 0 |
+| HDDC-6 | 0.15 | 93 | 15 / 78 | 24.000000 | 0.000000 | 0.000000 | 12.000000 | 1.000000 | 1.000000 | 0.000000 | 0.509660 | 0.064781 | 93 / 0 | 0.999921 | 0.999935 | 93 / 0 |
+| HDDC-7 | 0.2 | 93 | 15 / 78 | 24.000000 | 0.000000 | 0.000000 | 12.000000 | 1.000000 | 1.000000 | 0.000000 | 0.509660 | 0.064781 | 93 / 0 | 0.999921 | 0.999935 | 93 / 0 |
+| HDDC-8 | 0.5 | 93 | 86 / 7 | 22.763441 | 0.000000 | 0.000000 | 11.946237 | 0.946237 | 0.946237 | 1.236559 | 0.514215 | 0.062754 | 88 / 5 | 0.947846 | 0.946144 | 93 / 0 |
+| HDDC-9 | 1 | 93 | 93 / 0 | 1.000000 | 0.000000 | 0.000000 | 11.000000 | 0.000000 | 0.000000 | 23.000000 | — | — | 0 / 93 | 0.067667 | 0.000000 | 93 / 0 |
+
+**cylinder — intrinsic dimension 2; native embedding dimension 3**
+
+| Run | Surgery threshold | Associated / rank N | Live / dead | Mean rank | Intrinsic exact | Intrinsic ±1 | Intrinsic MAE | Ambient exact | Ambient ±1 | Ambient MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| HDDC-1 | 0.00025 | 59 | 12 / 47 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.763131 | 0.660101 | 59 / 0 | 0.999930 | 0.999945 | 59 / 0 |
+| HDDC-2 | 0.005 | 59 | 11 / 48 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.759081 | 0.641799 | 59 / 0 | 0.999930 | 0.999945 | 59 / 0 |
+| HDDC-3 | 0.01 | 59 | 11 / 48 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.759081 | 0.641799 | 59 / 0 | 0.999930 | 0.999945 | 59 / 0 |
+| HDDC-4 | 0.05 | 59 | 8 / 51 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.774071 | 0.671117 | 59 / 0 | 0.999930 | 0.999945 | 59 / 0 |
+| HDDC-5 | 0.1 | 59 | 8 / 51 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.774071 | 0.671117 | 59 / 0 | 0.999930 | 0.999945 | 59 / 0 |
+| HDDC-6 | 0.15 | 59 | 8 / 51 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.774071 | 0.671117 | 59 / 0 | 0.999930 | 0.999945 | 59 / 0 |
+| HDDC-7 | 0.2 | 59 | 8 / 51 | 3.000000 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 0.000000 | 0.774071 | 0.671117 | 59 / 0 | 0.999930 | 0.999945 | 59 / 0 |
+| HDDC-8 | 0.5 | 59 | 59 / 0 | 1.000000 | 0.000000 | 1.000000 | 1.000000 | 0.000000 | 0.000000 | 2.000000 | — | — | 0 / 59 | 0.488362 | 0.000000 | 59 / 0 |
+| HDDC-9 | 1 | 59 | 59 / 0 | 1.000000 | 0.000000 | 1.000000 | 1.000000 | 0.000000 | 0.000000 | 2.000000 | — | — | 0 / 59 | 0.478660 | 0.000000 | 59 / 0 |
+
+**KMeans initialization evaluation — noise ratio 10**
+
+Source: [initialization_evaluation](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/centroids/kmeans_k1000_full/initialization_evaluation/metrics.json). Full-data KMeans with K=1,000, D=128, and PCA capacity/q_max=16, evaluated in-sample on 300,000 points. Rank selection uses the raw Cattell scree rule; 982 components meet the minimum population of 26 (299,843 points).
+
+**Overall clustering and initialization geometry**
+
+| Run | Homogeneity | Completeness | ARI | NMI | Inertia | RMS point-to-centroid distance | Live / dead | Associated / outside / ambiguous | Mean centroid-to-manifold distance | Tangent alignment overlap | Tangent alignment worst cosine | Valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| KMeans k=1,000 full | 1.000000 | 0.344432 | 0.031147 | 0.512383 | 264964.094055 | 0.939794 | 1,000 / 0 | 1,000 / 0 / 0 | 0.202167 | 0.334854 | 0.319014 | 979 / 3 |
+
+NLL, BIC, and Gaussian-overlap metrics are not applicable: this artifact is a nearest-centroid/PCA initialization evaluation, not a probabilistic MFA model.
+
+**Cattell threshold sweep**
+
+| Threshold | Eligible components | Mean rank | Exact | ±1 | MAE | Containment overlap | Containment worst cosine | Valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.00025 | 982 | 15.812627 | 0.000000 | 0.014257 | 11.905295 | 0.441136 | 0.544931 | 979 / 3 |
+| 0.005 | 982 | 15.006110 | 0.017312 | 0.048880 | 11.098778 | 0.440200 | 0.543626 | 979 / 3 |
+| 0.01 | 982 | 14.225051 | 0.043788 | 0.071283 | 10.317719 | 0.437472 | 0.540223 | 979 / 3 |
+| 0.05 | 982 | 3.899185 | 0.651731 | 0.830957 | 0.914460 | 0.321952 | 0.326998 | 979 / 3 |
+| 0.1 | 982 | 2.262729 | 0.682281 | 0.843177 | 1.679226 | 0.235177 | 0.245365 | 979 / 3 |
+| 0.15 | 982 | 1.377800 | 0.597760 | 0.752546 | 2.558045 | 0.165560 | 0.177790 | 979 / 3 |
+| 0.2 | 982 | 1.135438 | 0.571283 | 0.727088 | 2.800407 | 0.145727 | 0.156314 | 979 / 3 |
+| 0.5 | 982 | 1.044806 | 0.510183 | 0.727088 | 2.862525 | 0.110272 | 0.083339 | 979 / 3 |
+| 1.0 | 982 | 1.000000 | 0.465377 | 0.727088 | 2.907332 | 0.088731 | 0.039919 | 979 / 3 |
+
+Exact and ±1 are fractions of eligible, associated components whose Cattell rank matches the planted intrinsic dimension exactly or within one; MAE is the corresponding mean absolute error. Tangent alignment matches the intrinsic-dimensional PCA subspace; containment uses the Cattell-selected rank.
+
+**segment — intrinsic dimension 1**
+
+| Threshold | Associated / eligible / excluded | Live / dead | Mean rank | Exact | ±1 | MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.00025 | 125 / 122 / 3 | 125 / 0 | 16.0 | 0.0 | 0.0 | 15.0 | 0.011285 | 0.084226 | 122 / 0 | 0.139337 | 0.367588 | 122 / 0 |
+| 0.005 | 125 / 122 / 3 | 125 / 0 | 15.836065 | 0.0 | 0.0 | 14.836065 | 0.011285 | 0.084226 | 122 / 0 | 0.138761 | 0.366724 | 122 / 0 |
+| 0.01 | 125 / 122 / 3 | 125 / 0 | 15.508197 | 0.0 | 0.0 | 14.508197 | 0.011285 | 0.084226 | 122 / 0 | 0.136366 | 0.363393 | 122 / 0 |
+| 0.05 | 125 / 122 / 3 | 125 / 0 | 1.606557 | 0.729508 | 0.819672 | 0.606557 | 0.011285 | 0.084226 | 122 / 0 | 0.017765 | 0.106721 | 122 / 0 |
+| 0.1 | 125 / 122 / 3 | 125 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.011285 | 0.084226 | 122 / 0 | 0.011285 | 0.084226 | 122 / 0 |
+| 0.15 | 125 / 122 / 3 | 125 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.011285 | 0.084226 | 122 / 0 | 0.011285 | 0.084226 | 122 / 0 |
+| 0.2 | 125 / 122 / 3 | 125 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.011285 | 0.084226 | 122 / 0 | 0.011285 | 0.084226 | 122 / 0 |
+| 0.5 | 125 / 122 / 3 | 125 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.011285 | 0.084226 | 122 / 0 | 0.011285 | 0.084226 | 122 / 0 |
+| 1.0 | 125 / 122 / 3 | 125 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.011285 | 0.084226 | 122 / 0 | 0.011285 | 0.084226 | 122 / 0 |
+
+**circle — intrinsic dimension 1**
+
+| Threshold | Associated / eligible / excluded | Live / dead | Mean rank | Exact | ±1 | MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.00025 | 134 / 129 / 5 | 134 / 0 | 16.0 | 0.0 | 0.0 | 15.0 | 0.011174 | 0.085098 | 129 / 0 | 0.143115 | 0.370573 | 129 / 0 |
+| 0.005 | 134 / 129 / 5 | 134 / 0 | 15.883721 | 0.0 | 0.0 | 14.883721 | 0.011174 | 0.085098 | 129 / 0 | 0.141812 | 0.368783 | 129 / 0 |
+| 0.01 | 134 / 129 / 5 | 134 / 0 | 15.573644 | 0.0 | 0.0 | 14.573644 | 0.011174 | 0.085098 | 129 / 0 | 0.139001 | 0.364741 | 129 / 0 |
+| 0.05 | 134 / 129 / 5 | 134 / 0 | 1.674419 | 0.689922 | 0.813953 | 0.674419 | 0.011174 | 0.085098 | 129 / 0 | 0.019887 | 0.113556 | 129 / 0 |
+| 0.1 | 134 / 129 / 5 | 134 / 0 | 1.007752 | 0.992248 | 1.0 | 0.007752 | 0.011174 | 0.085098 | 129 / 0 | 0.011258 | 0.085557 | 129 / 0 |
+| 0.15 | 134 / 129 / 5 | 134 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.011174 | 0.085098 | 129 / 0 | 0.011174 | 0.085098 | 129 / 0 |
+| 0.2 | 134 / 129 / 5 | 134 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.011174 | 0.085098 | 129 / 0 | 0.011174 | 0.085098 | 129 / 0 |
+| 0.5 | 134 / 129 / 5 | 134 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.011174 | 0.085098 | 129 / 0 | 0.011174 | 0.085098 | 129 / 0 |
+| 1.0 | 134 / 129 / 5 | 134 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.011174 | 0.085098 | 129 / 0 | 0.011174 | 0.085098 | 129 / 0 |
+
+**sphere — intrinsic dimension 2**
+
+| Threshold | Associated / eligible / excluded | Live / dead | Mean rank | Exact | ±1 | MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.00025 | 145 / 138 / 7 | 145 / 0 | 16.0 | 0.0 | 0.0 | 14.0 | 0.050298 | 0.077874 | 138 / 0 | 0.219375 | 0.361697 | 138 / 0 |
+| 0.005 | 145 / 138 / 7 | 145 / 0 | 15.891304 | 0.0 | 0.0 | 13.891304 | 0.050298 | 0.077874 | 138 / 0 | 0.218586 | 0.360135 | 138 / 0 |
+| 0.01 | 145 / 138 / 7 | 145 / 0 | 15.471014 | 0.0 | 0.0 | 13.471014 | 0.050298 | 0.077874 | 138 / 0 | 0.214702 | 0.35554 | 138 / 0 |
+| 0.05 | 145 / 138 / 7 | 145 / 0 | 1.891304 | 0.188406 | 0.905797 | 1.166667 | 0.050298 | 0.077874 | 138 / 0 | 0.04357 | 0.045529 | 138 / 0 |
+| 0.1 | 145 / 138 / 7 | 145 / 0 | 1.028986 | 0.014493 | 1.0 | 0.985507 | 0.050298 | 0.077874 | 138 / 0 | 0.028836 | 0.003519 | 138 / 0 |
+| 0.15 | 145 / 138 / 7 | 145 / 0 | 1.0 | 0.0 | 1.0 | 1.0 | 0.050298 | 0.077874 | 138 / 0 | 0.028118 | 0.0 | 138 / 0 |
+| 0.2 | 145 / 138 / 7 | 145 / 0 | 1.0 | 0.0 | 1.0 | 1.0 | 0.050298 | 0.077874 | 138 / 0 | 0.028118 | 0.0 | 138 / 0 |
+| 0.5 | 145 / 138 / 7 | 145 / 0 | 1.0 | 0.0 | 1.0 | 1.0 | 0.050298 | 0.077874 | 138 / 0 | 0.028118 | 0.0 | 138 / 0 |
+| 1.0 | 145 / 138 / 7 | 145 / 0 | 1.0 | 0.0 | 1.0 | 1.0 | 0.050298 | 0.077874 | 138 / 0 | 0.028118 | 0.0 | 138 / 0 |
+
+**torus — intrinsic dimension 2**
+
+| Threshold | Associated / eligible / excluded | Live / dead | Mean rank | Exact | ±1 | MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.00025 | 46 / 46 / 0 | 46 / 0 | 15.978261 | 0.0 | 0.0 | 13.978261 | 0.980265 | 0.988288 | 46 / 0 | 0.982934 | 0.989842 | 46 / 0 |
+| 0.005 | 46 / 46 / 0 | 46 / 0 | 3.021739 | 0.369565 | 0.73913 | 1.021739 | 0.980265 | 0.988288 | 46 / 0 | 0.980577 | 0.988482 | 46 / 0 |
+| 0.01 | 46 / 46 / 0 | 46 / 0 | 2.130435 | 0.869565 | 1.0 | 0.130435 | 0.980265 | 0.988288 | 46 / 0 | 0.980389 | 0.988349 | 46 / 0 |
+| 0.05 | 46 / 46 / 0 | 46 / 0 | 2.0 | 1.0 | 1.0 | 0.0 | 0.980265 | 0.988288 | 46 / 0 | 0.980265 | 0.988288 | 46 / 0 |
+| 0.1 | 46 / 46 / 0 | 46 / 0 | 2.0 | 1.0 | 1.0 | 0.0 | 0.980265 | 0.988288 | 46 / 0 | 0.980265 | 0.988288 | 46 / 0 |
+| 0.15 | 46 / 46 / 0 | 46 / 0 | 2.0 | 1.0 | 1.0 | 0.0 | 0.980265 | 0.988288 | 46 / 0 | 0.980265 | 0.988288 | 46 / 0 |
+| 0.2 | 46 / 46 / 0 | 46 / 0 | 2.0 | 1.0 | 1.0 | 0.0 | 0.980265 | 0.988288 | 46 / 0 | 0.980265 | 0.988288 | 46 / 0 |
+| 0.5 | 46 / 46 / 0 | 46 / 0 | 1.913043 | 0.913043 | 1.0 | 0.086957 | 0.980265 | 0.988288 | 46 / 0 | 0.938087 | 0.902654 | 46 / 0 |
+| 1.0 | 46 / 46 / 0 | 46 / 0 | 1.0 | 0.0 | 1.0 | 1.0 | 0.980265 | 0.988288 | 46 / 0 | 0.491358 | 0.0 | 46 / 0 |
+
+**swiss_roll — intrinsic dimension 2**
+
+| Threshold | Associated / eligible / excluded | Live / dead | Mean rank | Exact | ±1 | MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.00025 | 14 / 14 / 0 | 14 / 0 | 3.0 | 0.0 | 1.0 | 1.0 | 0.90549 | 0.869834 | 14 / 0 | 0.99958 | 0.999741 | 14 / 0 |
+| 0.005 | 14 / 14 / 0 | 14 / 0 | 3.0 | 0.0 | 1.0 | 1.0 | 0.90549 | 0.869834 | 14 / 0 | 0.99958 | 0.999741 | 14 / 0 |
+| 0.01 | 14 / 14 / 0 | 14 / 0 | 3.0 | 0.0 | 1.0 | 1.0 | 0.90549 | 0.869834 | 14 / 0 | 0.99958 | 0.999741 | 14 / 0 |
+| 0.05 | 14 / 14 / 0 | 14 / 0 | 3.0 | 0.0 | 1.0 | 1.0 | 0.90549 | 0.869834 | 14 / 0 | 0.99958 | 0.999741 | 14 / 0 |
+| 0.1 | 14 / 14 / 0 | 14 / 0 | 3.0 | 0.0 | 1.0 | 1.0 | 0.90549 | 0.869834 | 14 / 0 | 0.99958 | 0.999741 | 14 / 0 |
+| 0.15 | 14 / 14 / 0 | 14 / 0 | 3.0 | 0.0 | 1.0 | 1.0 | 0.90549 | 0.869834 | 14 / 0 | 0.99958 | 0.999741 | 14 / 0 |
+| 0.2 | 14 / 14 / 0 | 14 / 0 | 3.0 | 0.0 | 1.0 | 1.0 | 0.90549 | 0.869834 | 14 / 0 | 0.99958 | 0.999741 | 14 / 0 |
+| 0.5 | 14 / 14 / 0 | 14 / 0 | 1.142857 | 0.142857 | 1.0 | 0.857143 | 0.90549 | 0.869834 | 14 / 0 | 0.500009 | 0.070418 | 14 / 0 |
+| 1.0 | 14 / 14 / 0 | 14 / 0 | 1.0 | 0.0 | 1.0 | 1.0 | 0.90549 | 0.869834 | 14 / 0 | 0.461474 | 0.0 | 14 / 0 |
+
+**helix — intrinsic dimension 1**
+
+| Threshold | Associated / eligible / excluded | Live / dead | Mean rank | Exact | ±1 | MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.00025 | 97 / 95 / 2 | 97 / 0 | 16.0 | 0.0 | 0.0 | 15.0 | 0.013032 | 0.090598 | 95 / 0 | 0.147289 | 0.373913 | 95 / 0 |
+| 0.005 | 97 / 95 / 2 | 97 / 0 | 15.873684 | 0.0 | 0.0 | 14.873684 | 0.013032 | 0.090598 | 95 / 0 | 0.146204 | 0.372281 | 95 / 0 |
+| 0.01 | 97 / 95 / 2 | 97 / 0 | 15.473684 | 0.0 | 0.0 | 14.473684 | 0.013032 | 0.090598 | 95 / 0 | 0.143079 | 0.368313 | 95 / 0 |
+| 0.05 | 97 / 95 / 2 | 97 / 0 | 1.51579 | 0.8 | 0.873684 | 0.515789 | 0.013032 | 0.090598 | 95 / 0 | 0.020066 | 0.110846 | 95 / 0 |
+| 0.1 | 97 / 95 / 2 | 97 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.013032 | 0.090598 | 95 / 0 | 0.013032 | 0.090598 | 95 / 0 |
+| 0.15 | 97 / 95 / 2 | 97 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.013032 | 0.090598 | 95 / 0 | 0.013032 | 0.090598 | 95 / 0 |
+| 0.2 | 97 / 95 / 2 | 97 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.013032 | 0.090598 | 95 / 0 | 0.013032 | 0.090598 | 95 / 0 |
+| 0.5 | 97 / 95 / 2 | 97 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.013032 | 0.090598 | 95 / 0 | 0.013032 | 0.090598 | 95 / 0 |
+| 1.0 | 97 / 95 / 2 | 97 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.013032 | 0.090598 | 95 / 0 | 0.013032 | 0.090598 | 95 / 0 |
+
+**helix_4d — intrinsic dimension 1**
+
+| Threshold | Associated / eligible / excluded | Live / dead | Mean rank | Exact | ±1 | MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.00025 | 112 / 111 / 1 | 112 / 0 | 16.0 | 0.0 | 0.0 | 15.0 | 0.011293 | 0.085378 | 108 / 3 | 0.147726 | 0.374799 | 108 / 3 |
+| 0.005 | 112 / 111 / 1 | 112 / 0 | 15.864865 | 0.0 | 0.0 | 14.864865 | 0.011293 | 0.085378 | 108 / 3 | 0.147142 | 0.374054 | 108 / 3 |
+| 0.01 | 112 / 111 / 1 | 112 / 0 | 15.450451 | 0.0 | 0.0 | 14.450451 | 0.011293 | 0.085378 | 108 / 3 | 0.144176 | 0.36977 | 108 / 3 |
+| 0.05 | 112 / 111 / 1 | 112 / 0 | 1.630631 | 0.720721 | 0.846847 | 0.630631 | 0.011293 | 0.085378 | 108 / 3 | 0.022088 | 0.11372 | 108 / 3 |
+| 0.1 | 112 / 111 / 1 | 112 / 0 | 1.009009 | 0.990991 | 1.0 | 0.009009 | 0.011293 | 0.085378 | 108 / 3 | 0.011622 | 0.086096 | 108 / 3 |
+| 0.15 | 112 / 111 / 1 | 112 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.011293 | 0.085378 | 108 / 3 | 0.011293 | 0.085378 | 108 / 3 |
+| 0.2 | 112 / 111 / 1 | 112 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.011293 | 0.085378 | 108 / 3 | 0.011293 | 0.085378 | 108 / 3 |
+| 0.5 | 112 / 111 / 1 | 112 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.011293 | 0.085378 | 108 / 3 | 0.011293 | 0.085378 | 108 / 3 |
+| 1.0 | 112 / 111 / 1 | 112 / 0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.011293 | 0.085378 | 108 / 3 | 0.011293 | 0.085378 | 108 / 3 |
+
+**hypersphere_10d — intrinsic dimension 10**
+
+| Threshold | Associated / eligible / excluded | Live / dead | Mean rank | Exact | ±1 | MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.00025 | 175 / 175 / 0 | 175 / 0 | 15.994286 | 0.0 | 0.0 | 5.994286 | 0.790248 | 0.779998 | 175 / 0 | 0.809983 | 0.80734 | 175 / 0 |
+| 0.005 | 175 / 175 / 0 | 175 / 0 | 15.8 | 0.0 | 0.0 | 5.8 | 0.790248 | 0.779998 | 175 / 0 | 0.809481 | 0.806574 | 175 / 0 |
+| 0.01 | 175 / 175 / 0 | 175 / 0 | 15.028571 | 0.0 | 0.005714 | 5.028572 | 0.790248 | 0.779998 | 175 / 0 | 0.807215 | 0.804093 | 175 / 0 |
+| 0.05 | 175 / 175 / 0 | 175 / 0 | 9.965714 | 0.971429 | 0.994286 | 0.034286 | 0.790248 | 0.779998 | 175 / 0 | 0.788407 | 0.760415 | 175 / 0 |
+| 0.1 | 175 / 175 / 0 | 175 / 0 | 7.24 | 0.617143 | 0.651429 | 2.76 | 0.790248 | 0.779998 | 175 / 0 | 0.581516 | 0.48973 | 175 / 0 |
+| 0.15 | 175 / 175 / 0 | 175 / 0 | 2.36 | 0.142857 | 0.142857 | 7.64 | 0.790248 | 0.779998 | 175 / 0 | 0.196362 | 0.115255 | 175 / 0 |
+| 0.2 | 175 / 175 / 0 | 175 / 0 | 1.005714 | 0.0 | 0.0 | 8.994286 | 0.790248 | 0.779998 | 175 / 0 | 0.087507 | 0.0 | 175 / 0 |
+| 0.5 | 175 / 175 / 0 | 175 / 0 | 1.0 | 0.0 | 0.0 | 9.0 | 0.790248 | 0.779998 | 175 / 0 | 0.087001 | 0.0 | 175 / 0 |
+| 1.0 | 175 / 175 / 0 | 175 / 0 | 1.0 | 0.0 | 0.0 | 9.0 | 0.790248 | 0.779998 | 175 / 0 | 0.087001 | 0.0 | 175 / 0 |
+
+**product_torus_12d — intrinsic dimension 12**
+
+| Threshold | Associated / eligible / excluded | Live / dead | Mean rank | Exact | ±1 | MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.00025 | 93 / 93 / 0 | 93 / 0 | 16.0 | 0.0 | 0.0 | 4.0 | 0.712771 | 0.139781 | 93 / 0 | 0.871754 | 0.625281 | 93 / 0 |
+| 0.005 | 93 / 93 / 0 | 93 / 0 | 15.946237 | 0.0 | 0.0 | 3.946237 | 0.712771 | 0.139781 | 93 / 0 | 0.870242 | 0.622596 | 93 / 0 |
+| 0.01 | 93 / 93 / 0 | 93 / 0 | 15.913979 | 0.0 | 0.0 | 3.913979 | 0.712771 | 0.139781 | 93 / 0 | 0.869159 | 0.61973 | 93 / 0 |
+| 0.05 | 93 / 93 / 0 | 93 / 0 | 8.967742 | 0.064516 | 0.172043 | 4.688172 | 0.712771 | 0.139781 | 93 / 0 | 0.535886 | 0.16654 | 93 / 0 |
+| 0.1 | 93 / 93 / 0 | 93 / 0 | 1.096774 | 0.0 | 0.0 | 10.903226 | 0.712771 | 0.139781 | 93 / 0 | 0.073439 | 0.0 | 93 / 0 |
+| 0.15 | 93 / 93 / 0 | 93 / 0 | 1.0 | 0.0 | 0.0 | 11.0 | 0.712771 | 0.139781 | 93 / 0 | 0.066902 | 0.0 | 93 / 0 |
+| 0.2 | 93 / 93 / 0 | 93 / 0 | 1.0 | 0.0 | 0.0 | 11.0 | 0.712771 | 0.139781 | 93 / 0 | 0.066902 | 0.0 | 93 / 0 |
+| 0.5 | 93 / 93 / 0 | 93 / 0 | 1.0 | 0.0 | 0.0 | 11.0 | 0.712771 | 0.139781 | 93 / 0 | 0.066902 | 0.0 | 93 / 0 |
+| 1.0 | 93 / 93 / 0 | 93 / 0 | 1.0 | 0.0 | 0.0 | 11.0 | 0.712771 | 0.139781 | 93 / 0 | 0.066902 | 0.0 | 93 / 0 |
+
+**cylinder — intrinsic dimension 2**
+
+| Threshold | Associated / eligible / excluded | Live / dead | Mean rank | Exact | ±1 | MAE | Alignment overlap | Alignment worst cosine | Alignment valid / undefined | Containment overlap | Containment worst cosine | Containment valid / undefined |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.00025 | 59 / 59 / 0 | 59 / 0 | 16.0 | 0.0 | 0.0 | 14.0 | 0.902633 | 0.938114 | 59 / 0 | 0.917986 | 0.948462 | 59 / 0 |
+| 0.005 | 59 / 59 / 0 | 59 / 0 | 14.644068 | 0.0 | 0.0 | 12.644068 | 0.902633 | 0.938114 | 59 / 0 | 0.916872 | 0.947708 | 59 / 0 |
+| 0.01 | 59 / 59 / 0 | 59 / 0 | 8.440678 | 0.050847 | 0.152542 | 6.440678 | 0.902633 | 0.938114 | 59 / 0 | 0.910815 | 0.943928 | 59 / 0 |
+| 0.05 | 59 / 59 / 0 | 59 / 0 | 2.016949 | 0.983051 | 1.0 | 0.016949 | 0.902633 | 0.938114 | 59 / 0 | 0.902688 | 0.938124 | 59 / 0 |
+| 0.1 | 59 / 59 / 0 | 59 / 0 | 2.0 | 1.0 | 1.0 | 0.0 | 0.902633 | 0.938114 | 59 / 0 | 0.902633 | 0.938114 | 59 / 0 |
+| 0.15 | 59 / 59 / 0 | 59 / 0 | 2.0 | 1.0 | 1.0 | 0.0 | 0.902633 | 0.938114 | 59 / 0 | 0.902633 | 0.938114 | 59 / 0 |
+| 0.2 | 59 / 59 / 0 | 59 / 0 | 1.983051 | 0.983051 | 1.0 | 0.016949 | 0.902633 | 0.938114 | 59 / 0 | 0.896418 | 0.923605 | 59 / 0 |
+| 0.5 | 59 / 59 / 0 | 59 / 0 | 1.0 | 0.0 | 1.0 | 1.0 | 0.902633 | 0.938114 | 59 / 0 | 0.461037 | 0.0 | 59 / 0 |
+| 1.0 | 59 / 59 / 0 | 59 / 0 | 1.0 | 0.0 | 1.0 | 1.0 | 0.902633 | 0.938114 | 59 / 0 | 0.461037 | 0.0 | 59 / 0 |
+
+
+---
+
+
+**HDDC cluster-PCA with 35% centroids — noise ratio 10**
+
+Source: [toy_noise10_k1000_hddc_cluster_pca_35pct_centroids](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids). 9 runs with metrics; rows sorted by `training.arguments.surgery_threshold`, the only differing configuration value. Run labels below link to the original metrics artifacts.
+
+Shared configuration: K=1,000, q capacity=32, layer=0, seed=42. Values are read from existing `metrics.json` files, rounded to six decimal places; — denotes null, nonfinite, or missing values. ARI is adjusted Rand index; NMI is normalized mutual information; MAE is mean absolute error. `rank` compares learned rank with intrinsic dimension; `ambient_rank` compares it with embedding dimension.
+
+Recorded evaluation metadata: toy_manifold_tiling; model_kind=hddc; schema_version=1. Both rank definitions are `hddc_rank_mask_count`, over `proximity_associated_components`. Association uses `unique_nearest_exact_projection`, with no maximum distance cutoff. BIC uses the training split and lower is better. Alignment uses `leading_intrinsic_dim_covariance_subspace_principal_angles`; containment uses `leading_learned_rank_covariance_subspace_principal_angles`. Both aggregate by `unweighted_component_mean`, with relative boundary eigengap threshold 1e-6. Dataset subset_spec is null.
+
+**Overall metrics**
+
+| Run | Surgery threshold | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | association.ambiguous_components | association.associated_components | association.outside_cutoff_components | bic.n | bic.parameters | bic.value | clustering.ARI | clustering.completeness | clustering.homogeneity | clustering.NMI | components.dead | components.live | dataset.selected_rows | dataset.train_rows | dataset.validation_rows | nll.train | nll.validation | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [HDDC-35pct-1](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__b2a8e9bc/metrics.json) | 0.00025 | 1000 | 0.288000 | 17.016001 | 22.740000 | 0.296000 | 0 | 1000 | 0 | 270000 | 2723204 | -43046795.533176 | 0.351102 | 0.429803 | 1.000000 | 0.601206 | 187 | 813 | 300000 | 270000 | 30000 | -142.784569 | -136.429831 | 1000 | 0.000000 | 19.035999 | 22.740000 | 0.132000 | 0.581821 | 50 | 950 | 0.415502 | 50 | 950 | 0.970610 | 50 | 950 | 0.981186 | 50 | 950 |
+| [HDDC-35pct-2](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7f95fe89/metrics.json) | 0.005 | 1000 | 0.701000 | 4.714000 | 10.438000 | 0.720000 | 0 | 1000 | 0 | 270000 | 1356104 | -56623471.285683 | 0.350821 | 0.433539 | 1.000000 | 0.604852 | 182 | 818 | 300000 | 270000 | 30000 | -136.265089 | -134.624447 | 1000 | 0.098000 | 6.734000 | 10.438000 | 0.451000 | 0.590291 | 43 | 957 | 0.423424 | 43 | 957 | 0.967306 | 43 | 957 | 0.979327 | 43 | 957 |
+| [HDDC-35pct-3](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7e4a4cbc/metrics.json) | 0.01 | 1000 | 0.817000 | 3.634000 | 9.358000 | 0.861000 | 0 | 1000 | 0 | 270000 | 1234629 | -57877740.252001 | 0.351165 | 0.433756 | 1.000000 | 0.605062 | 184 | 816 | 300000 | 270000 | 30000 | -135.774499 | -134.513787 | 1000 | 0.098000 | 5.654000 | 9.358000 | 0.564000 | 0.590291 | 43 | 957 | 0.423424 | 43 | 957 | 0.966177 | 43 | 957 | 0.978486 | 43 | 957 |
+| [HDDC-35pct-4](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__a997ff68/metrics.json) | 0.05 | 1000 | 0.866000 | 3.563000 | 9.231000 | 0.866000 | 0 | 1000 | 0 | 270000 | 1219568 | -58044985.528105 | 0.203652 | 0.410720 | 1.000000 | 0.582285 | 166 | 834 | 300000 | 270000 | 30000 | -135.735406 | -134.518750 | 1000 | 0.098000 | 5.555000 | 9.231000 | 0.627000 | 0.580856 | 63 | 937 | 0.410725 | 63 | 937 | 0.958682 | 49 | 951 | 0.963608 | 49 | 951 |
+| [HDDC-35pct-5](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__4b0cfc9a/metrics.json) | 0.1 | 1000 | 0.866000 | 3.563000 | 9.231000 | 0.866000 | 0 | 1000 | 0 | 270000 | 1219568 | -58044985.528105 | 0.203652 | 0.410720 | 1.000000 | 0.582285 | 166 | 834 | 300000 | 270000 | 30000 | -135.735406 | -134.518750 | 1000 | 0.098000 | 5.555000 | 9.231000 | 0.627000 | 0.580856 | 63 | 937 | 0.410725 | 63 | 937 | 0.958682 | 49 | 951 | 0.963608 | 49 | 951 |
+| [HDDC-35pct-6](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__141118ec/metrics.json) | 0.15 | 1000 | 0.866000 | 3.563000 | 9.231000 | 0.866000 | 0 | 1000 | 0 | 270000 | 1219568 | -58044985.528105 | 0.203652 | 0.410720 | 1.000000 | 0.582285 | 166 | 834 | 300000 | 270000 | 30000 | -135.735406 | -134.518750 | 1000 | 0.098000 | 5.555000 | 9.231000 | 0.627000 | 0.580856 | 63 | 937 | 0.410725 | 63 | 937 | 0.958682 | 49 | 951 | 0.963608 | 49 | 951 |
+| [HDDC-35pct-7](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__26eb30f0/metrics.json) | 0.2 | 1000 | 0.866000 | 3.563000 | 9.231000 | 0.866000 | 0 | 1000 | 0 | 270000 | 1219568 | -58044985.528105 | 0.203652 | 0.410720 | 1.000000 | 0.582285 | 166 | 834 | 300000 | 270000 | 30000 | -135.735406 | -134.518750 | 1000 | 0.098000 | 5.555000 | 9.231000 | 0.627000 | 0.580856 | 63 | 937 | 0.410725 | 63 | 937 | 0.958682 | 49 | 951 | 0.963608 | 49 | 951 |
+| [HDDC-35pct-8](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__22f8314f/metrics.json) | 0.5 | 1000 | 0.353000 | 7.228000 | 4.946000 | 0.353000 | 0 | 1000 | 0 | 270000 | 706858 | -65362158.566162 | 0.209189 | 0.398046 | 1.000000 | 0.569432 | 1 | 999 | 300000 | 270000 | 30000 | -137.411574 | -134.887283 | 1000 | 0.283000 | 5.954000 | 4.946000 | 0.659000 | 0.541141 | 382 | 618 | 0.570697 | 382 | 618 | 0.554039 | 20 | 980 | 0.523809 | 20 | 980 |
+| [HDDC-35pct-9](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__63ae462d/metrics.json) | 1 | 1000 | 0.101000 | 7.852000 | 4.410000 | 0.214000 | 0 | 1000 | 0 | 270000 | 639920 | -63515555.692273 | 0.055960 | 0.367320 | 1.000000 | 0.537284 | 5 | 995 | 300000 | 270000 | 30000 | -132.441683 | -130.373036 | 1000 | 0.389000 | 6.052000 | 4.410000 | 0.638000 | 0.418211 | 505 | 495 | 0.521964 | 505 | 495 | 0.357150 | 4 | 996 | 0.309175 | 4 | 996 |
+
+**segment — intrinsic dimension 1; embedding dimension 1 (manifold_id=0, type_id=0)**
+
+| Run | Surgery threshold | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [HDDC-35pct-1](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__b2a8e9bc/metrics.json) | 0.00025 | 128 | 0.000000 | 26.007812 | 27.007812 | 0.000000 | 0 | 128 | 128 | 128 | 0.000000 | 26.007812 | 27.007812 | 0.000000 | 0.917553 | 0 | 128 | 0.956130 | 0 | 128 | 0.967569 | 0 | 128 | 0.983571 | 0 | 128 |
+| [HDDC-35pct-2](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7f95fe89/metrics.json) | 0.005 | 128 | 0.765625 | 7.265625 | 8.265625 | 0.765625 | 0 | 128 | 128 | 128 | 0.765625 | 7.265625 | 8.265625 | 0.765625 | 0.917719 | 0 | 128 | 0.956211 | 0 | 128 | 0.963803 | 0 | 128 | 0.981664 | 0 | 128 |
+| [HDDC-35pct-3](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7e4a4cbc/metrics.json) | 0.01 | 128 | 0.765625 | 7.265625 | 8.265625 | 0.765625 | 0 | 128 | 128 | 128 | 0.765625 | 7.265625 | 8.265625 | 0.765625 | 0.917719 | 0 | 128 | 0.956211 | 0 | 128 | 0.963803 | 0 | 128 | 0.981664 | 0 | 128 |
+| [HDDC-35pct-4](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__a997ff68/metrics.json) | 0.05 | 128 | 0.765625 | 7.265625 | 8.265625 | 0.765625 | 0 | 128 | 128 | 128 | 0.765625 | 7.265625 | 8.265625 | 0.765625 | 0.917686 | 0 | 128 | 0.956195 | 0 | 128 | 0.963733 | 0 | 128 | 0.981628 | 0 | 128 |
+| [HDDC-35pct-5](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__4b0cfc9a/metrics.json) | 0.1 | 128 | 0.765625 | 7.265625 | 8.265625 | 0.765625 | 0 | 128 | 128 | 128 | 0.765625 | 7.265625 | 8.265625 | 0.765625 | 0.917686 | 0 | 128 | 0.956195 | 0 | 128 | 0.963733 | 0 | 128 | 0.981628 | 0 | 128 |
+| [HDDC-35pct-6](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__141118ec/metrics.json) | 0.15 | 128 | 0.765625 | 7.265625 | 8.265625 | 0.765625 | 0 | 128 | 128 | 128 | 0.765625 | 7.265625 | 8.265625 | 0.765625 | 0.917686 | 0 | 128 | 0.956195 | 0 | 128 | 0.963733 | 0 | 128 | 0.981628 | 0 | 128 |
+| [HDDC-35pct-7](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__26eb30f0/metrics.json) | 0.2 | 128 | 0.765625 | 7.265625 | 8.265625 | 0.765625 | 0 | 128 | 128 | 128 | 0.765625 | 7.265625 | 8.265625 | 0.765625 | 0.917686 | 0 | 128 | 0.956195 | 0 | 128 | 0.963733 | 0 | 128 | 0.981628 | 0 | 128 |
+| [HDDC-35pct-8](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__22f8314f/metrics.json) | 0.5 | 128 | 0.843750 | 4.843750 | 5.843750 | 0.843750 | 0 | 128 | 128 | 128 | 0.843750 | 4.843750 | 5.843750 | 0.843750 | 0.908054 | 0 | 128 | 0.951183 | 0 | 128 | 0.928583 | 0 | 128 | 0.962788 | 0 | 128 |
+| [HDDC-35pct-9](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__63ae462d/metrics.json) | 1 | 128 | 0.789062 | 6.539062 | 7.539062 | 0.789062 | 0 | 128 | 128 | 128 | 0.789062 | 6.539062 | 7.539062 | 0.789062 | 0.889443 | 0 | 128 | 0.940260 | 0 | 128 | 0.919406 | 0 | 128 | 0.957966 | 0 | 128 |
+
+**circle — intrinsic dimension 1; embedding dimension 2 (manifold_id=1, type_id=1)**
+
+| Run | Surgery threshold | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [HDDC-35pct-1](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__b2a8e9bc/metrics.json) | 0.00025 | 145 | 0.000000 | 29.496552 | 31.496552 | 0.000000 | 0 | 145 | 145 | 145 | 0.000000 | 30.496552 | 31.496552 | 0.000000 | 0.375335 | 0 | 145 | 0.505802 | 0 | 145 | 0.960030 | 0 | 145 | 0.979633 | 0 | 145 |
+| [HDDC-35pct-2](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7f95fe89/metrics.json) | 0.005 | 145 | 0.744828 | 7.055172 | 9.055172 | 0.765517 | 0 | 145 | 145 | 145 | 0.000000 | 8.055172 | 9.055172 | 0.744828 | 0.440432 | 0 | 145 | 0.562289 | 0 | 145 | 0.952921 | 0 | 145 | 0.976030 | 0 | 145 |
+| [HDDC-35pct-3](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7e4a4cbc/metrics.json) | 0.01 | 145 | 0.765517 | 7.034483 | 9.034483 | 0.765517 | 0 | 145 | 145 | 145 | 0.000000 | 8.034483 | 9.034483 | 0.765517 | 0.440432 | 0 | 145 | 0.562289 | 0 | 145 | 0.952901 | 0 | 145 | 0.976020 | 0 | 145 |
+| [HDDC-35pct-4](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__a997ff68/metrics.json) | 0.05 | 145 | 0.765517 | 7.034483 | 9.034483 | 0.765517 | 0 | 145 | 145 | 145 | 0.000000 | 8.034483 | 9.034483 | 0.765517 | 0.421234 | 0 | 145 | 0.544927 | 0 | 145 | 0.953332 | 0 | 145 | 0.976238 | 0 | 145 |
+| [HDDC-35pct-5](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__4b0cfc9a/metrics.json) | 0.1 | 145 | 0.765517 | 7.034483 | 9.034483 | 0.765517 | 0 | 145 | 145 | 145 | 0.000000 | 8.034483 | 9.034483 | 0.765517 | 0.421234 | 0 | 145 | 0.544927 | 0 | 145 | 0.953332 | 0 | 145 | 0.976238 | 0 | 145 |
+| [HDDC-35pct-6](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__141118ec/metrics.json) | 0.15 | 145 | 0.765517 | 7.034483 | 9.034483 | 0.765517 | 0 | 145 | 145 | 145 | 0.000000 | 8.034483 | 9.034483 | 0.765517 | 0.421234 | 0 | 145 | 0.544927 | 0 | 145 | 0.953332 | 0 | 145 | 0.976238 | 0 | 145 |
+| [HDDC-35pct-7](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__26eb30f0/metrics.json) | 0.2 | 145 | 0.765517 | 7.034483 | 9.034483 | 0.765517 | 0 | 145 | 145 | 145 | 0.000000 | 8.034483 | 9.034483 | 0.765517 | 0.421234 | 0 | 145 | 0.544927 | 0 | 145 | 0.953332 | 0 | 145 | 0.976238 | 0 | 145 |
+| [HDDC-35pct-8](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__22f8314f/metrics.json) | 0.5 | 145 | 0.765517 | 7.034483 | 9.034483 | 0.765517 | 0 | 145 | 145 | 145 | 0.000000 | 8.034483 | 9.034483 | 0.765517 | 0.407201 | 0 | 145 | 0.538073 | 0 | 145 | 0.909421 | 0 | 145 | 0.953355 | 0 | 145 |
+| [HDDC-35pct-9](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__63ae462d/metrics.json) | 1 | 145 | 0.000000 | 7.400000 | 7.841379 | 0.779310 | 0 | 145 | 145 | 145 | 0.779310 | 6.841379 | 7.841379 | 0.779310 | 0.255272 | 0 | 145 | 0.400896 | 0 | 145 | 0.374607 | 0 | 145 | 0.531844 | 0 | 145 |
+
+**sphere — intrinsic dimension 2; embedding dimension 3 (manifold_id=2, type_id=2)**
+
+| Run | Surgery threshold | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [HDDC-35pct-1](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__b2a8e9bc/metrics.json) | 0.00025 | 148 | 0.000000 | 28.770269 | 31.770269 | 0.000000 | 0 | 148 | 148 | 148 | 0.000000 | 29.770269 | 31.770269 | 0.000000 | 0.583668 | 0 | 148 | 0.412999 | 0 | 148 | 0.957618 | 0 | 148 | 0.975130 | 0 | 148 |
+| [HDDC-35pct-2](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7f95fe89/metrics.json) | 0.005 | 148 | 0.756757 | 6.297297 | 9.297297 | 0.783784 | 0 | 148 | 148 | 148 | 0.000000 | 7.297297 | 9.297297 | 0.756757 | 0.583499 | 0 | 148 | 0.401490 | 0 | 148 | 0.949272 | 0 | 148 | 0.970402 | 0 | 148 |
+| [HDDC-35pct-3](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7e4a4cbc/metrics.json) | 0.01 | 148 | 0.783784 | 6.270270 | 9.270270 | 0.783784 | 0 | 148 | 148 | 148 | 0.000000 | 7.270270 | 9.270270 | 0.783784 | 0.583499 | 0 | 148 | 0.401490 | 0 | 148 | 0.949260 | 0 | 148 | 0.970392 | 0 | 148 |
+| [HDDC-35pct-4](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__a997ff68/metrics.json) | 0.05 | 148 | 0.783784 | 6.270270 | 9.270270 | 0.783784 | 0 | 148 | 148 | 148 | 0.000000 | 7.270270 | 9.270270 | 0.783784 | 0.571129 | 0 | 148 | 0.377063 | 0 | 148 | 0.949762 | 0 | 148 | 0.970652 | 0 | 148 |
+| [HDDC-35pct-5](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__4b0cfc9a/metrics.json) | 0.1 | 148 | 0.783784 | 6.270270 | 9.270270 | 0.783784 | 0 | 148 | 148 | 148 | 0.000000 | 7.270270 | 9.270270 | 0.783784 | 0.571129 | 0 | 148 | 0.377063 | 0 | 148 | 0.949762 | 0 | 148 | 0.970652 | 0 | 148 |
+| [HDDC-35pct-6](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__141118ec/metrics.json) | 0.15 | 148 | 0.783784 | 6.270270 | 9.270270 | 0.783784 | 0 | 148 | 148 | 148 | 0.000000 | 7.270270 | 9.270270 | 0.783784 | 0.571129 | 0 | 148 | 0.377063 | 0 | 148 | 0.949762 | 0 | 148 | 0.970652 | 0 | 148 |
+| [HDDC-35pct-7](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__26eb30f0/metrics.json) | 0.2 | 148 | 0.783784 | 6.270270 | 9.270270 | 0.783784 | 0 | 148 | 148 | 148 | 0.000000 | 7.270270 | 9.270270 | 0.783784 | 0.571129 | 0 | 148 | 0.377063 | 0 | 148 | 0.949762 | 0 | 148 | 0.970652 | 0 | 148 |
+| [HDDC-35pct-8](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__22f8314f/metrics.json) | 0.5 | 148 | 0.783784 | 6.270270 | 9.270270 | 0.783784 | 0 | 148 | 148 | 148 | 0.000000 | 7.270270 | 9.270270 | 0.783784 | 0.587319 | 0 | 148 | 0.455581 | 0 | 148 | 0.883312 | 0 | 148 | 0.926763 | 0 | 148 |
+| [HDDC-35pct-9](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__63ae462d/metrics.json) | 1 | 148 | 0.000000 | 7.655406 | 7.493243 | 0.000000 | 0 | 148 | 148 | 148 | 0.000000 | 7.074324 | 7.493243 | 0.790541 | 0.187254 | 117 | 31 | 0.109788 | 117 | 31 | 0.268108 | 0 | 148 | 0.141669 | 0 | 148 |
+
+**torus — intrinsic dimension 2; embedding dimension 3 (manifold_id=3, type_id=3)**
+
+| Run | Surgery threshold | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [HDDC-35pct-1](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__b2a8e9bc/metrics.json) | 0.00025 | 52 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 45 | 7 | 52 | 52 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.500131 | 0 | 52 | 0.013580 | 0 | 52 | 0.999937 | 0 | 52 | 0.999952 | 0 | 52 |
+| [HDDC-35pct-2](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7f95fe89/metrics.json) | 0.005 | 52 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 47 | 5 | 52 | 52 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.500128 | 0 | 52 | 0.013803 | 0 | 52 | 0.999938 | 0 | 52 | 0.999952 | 0 | 52 |
+| [HDDC-35pct-3](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7e4a4cbc/metrics.json) | 0.01 | 52 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 47 | 5 | 52 | 52 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.500128 | 0 | 52 | 0.013803 | 0 | 52 | 0.999938 | 0 | 52 | 0.999952 | 0 | 52 |
+| [HDDC-35pct-4](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__a997ff68/metrics.json) | 0.05 | 52 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 41 | 11 | 52 | 52 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.500128 | 0 | 52 | 0.014437 | 0 | 52 | 0.999939 | 0 | 52 | 0.999953 | 0 | 52 |
+| [HDDC-35pct-5](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__4b0cfc9a/metrics.json) | 0.1 | 52 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 41 | 11 | 52 | 52 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.500128 | 0 | 52 | 0.014437 | 0 | 52 | 0.999939 | 0 | 52 | 0.999953 | 0 | 52 |
+| [HDDC-35pct-6](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__141118ec/metrics.json) | 0.15 | 52 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 41 | 11 | 52 | 52 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.500128 | 0 | 52 | 0.014437 | 0 | 52 | 0.999939 | 0 | 52 | 0.999953 | 0 | 52 |
+| [HDDC-35pct-7](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__26eb30f0/metrics.json) | 0.2 | 52 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 41 | 11 | 52 | 52 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.500128 | 0 | 52 | 0.014437 | 0 | 52 | 0.999939 | 0 | 52 | 0.999953 | 0 | 52 |
+| [HDDC-35pct-8](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__22f8314f/metrics.json) | 0.5 | 52 | 0.000000 | 2.000000 | 1.000000 | 0.000000 | 0 | 52 | 52 | 52 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | — | 52 | 0 | — | 52 | 0 | 0.479189 | 0 | 52 | 0.000000 | 0 | 52 |
+| [HDDC-35pct-9](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__63ae462d/metrics.json) | 1 | 52 | 0.000000 | 2.000000 | 1.000000 | 0.000000 | 0 | 52 | 52 | 52 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | — | 52 | 0 | — | 52 | 0 | 0.493119 | 0 | 52 | 0.000000 | 0 | 52 |
+
+**swiss_roll — intrinsic dimension 2; embedding dimension 3 (manifold_id=4, type_id=4)**
+
+| Run | Surgery threshold | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [HDDC-35pct-1](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__b2a8e9bc/metrics.json) | 0.00025 | 14 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 7 | 7 | 14 | 14 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.987951 | 0 | 14 | 0.987863 | 0 | 14 | 0.999988 | 0 | 14 | 0.999988 | 0 | 14 |
+| [HDDC-35pct-2](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7f95fe89/metrics.json) | 0.005 | 14 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 6 | 8 | 14 | 14 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.988089 | 0 | 14 | 0.988009 | 0 | 14 | 0.999988 | 0 | 14 | 0.999988 | 0 | 14 |
+| [HDDC-35pct-3](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7e4a4cbc/metrics.json) | 0.01 | 14 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 6 | 8 | 14 | 14 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.988089 | 0 | 14 | 0.988009 | 0 | 14 | 0.999988 | 0 | 14 | 0.999988 | 0 | 14 |
+| [HDDC-35pct-4](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__a997ff68/metrics.json) | 0.05 | 14 | 0.000000 | 2.000000 | 1.000000 | 0.000000 | 0 | 14 | 14 | 14 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | — | 14 | 0 | — | 14 | 0 | 0.499625 | 0 | 14 | 0.000000 | 0 | 14 |
+| [HDDC-35pct-5](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__4b0cfc9a/metrics.json) | 0.1 | 14 | 0.000000 | 2.000000 | 1.000000 | 0.000000 | 0 | 14 | 14 | 14 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | — | 14 | 0 | — | 14 | 0 | 0.499625 | 0 | 14 | 0.000000 | 0 | 14 |
+| [HDDC-35pct-6](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__141118ec/metrics.json) | 0.15 | 14 | 0.000000 | 2.000000 | 1.000000 | 0.000000 | 0 | 14 | 14 | 14 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | — | 14 | 0 | — | 14 | 0 | 0.499625 | 0 | 14 | 0.000000 | 0 | 14 |
+| [HDDC-35pct-7](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__26eb30f0/metrics.json) | 0.2 | 14 | 0.000000 | 2.000000 | 1.000000 | 0.000000 | 0 | 14 | 14 | 14 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | — | 14 | 0 | — | 14 | 0 | 0.499625 | 0 | 14 | 0.000000 | 0 | 14 |
+| [HDDC-35pct-8](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__22f8314f/metrics.json) | 0.5 | 14 | 0.000000 | 2.000000 | 1.000000 | 0.000000 | 0 | 14 | 14 | 14 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | — | 14 | 0 | — | 14 | 0 | 0.499655 | 0 | 14 | 0.000000 | 0 | 14 |
+| [HDDC-35pct-9](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__63ae462d/metrics.json) | 1 | 14 | 0.000000 | 2.000000 | 1.000000 | 0.000000 | 0 | 14 | 14 | 14 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | — | 14 | 0 | — | 14 | 0 | 0.499260 | 0 | 14 | 0.000000 | 0 | 14 |
+
+**helix — intrinsic dimension 1; embedding dimension 3 (manifold_id=5, type_id=5)**
+
+| Run | Surgery threshold | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [HDDC-35pct-1](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__b2a8e9bc/metrics.json) | 0.00025 | 100 | 0.750000 | 4.160000 | 7.160000 | 0.830000 | 9 | 91 | 100 | 100 | 0.000000 | 6.160000 | 7.160000 | 0.000000 | 0.091291 | 0 | 100 | 0.256010 | 0 | 100 | 0.981315 | 0 | 100 | 0.990334 | 0 | 100 |
+| [HDDC-35pct-2](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7f95fe89/metrics.json) | 0.005 | 100 | 0.870000 | 3.770000 | 6.770000 | 0.870000 | 15 | 85 | 100 | 100 | 0.000000 | 5.770000 | 6.770000 | 0.000000 | 0.083110 | 0 | 100 | 0.246175 | 0 | 100 | 0.981446 | 0 | 100 | 0.990400 | 0 | 100 |
+| [HDDC-35pct-3](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7e4a4cbc/metrics.json) | 0.01 | 100 | 0.870000 | 3.770000 | 6.770000 | 0.870000 | 16 | 84 | 100 | 100 | 0.000000 | 5.770000 | 6.770000 | 0.000000 | 0.083110 | 0 | 100 | 0.246175 | 0 | 100 | 0.981446 | 0 | 100 | 0.990400 | 0 | 100 |
+| [HDDC-35pct-4](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__a997ff68/metrics.json) | 0.05 | 100 | 0.870000 | 3.770000 | 6.770000 | 0.870000 | 20 | 80 | 100 | 100 | 0.000000 | 5.770000 | 6.770000 | 0.000000 | 0.079579 | 0 | 100 | 0.231647 | 0 | 100 | 0.981505 | 0 | 100 | 0.990429 | 0 | 100 |
+| [HDDC-35pct-5](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__4b0cfc9a/metrics.json) | 0.1 | 100 | 0.870000 | 3.770000 | 6.770000 | 0.870000 | 20 | 80 | 100 | 100 | 0.000000 | 5.770000 | 6.770000 | 0.000000 | 0.079579 | 0 | 100 | 0.231647 | 0 | 100 | 0.981505 | 0 | 100 | 0.990429 | 0 | 100 |
+| [HDDC-35pct-6](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__141118ec/metrics.json) | 0.15 | 100 | 0.870000 | 3.770000 | 6.770000 | 0.870000 | 20 | 80 | 100 | 100 | 0.000000 | 5.770000 | 6.770000 | 0.000000 | 0.079579 | 0 | 100 | 0.231647 | 0 | 100 | 0.981505 | 0 | 100 | 0.990429 | 0 | 100 |
+| [HDDC-35pct-7](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__26eb30f0/metrics.json) | 0.2 | 100 | 0.870000 | 3.770000 | 6.770000 | 0.870000 | 20 | 80 | 100 | 100 | 0.000000 | 5.770000 | 6.770000 | 0.000000 | 0.079579 | 0 | 100 | 0.231647 | 0 | 100 | 0.981505 | 0 | 100 | 0.990429 | 0 | 100 |
+| [HDDC-35pct-8](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__22f8314f/metrics.json) | 0.5 | 100 | 0.000000 | 5.510000 | 5.030000 | 0.000000 | 0 | 100 | 100 | 100 | 0.870000 | 4.030000 | 5.030000 | 0.870000 | 0.335966 | 0 | 100 | 0.485139 | 0 | 100 | 0.430652 | 0 | 100 | 0.578180 | 0 | 100 |
+| [HDDC-35pct-9](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__63ae462d/metrics.json) | 1 | 100 | 0.000000 | 5.510000 | 5.030000 | 0.000000 | 3 | 97 | 100 | 100 | 0.870000 | 4.030000 | 5.030000 | 0.870000 | 0.376728 | 0 | 100 | 0.521334 | 0 | 100 | 0.439447 | 0 | 100 | 0.586129 | 0 | 100 |
+
+**helix_4d — intrinsic dimension 1; embedding dimension 4 (manifold_id=6, type_id=6)**
+
+| Run | Surgery threshold | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [HDDC-35pct-1](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__b2a8e9bc/metrics.json) | 0.00025 | 95 | 0.031579 | 11.442105 | 15.442105 | 0.031579 | 2 | 93 | 95 | 95 | 0.000000 | 14.442105 | 15.442105 | 0.000000 | 0.212414 | 50 | 45 | 0.361581 | 50 | 45 | 0.975442 | 50 | 45 | 0.987314 | 50 | 45 |
+| [HDDC-35pct-2](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7f95fe89/metrics.json) | 0.005 | 95 | 0.894737 | 2.094737 | 6.094737 | 0.926316 | 2 | 93 | 95 | 95 | 0.000000 | 5.094737 | 6.094737 | 0.000000 | 0.220589 | 43 | 52 | 0.386412 | 43 | 52 | 0.977872 | 43 | 52 | 0.988584 | 43 | 52 |
+| [HDDC-35pct-3](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7e4a4cbc/metrics.json) | 0.01 | 95 | 0.926316 | 2.063158 | 6.063158 | 0.926316 | 3 | 92 | 95 | 95 | 0.000000 | 5.063158 | 6.063158 | 0.000000 | 0.220589 | 43 | 52 | 0.386412 | 43 | 52 | 0.977870 | 43 | 52 | 0.988583 | 43 | 52 |
+| [HDDC-35pct-4](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__a997ff68/metrics.json) | 0.05 | 95 | 0.926316 | 2.063158 | 6.063158 | 0.926316 | 2 | 93 | 95 | 95 | 0.000000 | 5.063158 | 6.063158 | 0.000000 | 0.211797 | 49 | 46 | 0.363474 | 49 | 46 | 0.975682 | 49 | 46 | 0.987443 | 49 | 46 |
+| [HDDC-35pct-5](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__4b0cfc9a/metrics.json) | 0.1 | 95 | 0.926316 | 2.063158 | 6.063158 | 0.926316 | 2 | 93 | 95 | 95 | 0.000000 | 5.063158 | 6.063158 | 0.000000 | 0.211797 | 49 | 46 | 0.363474 | 49 | 46 | 0.975682 | 49 | 46 | 0.987443 | 49 | 46 |
+| [HDDC-35pct-6](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__141118ec/metrics.json) | 0.15 | 95 | 0.926316 | 2.063158 | 6.063158 | 0.926316 | 2 | 93 | 95 | 95 | 0.000000 | 5.063158 | 6.063158 | 0.000000 | 0.211797 | 49 | 46 | 0.363474 | 49 | 46 | 0.975682 | 49 | 46 | 0.987443 | 49 | 46 |
+| [HDDC-35pct-7](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__26eb30f0/metrics.json) | 0.2 | 95 | 0.926316 | 2.063158 | 6.063158 | 0.926316 | 2 | 93 | 95 | 95 | 0.000000 | 5.063158 | 6.063158 | 0.000000 | 0.211797 | 49 | 46 | 0.363474 | 49 | 46 | 0.975682 | 49 | 46 | 0.987443 | 49 | 46 |
+| [HDDC-35pct-8](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__22f8314f/metrics.json) | 0.5 | 95 | 0.000000 | 4.842105 | 3.284210 | 0.000000 | 1 | 94 | 95 | 95 | 0.926316 | 2.284210 | 3.284210 | 0.926316 | 0.297284 | 20 | 75 | 0.438604 | 20 | 75 | 0.359795 | 20 | 75 | 0.504426 | 20 | 75 |
+| [HDDC-35pct-9](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__63ae462d/metrics.json) | 1 | 95 | 0.000000 | 4.842105 | 3.284210 | 0.000000 | 2 | 93 | 95 | 95 | 0.926316 | 2.284210 | 3.284210 | 0.926316 | 0.139272 | 4 | 91 | 0.267607 | 4 | 91 | 0.178977 | 4 | 91 | 0.314523 | 4 | 91 |
+
+**hypersphere_10d — intrinsic dimension 10; embedding dimension 11 (manifold_id=7, type_id=7)**
+
+| Run | Surgery threshold | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [HDDC-35pct-1](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__b2a8e9bc/metrics.json) | 0.00025 | 174 | 0.000000 | 20.971264 | 31.971264 | 0.000000 | 0 | 174 | 174 | 174 | 0.000000 | 21.971264 | 31.971264 | 0.000000 | 0.837320 | 0 | 174 | 0.185954 | 0 | 174 | 0.949924 | 0 | 174 | 0.956391 | 0 | 174 |
+| [HDDC-35pct-2](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7f95fe89/metrics.json) | 0.005 | 174 | 0.005747 | 7.201149 | 18.201149 | 0.057471 | 0 | 174 | 174 | 174 | 0.000000 | 8.201149 | 18.201149 | 0.005747 | 0.846564 | 0 | 174 | 0.189874 | 0 | 174 | 0.946550 | 0 | 174 | 0.953929 | 0 | 174 |
+| [HDDC-35pct-3](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7e4a4cbc/metrics.json) | 0.01 | 174 | 0.614943 | 1.051724 | 12.051724 | 0.867816 | 0 | 174 | 174 | 174 | 0.000000 | 2.051724 | 12.051724 | 0.614943 | 0.846564 | 0 | 174 | 0.189874 | 0 | 174 | 0.940369 | 0 | 174 | 0.949325 | 0 | 174 |
+| [HDDC-35pct-4](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__a997ff68/metrics.json) | 0.05 | 174 | 0.977012 | 0.482759 | 11.482759 | 0.977012 | 0 | 174 | 174 | 174 | 0.000000 | 1.482759 | 11.482759 | 0.977012 | 0.847409 | 0 | 174 | 0.210521 | 0 | 174 | 0.939873 | 0 | 174 | 0.948724 | 0 | 174 |
+| [HDDC-35pct-5](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__4b0cfc9a/metrics.json) | 0.1 | 174 | 0.977012 | 0.482759 | 11.482759 | 0.977012 | 0 | 174 | 174 | 174 | 0.000000 | 1.482759 | 11.482759 | 0.977012 | 0.847409 | 0 | 174 | 0.210521 | 0 | 174 | 0.939873 | 0 | 174 | 0.948724 | 0 | 174 |
+| [HDDC-35pct-6](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__141118ec/metrics.json) | 0.15 | 174 | 0.977012 | 0.482759 | 11.482759 | 0.977012 | 0 | 174 | 174 | 174 | 0.000000 | 1.482759 | 11.482759 | 0.977012 | 0.847409 | 0 | 174 | 0.210521 | 0 | 174 | 0.939873 | 0 | 174 | 0.948724 | 0 | 174 |
+| [HDDC-35pct-7](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__26eb30f0/metrics.json) | 0.2 | 174 | 0.977012 | 0.482759 | 11.482759 | 0.977012 | 0 | 174 | 174 | 174 | 0.000000 | 1.482759 | 11.482759 | 0.977012 | 0.847409 | 0 | 174 | 0.210521 | 0 | 174 | 0.939873 | 0 | 174 | 0.948724 | 0 | 174 |
+| [HDDC-35pct-8](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__22f8314f/metrics.json) | 0.5 | 174 | 0.097701 | 9.275862 | 2.689655 | 0.097701 | 0 | 174 | 174 | 174 | 0.000000 | 8.517241 | 2.689655 | 0.097701 | 0.753516 | 153 | 21 | 0.191098 | 153 | 21 | 0.146951 | 0 | 174 | 0.103726 | 0 | 174 |
+| [HDDC-35pct-9](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__63ae462d/metrics.json) | 1 | 174 | 0.000000 | 10.000000 | 1.000000 | 0.000000 | 0 | 174 | 174 | 174 | 0.000000 | 9.000000 | 1.000000 | 0.000000 | — | 174 | 0 | — | 174 | 0 | 0.095826 | 0 | 174 | 0.000000 | 0 | 174 |
+
+**product_torus_12d — intrinsic dimension 12; embedding dimension 24 (manifold_id=8, type_id=8)**
+
+| Run | Surgery threshold | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [HDDC-35pct-1](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__b2a8e9bc/metrics.json) | 0.00025 | 78 | 1.000000 | 0.000000 | 24.000000 | 1.000000 | 71 | 7 | 78 | 78 | 0.000000 | 12.000000 | 24.000000 | 0.000000 | 0.509856 | 0 | 78 | 0.071558 | 0 | 78 | 0.999921 | 0 | 78 | 0.999935 | 0 | 78 |
+| [HDDC-35pct-2](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7f95fe89/metrics.json) | 0.005 | 78 | 1.000000 | 0.000000 | 24.000000 | 1.000000 | 62 | 16 | 78 | 78 | 0.000000 | 12.000000 | 24.000000 | 0.000000 | 0.508935 | 0 | 78 | 0.063342 | 0 | 78 | 0.999921 | 0 | 78 | 0.999935 | 0 | 78 |
+| [HDDC-35pct-3](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7e4a4cbc/metrics.json) | 0.01 | 78 | 1.000000 | 0.000000 | 24.000000 | 1.000000 | 62 | 16 | 78 | 78 | 0.000000 | 12.000000 | 24.000000 | 0.000000 | 0.508935 | 0 | 78 | 0.063342 | 0 | 78 | 0.999921 | 0 | 78 | 0.999935 | 0 | 78 |
+| [HDDC-35pct-4](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__a997ff68/metrics.json) | 0.05 | 78 | 1.000000 | 0.000000 | 24.000000 | 1.000000 | 51 | 27 | 78 | 78 | 0.000000 | 12.000000 | 24.000000 | 0.000000 | 0.503091 | 0 | 78 | 0.067236 | 0 | 78 | 0.999921 | 0 | 78 | 0.999936 | 0 | 78 |
+| [HDDC-35pct-5](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__4b0cfc9a/metrics.json) | 0.1 | 78 | 1.000000 | 0.000000 | 24.000000 | 1.000000 | 51 | 27 | 78 | 78 | 0.000000 | 12.000000 | 24.000000 | 0.000000 | 0.503091 | 0 | 78 | 0.067236 | 0 | 78 | 0.999921 | 0 | 78 | 0.999936 | 0 | 78 |
+| [HDDC-35pct-6](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__141118ec/metrics.json) | 0.15 | 78 | 1.000000 | 0.000000 | 24.000000 | 1.000000 | 51 | 27 | 78 | 78 | 0.000000 | 12.000000 | 24.000000 | 0.000000 | 0.503091 | 0 | 78 | 0.067236 | 0 | 78 | 0.999921 | 0 | 78 | 0.999936 | 0 | 78 |
+| [HDDC-35pct-7](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__26eb30f0/metrics.json) | 0.2 | 78 | 1.000000 | 0.000000 | 24.000000 | 1.000000 | 51 | 27 | 78 | 78 | 0.000000 | 12.000000 | 24.000000 | 0.000000 | 0.503091 | 0 | 78 | 0.067236 | 0 | 78 | 0.999921 | 0 | 78 | 0.999936 | 0 | 78 |
+| [HDDC-35pct-8](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__22f8314f/metrics.json) | 0.5 | 78 | 0.012821 | 22.705128 | 1.294872 | 0.012821 | 0 | 78 | 78 | 78 | 0.000000 | 11.012820 | 1.294872 | 0.000000 | 0.510391 | 77 | 1 | 0.070354 | 77 | 1 | 0.047728 | 0 | 78 | 0.012820 | 0 | 78 |
+| [HDDC-35pct-9](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__63ae462d/metrics.json) | 1 | 78 | 0.000000 | 23.000000 | 1.000000 | 0.000000 | 0 | 78 | 78 | 78 | 0.000000 | 11.000000 | 1.000000 | 0.000000 | — | 78 | 0 | — | 78 | 0 | 0.065754 | 0 | 78 | 0.000000 | 0 | 78 |
+
+**cylinder — intrinsic dimension 2; embedding dimension 3 (manifold_id=9, type_id=9)**
+
+| Run | Surgery threshold | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [HDDC-35pct-1](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__b2a8e9bc/metrics.json) | 0.00025 | 66 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 53 | 13 | 66 | 66 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.764968 | 0 | 66 | 0.659567 | 0 | 66 | 0.999930 | 0 | 66 | 0.999945 | 0 | 66 |
+| [HDDC-35pct-2](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7f95fe89/metrics.json) | 0.005 | 66 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 50 | 16 | 66 | 66 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.766650 | 0 | 66 | 0.676202 | 0 | 66 | 0.999931 | 0 | 66 | 0.999946 | 0 | 66 |
+| [HDDC-35pct-3](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__7e4a4cbc/metrics.json) | 0.01 | 66 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 50 | 16 | 66 | 66 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.766650 | 0 | 66 | 0.676201 | 0 | 66 | 0.999931 | 0 | 66 | 0.999946 | 0 | 66 |
+| [HDDC-35pct-4](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__a997ff68/metrics.json) | 0.05 | 66 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 52 | 14 | 66 | 66 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.769612 | 0 | 66 | 0.683731 | 0 | 66 | 0.999931 | 0 | 66 | 0.999946 | 0 | 66 |
+| [HDDC-35pct-5](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__4b0cfc9a/metrics.json) | 0.1 | 66 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 52 | 14 | 66 | 66 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.769612 | 0 | 66 | 0.683731 | 0 | 66 | 0.999931 | 0 | 66 | 0.999946 | 0 | 66 |
+| [HDDC-35pct-6](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__141118ec/metrics.json) | 0.15 | 66 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 52 | 14 | 66 | 66 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.769612 | 0 | 66 | 0.683731 | 0 | 66 | 0.999931 | 0 | 66 | 0.999946 | 0 | 66 |
+| [HDDC-35pct-7](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__26eb30f0/metrics.json) | 0.2 | 66 | 1.000000 | 0.000000 | 3.000000 | 1.000000 | 52 | 14 | 66 | 66 | 0.000000 | 1.000000 | 3.000000 | 1.000000 | 0.769612 | 0 | 66 | 0.683731 | 0 | 66 | 0.999931 | 0 | 66 | 0.999946 | 0 | 66 |
+| [HDDC-35pct-8](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__22f8314f/metrics.json) | 0.5 | 66 | 0.000000 | 2.000000 | 1.000000 | 0.000000 | 0 | 66 | 66 | 66 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | — | 66 | 0 | — | 66 | 0 | 0.458312 | 0 | 66 | 0.000000 | 0 | 66 |
+| [HDDC-35pct-9](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_35pct_centroids/hddc__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__63ae462d/metrics.json) | 1 | 66 | 0.000000 | 2.000000 | 1.000000 | 0.000000 | 0 | 66 | 66 | 66 | 0.000000 | 1.000000 | 1.000000 | 1.000000 | — | 66 | 0 | — | 66 | 0 | 0.445051 | 0 | 66 | 0.000000 | 0 | 66 |
+
+
+---
+
+**Vanilla MFA with cluster-PCA initialization — noise ratio 10**
+
+Source: [toy_noise10_k1000_hddc_cluster_pca_mfa_vanilla](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_mfa_vanilla). One completed run with metrics. Configuration: model_kind=mfa, K=1,000, q capacity=32, seed=42, direction_init=cluster_pca, training_mode=vanilla, learning rate=0.001. No differing configuration columns apply to this single run.
+
+Values are read from existing metrics artifacts and rounded to six decimal places; — denotes null, nonfinite, or missing values. ARI is adjusted Rand index; NMI is normalized mutual information; MAE is mean absolute error. `rank` compares effective rank with intrinsic dimension; `ambient_rank` compares it with embedding dimension.
+
+Recorded metadata: `ambient_rank.definition="loading_variance_above_noise_threshold"`; `ambient_rank.population="proximity_associated_components"`; `association.max_mean_to_manifold_distance=null`; `association.rule="unique_nearest_exact_projection"`; `bic.convention="lower_is_better"`; `bic.split="train"`; `dataset.subset_spec=null`; `evaluation="toy_manifold_tiling"`; `model_kind="mfa"`; `rank.definition="loading_variance_above_noise_threshold"`; `rank.population="proximity_associated_components"`; `tangent_alignment.aggregation="unweighted_component_mean"`; `tangent_alignment.definition="leading_intrinsic_dim_covariance_subspace_principal_angles"`; `tangent_containment.aggregation="unweighted_component_mean"`; `tangent_containment.definition="leading_effective_rank_covariance_subspace_principal_angles"`; `schema_version=1`; `dataset.layer=0`; `tangent_alignment.relative_boundary_eigengap_threshold=1e-06`; `tangent_containment.relative_boundary_eigengap_threshold=1e-06`.
+
+Rank uses `loading_variance_above_noise_threshold` with threshold 1.0. Containment uses the effective-rank covariance subspace.
+
+**Overall metrics**
+
+| Run | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.threshold | ambient_rank.within_1 | association.ambiguous_components | association.associated_components | association.outside_cutoff_components | bic.n | bic.parameters | bic.value | clustering.ARI | clustering.completeness | clustering.homogeneity | clustering.NMI | components.dead | components.live | dataset.selected_rows | dataset.train_rows | dataset.validation_rows | nll.train | nll.validation | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.threshold | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [MFA-vanilla](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_mfa_vanilla/mfa__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__04af5a8c/metrics.json) | 1000 | 0.000000 | 25.628000 | 31.684999 | 1.000000 | 0.000000 | 0 | 1000 | 0 | 270000 | 3729128 | -30112556.875310 | 0.229217 | 0.483121 | 1.000000 | 0.651493 | 22 | 978 | 300000 | 270000 | 30000 | -142.129060 | -136.532742 | 1000 | 0.000000 | 27.827000 | 31.684999 | 1.000000 | 0.004000 | 0.573426 | 20 | 980 | 0.486250 | 20 | 980 | 0.725667 | 20 | 980 | 0.719297 | 20 | 980 |
+
+**segment — intrinsic dimension 1; embedding dimension 1 (manifold_id=0, type_id=0)**
+
+| Run | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [MFA-vanilla](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_mfa_vanilla/mfa__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__04af5a8c/metrics.json) | 125 | 0.000000 | 31.000000 | 32.000000 | 0.000000 | 0 | 125 | 125 | 125 | 0.000000 | 31.000000 | 32.000000 | 0.000000 | 0.952051 | 0 | 125 | 0.975568 | 0 | 125 | 0.976996 | 0 | 125 | 0.988353 | 0 | 125 |
+
+**circle — intrinsic dimension 1; embedding dimension 2 (manifold_id=1, type_id=1)**
+
+| Run | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [MFA-vanilla](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_mfa_vanilla/mfa__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__04af5a8c/metrics.json) | 134 | 0.000000 | 30.000000 | 32.000000 | 0.000000 | 0 | 134 | 134 | 134 | 0.000000 | 31.000000 | 32.000000 | 0.000000 | 0.748158 | 0 | 134 | 0.825197 | 0 | 134 | 0.944250 | 0 | 134 | 0.970627 | 0 | 134 |
+
+**sphere — intrinsic dimension 2; embedding dimension 3 (manifold_id=2, type_id=2)**
+
+| Run | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [MFA-vanilla](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_mfa_vanilla/mfa__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__04af5a8c/metrics.json) | 145 | 0.000000 | 29.000000 | 32.000000 | 0.000000 | 0 | 145 | 145 | 145 | 0.000000 | 30.000000 | 32.000000 | 0.000000 | 0.576841 | 0 | 145 | 0.389537 | 0 | 145 | 0.798148 | 0 | 145 | 0.781785 | 0 | 145 |
+
+**torus — intrinsic dimension 2; embedding dimension 3 (manifold_id=3, type_id=3)**
+
+| Run | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [MFA-vanilla](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_mfa_vanilla/mfa__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__04af5a8c/metrics.json) | 46 | 0.000000 | 28.673914 | 31.673914 | 0.000000 | 10 | 36 | 46 | 46 | 0.000000 | 29.673914 | 31.673914 | 0.000000 | 0.493519 | 0 | 46 | 0.214294 | 0 | 46 | 0.637844 | 0 | 46 | 0.566664 | 0 | 46 |
+
+**swiss_roll — intrinsic dimension 2; embedding dimension 3 (manifold_id=4, type_id=4)**
+
+| Run | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [MFA-vanilla](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_mfa_vanilla/mfa__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__04af5a8c/metrics.json) | 14 | 0.000000 | 29.000000 | 32.000000 | 0.000000 | 10 | 4 | 14 | 14 | 0.000000 | 30.000000 | 32.000000 | 0.000000 | 0.601376 | 0 | 14 | 0.297232 | 0 | 14 | 0.766361 | 0 | 14 | 0.717704 | 0 | 14 |
+
+**helix — intrinsic dimension 1; embedding dimension 3 (manifold_id=5, type_id=5)**
+
+| Run | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [MFA-vanilla](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_mfa_vanilla/mfa__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__04af5a8c/metrics.json) | 97 | 0.000000 | 28.721649 | 31.721649 | 0.000000 | 0 | 97 | 97 | 97 | 0.000000 | 30.721649 | 31.721649 | 0.000000 | 0.418707 | 0 | 97 | 0.562095 | 0 | 97 | 0.614158 | 0 | 97 | 0.766779 | 0 | 97 |
+
+**helix_4d — intrinsic dimension 1; embedding dimension 4 (manifold_id=6, type_id=6)**
+
+| Run | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [MFA-vanilla](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_mfa_vanilla/mfa__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__04af5a8c/metrics.json) | 112 | 0.000000 | 25.839285 | 29.625000 | 0.000000 | 0 | 112 | 112 | 112 | 0.000000 | 28.660715 | 29.625000 | 0.035714 | 0.791577 | 20 | 92 | 0.862684 | 20 | 92 | 0.869377 | 20 | 92 | 0.917874 | 20 | 92 |
+
+**hypersphere_10d — intrinsic dimension 10; embedding dimension 11 (manifold_id=7, type_id=7)**
+
+| Run | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [MFA-vanilla](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_mfa_vanilla/mfa__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__04af5a8c/metrics.json) | 175 | 0.000000 | 21.000000 | 32.000000 | 0.000000 | 0 | 175 | 175 | 175 | 0.000000 | 22.000000 | 32.000000 | 0.000000 | 0.272647 | 0 | 175 | 0.117788 | 0 | 175 | 0.408344 | 0 | 175 | 0.357329 | 0 | 175 |
+
+**product_torus_12d — intrinsic dimension 12; embedding dimension 24 (manifold_id=8, type_id=8)**
+
+| Run | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [MFA-vanilla](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_mfa_vanilla/mfa__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__04af5a8c/metrics.json) | 93 | 0.000000 | 8.000000 | 32.000000 | 0.000000 | 0 | 93 | 93 | 93 | 0.000000 | 20.000000 | 32.000000 | 0.000000 | 0.348843 | 0 | 93 | 0.038647 | 0 | 93 | 0.553310 | 0 | 93 | 0.429208 | 0 | 93 |
+
+**cylinder — intrinsic dimension 2; embedding dimension 3 (manifold_id=9, type_id=9)**
+
+| Run | ambient_rank.components | ambient_rank.exact_match | ambient_rank.MAE | ambient_rank.mean_learned | ambient_rank.within_1 | components.assignment_dead | components.assignment_live | components.associated | rank.components | rank.exact_match | rank.MAE | rank.mean_learned | rank.within_1 | alignment.overlap.mean | alignment.overlap.undefined | alignment.overlap.valid | alignment.worst_cosine.mean | alignment.worst_cosine.undefined | alignment.worst_cosine.valid | containment.overlap.mean | containment.overlap.undefined | containment.overlap.valid | containment.worst_cosine.mean | containment.worst_cosine.undefined | containment.worst_cosine.valid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [MFA-vanilla](../dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models/toy_noise10_k1000_hddc_cluster_pca_mfa_vanilla/mfa__toy_manifolds_10types_1each_d128_30keach_noise10__l00__k1000__q32__s42__04af5a8c/metrics.json) | 59 | 0.000000 | 28.881355 | 31.881355 | 0.000000 | 2 | 57 | 59 | 59 | 0.000000 | 29.881355 | 31.881355 | 0.000000 | 0.582027 | 0 | 59 | 0.261083 | 0 | 59 | 0.749558 | 0 | 59 | 0.687440 | 0 | 59 |

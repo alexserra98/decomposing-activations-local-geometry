@@ -1,0 +1,1 @@
+- [] I should compare kmeans clusters with MFA ones in the ToyManifold dataset. Is kmeans already doing much of the work?

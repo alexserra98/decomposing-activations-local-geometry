@@ -8,7 +8,7 @@
 The toy-manifold tiling evaluator measures model fit and whether an MFA-family
 model has placed useful local Gaussian components around each planted manifold
 instance. It supports vanilla MFA, ARD, and HDDC checkpoints and writes NLL,
-BIC, clustering, rank, and tangent-geometry results to the pipeline run's
+augmented BIC, clustering, rank, and tangent-geometry results to the pipeline run's
 `metrics.json`.
 
 The public entry point is:
@@ -32,12 +32,36 @@ An assignment-dead Gaussian can still be geometrically close to a planted
 manifold, and an assignment-live Gaussian is not assumed to represent the
 manifold that supplies most of its assigned points.
 
-## Bayesian information criterion
+## Augmented BIC
 
-BIC uses the saved model's log likelihood on the exact recorded training split:
+The reported `bic.value` is the utilization-adjusted, or active-BIC, score
+implemented in [`analysis/bic_improved.py`](../../src/dalg/analysis/bic_improved.py):
 
 \[
-\operatorname{BIC} = -2\log L + p\log n
+S_{\mathrm{active\text{-}BIC}}
+  = -\frac{\operatorname{BIC}_{\mathrm{standard}}}{n} + K_{\mathrm{active}}.
+\]
+
+**Higher is better.** `K_active` counts components with at least one hard MAP
+assignment on the exact recorded training split. The evaluator slices the saved
+assignment bundle to those training rows; validation-only assignments do not
+earn an activity reward. Each additional active component adds exactly one to
+the score at fixed likelihood and parameter count. The separate global
+`components.live` diagnostic still counts activity over the full selected
+stream, including validation.
+
+This implements the utilization preference recorded in the
+[research backlog](../research/backlog.md). Compare runs on the same dataset and
+split with the same nominal `K`: changing `K` changes the maximum activity
+reward. Dividing standard BIC by `n` keeps the activity term on a scale that
+does not vanish as the dataset grows. The unit reward is a research preference,
+and a one-point MAP winner counts as active.
+
+The underlying standard BIC uses the saved model's log likelihood on that same
+training split:
+
+\[
+\operatorname{BIC}_{\mathrm{standard}} = -2\log L + p\log n
                        = 2n\,\overline{\operatorname{NLL}} + p\log n.
 \]
 
@@ -50,9 +74,12 @@ models count their per-component selected dimensions, while vanilla MFA counts
 its one common rank. Shared diagonal unique variance contributes `D` parameters
 and component-specific diagonal variance contributes `K * D`.
 
-The output stores the value, `p`, `n`, and split explicitly. This is the
-standard minimizing convention, so lower BIC is better. Validation NLL remains
-a separate held-out fit metric and is not used in BIC.
+The output stores the augmented score, `p`, `n`, split, activity counts,
+formula, and `higher_is_better` convention explicitly. `bic.standard_bic`
+retains the standard minimizing BIC as a diagnostic;
+`bic.standard_bic_per_sample_reward` and `bic.activity_reward` sum to
+`bic.value`. Validation NLL remains a separate held-out fit metric and is not
+used in either BIC calculation.
 
 ## Exact proximity association
 
@@ -66,8 +93,8 @@ p_{ki} = \operatorname*{argmin}_{p \in M_i} \|\mu_k - p\|_2
 on the noiseless manifold and records \(\delta_{ki}=\|\mu_k-p_{ki}\|_2\). The
 projection uses the instance's saved calibration, orthonormal embedding, and
 ambient offset; it does not use sampled noisy dataset points. Segment, circle,
-flat disk, sphere, torus, 10D-hypersphere, and 12D-product-torus projections are
-analytic. Mobius, Swiss-roll, and helix projections enumerate coarse local
+flat disk, sphere, torus, cylinder, 10D-hypersphere, and 12D-product-torus projections are
+analytic. Mobius, Swiss-roll, and both helix projections enumerate coarse local
 minima of their one-dimensional objectives and refine every candidate before
 choosing the global minimum.
 
@@ -83,13 +110,17 @@ For the two high-dimensional types, the closed-form raw-local projections are:
 reversing the saved ambient offset, embedding, and calibration. They are not in
 general the zero vector or a zero pair in the model's ambient coordinates.
 
-A component is associated with manifold \(i\) exactly when:
+A component is associated with manifold \(i\) by default when \(i\) is the
+unique nearest manifold instance. An optional cutoff can restrict this
+association: when `evaluation.max_mean_to_manifold_distance` is a number,
+association additionally requires
 
-1. \(i\) is the unique nearest manifold instance; and
-2. \(\delta_{ki}\) is at most
-   `evaluation.max_mean_to_manifold_distance`.
+\[
+\delta_{ki} \leq \texttt{evaluation.max_mean_to_manifold_distance}.
+\]
 
-The cutoff is inclusive. Projection has two distinct uniqueness questions:
+The optional cutoff is inclusive. Projection has two distinct uniqueness
+questions:
 
 1. **Nearest-instance uniqueness.** A distance tie between separate planted
    manifold instances is marked `ambiguous` and left unassociated.
@@ -104,8 +135,8 @@ learned component mean can. In a within-manifold degeneracy, the projector
 returns a deterministic representative point so its distance remains finite
 and marks the projection non-unique because neither the point nor its tangent
 is identified. If the nearest instance is unique and the representative
-distance passes the cutoff, the component remains associated and contributes
-to rank recovery, but both tangent metrics are undefined.
+distance passes any configured cutoff, the component remains associated and
+contributes to rank recovery, but both tangent metrics are undefined.
 
 These three global counts partition all \(K\) components:
 
@@ -114,11 +145,20 @@ These three global counts partition all \(K\) components:
 - `ambiguous_components`
 
 The same within-manifold rule applies to existing degeneracies such as a mean
-at the center of a circle: this is not reported as cross-manifold ambiguity.
+at the center of a circle or on the cylinder axis: this is not reported as
+cross-manifold ambiguity. Cylinder projection normalizes the radial pair and
+clamps height to `[0, 5]`; its tangent spans the circumferential and axial
+directions, including at the boundary rings.
 
-## Effective-rank recovery
+## Learned-rank recovery
 
-For all model kinds, component \(k\)'s learned effective rank is
+For HDDC, component \(k\)'s learned rank is the number of active entries in
+its saved `rank_mask`: `rank_mask[k].sum()`. Evaluation uses this final rank
+directly, without any additional loading-variance or noise-floor filtering.
+`evaluation.rank_threshold` has no effect on HDDC. HDDC rank summaries record
+`definition: hddc_rank_mask_count` and omit `threshold`.
+
+For vanilla MFA and ARD, component \(k\)'s effective rank remains
 
 \[
 \hat r_k = \#\{j : s_{kj}^2 > \tau_{rank}\,\overline{\psi}_k\},
@@ -126,9 +166,18 @@ For all model kinds, component \(k\)'s learned effective rank is
 
 where \(s_{kj}\) is loading-column \(j\)'s scale,
 \(\overline{\psi}_k\) is the mean diagonal unique variance, and
-\(\tau_{rank}\) is `evaluation.rank_threshold`. HDDC's `rank_mask` is applied
-before counting. The target is the intrinsic dimension \(r_i\) of the
-proximity-associated manifold.
+\(\tau_{rank}\) is `evaluation.rank_threshold`. These summaries record
+`definition: loading_variance_above_noise_threshold` and the threshold value.
+The evaluator compares the model's rank against two
+targets for the proximity-associated manifold:
+
+- `rank` targets its local intrinsic dimension; and
+- `ambient_rank` targets its native ambient dimension, stored by the generator
+  as `embedding_dim` (for example, circle 2, helix 3, and `helix_4d` 4).
+
+The native ambient dimension is the dimension of the manifold's coordinate
+space before its random embedding. It is not the dataset-wide activation
+dimension `D` (typically 128).
 
 Global and per-manifold rank summaries report:
 
@@ -181,10 +230,11 @@ are:
   = \min_j c_j.
 \]
 
-### Effective-rank containment
+### Learned-rank containment
 
-Let \(s_k\) be component \(k\)'s effective rank under the same loading-scale,
-noise-floor, and HDDC-mask rule used for rank recovery. `tangent_containment`
+Let \(s_k\) be component \(k\)'s rank under the same rule used for rank
+recovery: the saved mask count for HDDC, or the loading-variance threshold for
+vanilla MFA and ARD. `tangent_containment`
 compares \(T_i\) with
 \(P_k^{(s_k)} \in \mathbb{R}^{D \times s_k}\), containing the leading
 `PC1..PCs_k` covariance eigenvectors. It asks whether the tangent is contained
@@ -277,9 +327,17 @@ dataset
 nll
 bic
   value
+  standard_bic
+  standard_bic_per_sample_reward
+  activity_reward
+  active_components
+  inactive_components
+  K
   parameters
   n
   split
+  assignment_rule
+  formula
   convention
 clustering
 components
@@ -290,7 +348,17 @@ association
   outside_cutoff_components
   ambiguous_components
 rank
-  threshold
+  definition
+  threshold  # vanilla MFA and ARD only
+  population
+  components
+  mean_learned
+  exact_match
+  within_one_match
+  mean_absolute_error
+ambient_rank
+  definition
+  threshold  # vanilla MFA and ARD only
   population
   components
   mean_learned
@@ -326,6 +394,7 @@ per_manifold[]
   type_id
   type_name
   intrinsic_dim
+  embedding_dim
   components
     associated
     assignment_live
@@ -337,12 +406,24 @@ per_manifold[]
     exact_match
     within_one_match
     mean_absolute_error
+  ambient_rank
+    target_ambient_dim
+    components
+    mean_learned
+    exact_match
+    within_one_match
+    mean_absolute_error
   tangent_alignment
   tangent_containment
 ```
 
-This is output `schema_version: 1`; completed-artifact validation requires this
-version and a finite `bic.value`.
+This is output `schema_version: 2`; completed-artifact validation requires this
+version, a finite `bic.value`, `convention: higher_is_better`, and
+`formula: -standard_bic / n + active_components`. Version 1 reports contain
+standard BIC in `bic.value` and are not accepted as current evaluations.
+For an existing run, archive its old `metrics.json` before resuming the manifest
+to regenerate evaluation; the pipeline refuses to overwrite an invalid existing
+report. Valid training and assignment artifacts can be reused.
 
 `per_manifold` follows the metadata order and contains an entry for every
 planted instance, including instances with zero associated components. Global
@@ -363,14 +444,19 @@ evaluation:
   batch_size: 4096
   device: cuda
   rank_threshold: 1.0
-  max_mean_to_manifold_distance: 0.1
+  max_mean_to_manifold_distance: null
 ```
 
-`rank_threshold` and `max_mean_to_manifold_distance` must be positive; the mean
-distance must also be finite. The resolved evaluation mapping is included in
-the immutable run identity. Changing the cutoff therefore creates a new run ID
-and output artifact rather than overwriting a completed run with different
-semantics.
+`null` is the default and disables distance filtering, so every component with
+a unique nearest manifold is associated with it. A numeric
+`max_mean_to_manifold_distance` enables the old cutoff behavior and must be
+finite and positive. `rank_threshold` must be positive when used for vanilla
+MFA or ARD; it is ignored for HDDC. Existing manifests may retain the legacy
+field, but HDDC metrics explicitly record the mask-based rank definition.
+The resolved evaluation
+mapping is included in the immutable run identity. Changing the cutoff
+therefore creates a new run ID and output artifact rather than overwriting a
+completed run with different semantics.
 
 The evaluator requires:
 
@@ -382,13 +468,15 @@ The evaluator requires:
 ## Code organization
 
 - `toy_manifold_geometry.py` implements noiseless projections and orthonormal
-  tangent construction for all ten manifold types.
+  tangent construction for all twelve manifold types.
 - `toy_manifold_metrics.py` implements proximity association, covariance
   eigenspaces, effective rank, principal-angle scores, and aggregation.
 - `toy_manifold_tiling.py` loads artifacts and models, reconstructs the
-  train/validation split, computes NLL, BIC, and clustering metrics, and
+  train/validation split, computes NLL, augmented BIC, and clustering metrics, and
   assembles the report.
-- `analysis/bic.py` owns MFA-family parameter counting and the BIC formula.
+- `analysis/bic.py` owns MFA-family parameter counting and the standard BIC formula.
+- `analysis/bic_improved.py` owns the active-BIC formula reused by the evaluator
+  and standalone helpers for scoring a saved run.
 
 Tests are split along the same boundaries in
 `tests/test_toy_manifold_geometry.py`, `tests/test_toy_manifold_metrics.py`, and

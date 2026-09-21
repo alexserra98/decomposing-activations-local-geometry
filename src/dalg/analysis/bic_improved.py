@@ -40,8 +40,8 @@ Assignment bundles cover the complete selected stream (training plus
 validation).  This module reconstructs the recorded split and slices the bundle
 at row boundaries, including activation windows with more than one retained
 token, so activity and BIC are evaluated on exactly the same training samples.
-It reads existing artifacts only and is not integrated into the evaluation
-pipeline.
+The standalone helpers read existing artifacts only. The toy-manifold evaluator
+reuses :func:`active_bic_from_standard` to report this score as ``bic.value``.
 """
 
 from __future__ import annotations

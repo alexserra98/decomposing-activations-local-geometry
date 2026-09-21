@@ -1,0 +1,57 @@
+# Existing activation shards are required; this config does not generate data.
+experiment:
+  name: hddc_em_D128_1M
+  output_root: dalg-cache/hddc_em_D128_1M
+
+dataset:
+  id: toy_manifolds_D128_1M
+  shard_dir: dalg-cache/assets/toy_manifolds_circle_helix_D128_1M_noise1e4_shards
+  layer: 0
+
+model:
+  kind: hddc
+  K: 500
+  q_max: 32
+  shared_b: true
+  surgery_threshold: 0.01
+
+training:
+  fit_method: em
+  epochs: 100
+  em_component_chunk_size: 32
+  em_eig_batch_size: 128
+  em_tol: 0.00001
+  batch_size: 2048
+  num_workers: 2
+  pool_size: 100000
+  refine_epochs: 0
+  val_frac: 0.1
+  split_seed: 42
+  seed: 42
+  device: cuda
+  epoch_snapshot_every: 10
+  early_stop_patience: 10
+  early_stop_min_delta: 0.0001
+
+assignments:
+  enabled: true
+  batch_size: 2048
+  device: cuda
+
+evaluation:
+  enabled: false
+
+resources:
+  partition: H100
+  account: LADE
+  nodes: 1
+  ntasks_per_node: 1
+  cpus_per_task: 8
+  gpus: 1
+  gpu_type: H100
+  memory: 80G
+  time: "03:00:00"
+  max_parallel: 1
+
+sweep:
+  model.K: [500, 5000]

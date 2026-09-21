@@ -19,7 +19,10 @@ from dalg.models.adaptive_q.mfa_hddc import (
     MFA_HDDC,
 )
 from dalg.models.mfa import ComponentShardedMFA, MFA
-from scripts.temporary.build_toy_kmeans_centroids import build_centroids
+from scripts.temporary.build_toy_kmeans_centroids import (
+    _subsample_points,
+    build_centroids,
+)
 
 
 def _orthonormal_directions(K: int, D: int, q: int) -> torch.Tensor:
@@ -97,16 +100,23 @@ def test_centroid_artifact_supports_legacy_and_enriched_files(tmp_path: Path) ->
     directions = _orthonormal_directions(3, 5, 2)
     legacy_path = tmp_path / "legacy.pt"
     bundle_path = tmp_path / "bundle.pt"
+    centroid_only_path = tmp_path / "centroid_only.pt"
     torch.save(centroids, legacy_path)
     save_centroid_artifact(bundle_path, centroids, directions)
+    save_centroid_artifact(centroid_only_path, centroids, None)
 
     legacy_centroids, legacy_directions = load_centroid_artifact(legacy_path)
     bundle_centroids, bundle_directions = load_centroid_artifact(bundle_path)
+    centroid_only, centroid_only_directions = load_centroid_artifact(
+        centroid_only_path
+    )
 
     assert torch.equal(legacy_centroids, centroids)
     assert legacy_directions is None
     assert torch.equal(bundle_centroids, centroids)
     assert torch.equal(bundle_directions, directions)
+    assert torch.equal(centroid_only, centroids)
+    assert centroid_only_directions is None
     validate_centroid_artifact(
         bundle_centroids,
         bundle_directions,
@@ -120,6 +130,24 @@ def test_centroid_artifact_supports_legacy_and_enriched_files(tmp_path: Path) ->
             bundle_directions,
             required_pca_rank=3,
         )
+
+
+def test_toy_builder_subsampling_is_deterministic_and_preserves_order() -> None:
+    points = torch.arange(40).reshape(20, 2)
+
+    first = _subsample_points(points, fraction=0.35, seed=11)
+    second = _subsample_points(points, fraction=0.35, seed=11)
+
+    assert first.shape == (7, 2)
+    assert torch.equal(first, second)
+    assert torch.all(first[1:, 0] > first[:-1, 0])
+    assert torch.equal(_subsample_points(points, fraction=1.0, seed=11), points)
+
+
+@pytest.mark.parametrize("fraction", [0.0, -0.1, 1.1])
+def test_toy_builder_subsampling_rejects_invalid_fraction(fraction: float) -> None:
+    with pytest.raises(ValueError, match="sample_fraction"):
+        _subsample_points(torch.randn(10, 2), fraction=fraction, seed=0)
 
 
 def test_initial_directions_are_used_by_every_model_variant() -> None:
@@ -221,6 +249,7 @@ def test_toy_builder_pca_only_upgrades_existing_centroids(
     )
 
     build_centroids(args)
+
     saved_centroids, saved_directions = load_centroid_artifact(
         output_dir / "centroids.pt"
     )
@@ -239,3 +268,66 @@ def test_toy_builder_pca_only_upgrades_existing_centroids(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not load")),
     )
     build_centroids(args)
+
+
+def test_toy_builder_can_save_centroids_without_pca(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shard_dir = tmp_path / "shards"
+    output_dir = tmp_path / "centroids"
+    shard_dir.mkdir()
+    (shard_dir / "config.json").write_text(json.dumps({"d_model": 3}))
+
+    points = torch.tensor(
+        [
+            [-2.0, -1.0, 0.0],
+            [-1.0, 2.0, 0.0],
+            [1.0, -2.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [8.0, -1.0, 0.0],
+            [9.0, 2.0, 0.0],
+            [11.0, -2.0, 0.0],
+            [12.0, 1.0, 0.0],
+        ]
+    )
+    source_config = {
+        "layers": [0],
+        "num_rows": len(points),
+        "d_model": 3,
+        "window": 1,
+        "drop_prefix": 0,
+    }
+    monkeypatch.setattr(
+        "scripts.temporary.build_toy_kmeans_centroids._load_activations",
+        lambda *_args, **_kwargs: (points, source_config),
+    )
+    args = argparse.Namespace(
+        shard_dir=shard_dir,
+        layer=0,
+        K=2,
+        out_dir=output_dir,
+        max_iter=10,
+        restarts=1,
+        tol=1e-6,
+        seed=0,
+        device="cpu",
+        load_batch_size=16,
+        block_x=16,
+        block_c=16,
+        pca_rank=0,
+        pca_only=False,
+        pca_chunk_elems=32,
+        pca_eig_batch_size=1,
+    )
+
+    build_centroids(args)
+
+    saved_centroids, saved_directions = load_centroid_artifact(
+        output_dir / "centroids.pt"
+    )
+    metadata = json.loads((output_dir / "config.json").read_text())
+    assert saved_centroids.shape == (2, 3)
+    assert saved_directions is None
+    assert metadata["principal_components"] is None
+    assert sum(metadata["cluster_sizes"]) == len(points)

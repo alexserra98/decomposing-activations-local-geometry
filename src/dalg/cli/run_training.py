@@ -19,6 +19,8 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 
+from dalg.init.mixture_weights import initialize_mixture_weights
+
 
 # Dataset setup
 
@@ -538,6 +540,10 @@ def cmd_train(args):
         rank=args.rank,
         init_directions=init_directions,
     ).to(args.device)
+    if not (out_dir / "checkpoint.pt").exists():
+        initialize_mixture_weights(
+            model, centroids, train_loader, n_train_tokens=data["n_train_tokens"],
+        )
     if getattr(args, "compile", False):
         print("Compiling model with torch.compile...")
         model = torch.compile(model)
@@ -664,6 +670,10 @@ def cmd_train_component_shard(args):
         world_size=world_size,
         init_directions=init_directions,
     ).to(device)
+    if not (out_dir / "checkpoint_rank0000.pt").exists():
+        initialize_mixture_weights(
+            model, centroids, base_loader, n_train_tokens=data["n_train_tokens"],
+        )
     log(
         f"Component sharding: rank {rank}/{world_size} owns "
         f"[{model.component_start}, {model.component_end})"

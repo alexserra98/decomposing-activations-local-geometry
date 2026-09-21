@@ -207,6 +207,39 @@ def _helix_at(theta: float, target: torch.Tensor, alpha: float) -> _RawProjectio
     return _RawProjection(point, tangent, True)
 
 
+def _helix_4d_at(
+    theta: float,
+    target: torch.Tensor,
+    radius_xy: float,
+    radius_zw: float,
+    frequency_xy: float,
+    frequency_zw: float,
+) -> _RawProjection:
+    angle_xy = frequency_xy * theta
+    angle_zw = frequency_zw * theta
+    cos_xy = math.cos(angle_xy)
+    sin_xy = math.sin(angle_xy)
+    cos_zw = math.cos(angle_zw)
+    sin_zw = math.sin(angle_zw)
+    point = target.new_tensor(
+        (
+            radius_xy * cos_xy,
+            radius_xy * sin_xy,
+            radius_zw * cos_zw,
+            radius_zw * sin_zw,
+        )
+    )
+    tangent = target.new_tensor(
+        (
+            -radius_xy * frequency_xy * sin_xy,
+            radius_xy * frequency_xy * cos_xy,
+            -radius_zw * frequency_zw * sin_zw,
+            radius_zw * frequency_zw * cos_zw,
+        )
+    )[:, None]
+    return _RawProjection(point, tangent, True)
+
+
 def _project_raw_point(
     target: torch.Tensor,
     type_name: str,
@@ -233,6 +266,18 @@ def _project_raw_point(
         point = target.new_tensor((math.cos(theta), math.sin(theta)))
         tangent = target.new_tensor((-math.sin(theta), math.cos(theta)))[:, None]
         return _RawProjection(point, tangent, unique)
+
+    if type_name == "cylinder":
+        if target.numel() != 3:
+            raise ValueError("cylinder projection expects three local coordinates")
+        circle = _project_raw_point(target[[0, 2]], "circle", config)
+        point = target.new_tensor(
+            (circle.point[0], target[1].clamp(0.0, 5.0), circle.point[1])
+        )
+        tangent = target.new_zeros((3, 2))
+        tangent[[0, 2], 0] = circle.tangent[:, 0]
+        tangent[1, 1] = 1.0
+        return _RawProjection(point, tangent, circle.unique)
 
     if type_name == "flat_disk":
         if target.numel() != 2:
@@ -409,6 +454,61 @@ def _project_raw_point(
         candidates = []
         for theta in parameters:
             projection = _helix_at(theta, target, alpha)
+            candidates.append((objective(theta), projection))
+        return _select_raw_projection(candidates)
+
+    if type_name == "helix_4d":
+        if target.numel() != 4:
+            raise ValueError("4D-helix projection expects four local coordinates")
+        theta_min = float(config["helix_4d_theta_min"])
+        theta_max = float(config["helix_4d_theta_max"])
+        radius_xy = float(config["helix_4d_radius_xy"])
+        radius_zw = float(config["helix_4d_radius_zw"])
+        frequency_xy = float(config["helix_4d_frequency_xy"])
+        frequency_zw = float(config["helix_4d_frequency_zw"])
+        grid = torch.linspace(
+            theta_min,
+            theta_max,
+            _PROJECTION_GRID_POINTS,
+            dtype=torch.float64,
+        )
+        angle_xy = frequency_xy * grid
+        angle_zw = frequency_zw * grid
+        points = torch.stack(
+            (
+                radius_xy * torch.cos(angle_xy),
+                radius_xy * torch.sin(angle_xy),
+                radius_zw * torch.cos(angle_zw),
+                radius_zw * torch.sin(angle_zw),
+            ),
+            dim=1,
+        )
+        values = (points - target[None, :]).square().sum(dim=1)
+
+        def objective(theta: float) -> float:
+            projection = _helix_4d_at(
+                theta,
+                target,
+                radius_xy,
+                radius_zw,
+                frequency_xy,
+                frequency_zw,
+            )
+            return float((projection.point - target).square().sum())
+
+        parameters = _refined_grid_candidates(
+            grid, values, objective, periodic=False
+        )
+        candidates = []
+        for theta in parameters:
+            projection = _helix_4d_at(
+                theta,
+                target,
+                radius_xy,
+                radius_zw,
+                frequency_xy,
+                frequency_zw,
+            )
             candidates.append((objective(theta), projection))
         return _select_raw_projection(candidates)
 

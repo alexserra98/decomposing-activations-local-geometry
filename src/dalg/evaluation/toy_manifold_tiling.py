@@ -17,6 +17,7 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader
 
 from dalg.analysis.bic import bic_from_mean_nll, model_parameter_count
+from dalg.analysis.bic_improved import active_bic_from_standard
 from dalg.data.shard_activations import ActivationBatchDataset, load_meta_index
 from dalg.data.subset_spec import resolve_spec_positions, split_shard_dir_spec
 from dalg.evaluation.toy_manifold_metrics import evaluate_toy_manifold_metrics
@@ -95,13 +96,14 @@ def evaluate_toy_manifold_tiling(
     batch_size: int = 4096,
     device: str = "cuda",
     rank_threshold: float = 1.0,
-    max_mean_to_manifold_distance: float = 0.1,
+    max_mean_to_manifold_distance: float | None = None,
 ) -> dict[str, Any]:
     """Evaluate one MFA-family run against planted toy-manifold structure."""
-    if rank_threshold <= 0.0:
+    if model_kind != "hddc" and rank_threshold <= 0.0:
         raise ValueError("rank_threshold must be positive")
-    if not math.isfinite(max_mean_to_manifold_distance) or (
-        max_mean_to_manifold_distance <= 0.0
+    if max_mean_to_manifold_distance is not None and (
+        not math.isfinite(max_mean_to_manifold_distance)
+        or max_mean_to_manifold_distance <= 0.0
     ):
         raise ValueError("max_mean_to_manifold_distance must be finite and positive")
 
@@ -222,11 +224,23 @@ def evaluate_toy_manifold_tiling(
     )
     n_train = len(train_positions) * (window - drop_prefix)
     bic_parameters = model_parameter_count(model, model_kind)
-    bic = bic_from_mean_nll(
+    standard_bic = bic_from_mean_nll(
         model,
         model_kind,
         mean_nll=train_nll,
         n=n_train,
+    )
+    train_mask = torch.tensor(
+        [position not in val_position_set for position in positions],
+        dtype=torch.bool,
+    )
+    train_cluster_sizes = torch.bincount(assignments[train_mask], minlength=model.K)
+    active_components = int((train_cluster_sizes > 0).sum())
+    bic = active_bic_from_standard(
+        standard_bic,
+        n=n_train,
+        active_components=active_components,
+        K=model.K,
     )
 
     true_ids = row_manifold_ids.numpy()
@@ -250,7 +264,7 @@ def evaluate_toy_manifold_tiling(
     )
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "evaluation": "toy_manifold_tiling",
         "model_kind": model_kind,
         "K": int(model.K),
@@ -266,10 +280,18 @@ def evaluate_toy_manifold_tiling(
         "nll": {"train": train_nll, "validation": val_nll},
         "bic": {
             "value": bic,
+            "standard_bic": standard_bic,
+            "standard_bic_per_sample_reward": -standard_bic / n_train,
+            "activity_reward": active_components,
+            "active_components": active_components,
+            "inactive_components": int(model.K) - active_components,
+            "K": int(model.K),
             "parameters": bic_parameters,
             "n": n_train,
             "split": "train",
-            "convention": "lower_is_better",
+            "assignment_rule": "hard_map_count_greater_than_zero",
+            "formula": "-standard_bic / n + active_components",
+            "convention": "higher_is_better",
         },
         "clustering": clustering,
         "components": {

@@ -224,7 +224,7 @@ def train_nll_hddc(
     update; this is required for a DataLoader whose active training iterator
     cannot be nested.
     The checkpoint written at the end of the epoch is post-surgery, so a resume
-    picks up the rewritten covariances and the reset optimizer state.
+    picks up the rewritten mixture parameters and the reset optimizer state.
     """
     dist_on, rank = _distributed_state()
     is_main = (rank == 0)
@@ -248,6 +248,8 @@ def train_nll_hddc(
     )
     if load_ckpt:
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        if ckpt.get("fit_method", "adam") != "adam":
+            raise ValueError("Cannot resume an EM checkpoint as Adam; use init_model_path with mfa_model.pt")
         raw_model.load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["optimizer"])
         if track_best:
@@ -319,8 +321,9 @@ def train_nll_hddc(
         summary = hddc_surgery(
             raw_model, stats_loader, surgery, device=device, log=log
         )
-        reset_optimizer_state(opt, surgery_params(raw_model))
-        warmup_total, warmup_step = int(surgery.warmup_steps or 0), 0
+        if summary["n_updated"] > 0:
+            reset_optimizer_state(opt, surgery_params(raw_model))
+            warmup_total, warmup_step = int(surgery.warmup_steps or 0), 0
         nll_after = eval_val_nll() if has_validation else float("nan")
         if dist_on:
             t = torch.tensor([nll_after], device=device, dtype=torch.float64)

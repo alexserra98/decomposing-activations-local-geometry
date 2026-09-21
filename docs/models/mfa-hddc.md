@@ -1,7 +1,7 @@
 # MFA-HDDC
 
 > **Kind:** Model explanation · **Status:** Current · **Use when:** Working on
-> HDDC covariance surgery, isotropic noise, rank masks, or HDDC checkpoints.
+> HDDC EM, covariance surgery, isotropic noise, rank masks, or HDDC checkpoints.
 
 `MFA_HDDC` learns a **per-component rank** `d_k` by periodically re-estimating
 each component's covariance in closed form and reading its rank off the
@@ -9,7 +9,7 @@ eigenspectrum. Unlike the ARD path it is a self-contained fork of `mfa.py`,
 because it changes parameter shapes.
 
 Code: `src/dalg/models/adaptive_q/mfa_hddc.py`, `hddc_surgery.py`,
-`train_hddc.py`, `cli/adaptive_q/run_training_hddc.py`
+`train_hddc.py`, `train_em_hddc.py`, `cli/adaptive_q/run_training_hddc.py`
 (`dalg-run-training-hddc`). Method: the HDDC models `[a_ij b_i Q_i d_i]` and
 `[a_ij b Q_i d_i]` of Bouveyron, Girard & Schmid (arXiv:math/0604064).
 
@@ -18,6 +18,73 @@ Code: `src/dalg/models/adaptive_q/mfa_hddc.py`, `hddc_surgery.py`,
 Vanilla MFA fits `C_k = W_k W_k^T + Psi` by Adam on the mean NLL, with `W_k` of
 shape `(D, q)` and **one `q` fixed by hand for every component**, and a `Psi`
 that is diagonal and (by default) shared across components.
+
+## Streamed full-data EM
+
+Select `--fit-method em --shared-b`, or `training.fit_method: em` with
+`model.shared_b: true` in YAML. The default `fit_method: adam` retains the
+Adam/surgery trainer. EM supports one CPU or CUDA process and
+`1 <= q_max < D`; the intended scale is D=128 and K=500–5000.
+
+The EM trainer freezes parameters for a complete pass and computes soft
+responsibilities over **all K components**. It accumulates the same float64
+counts, residual sums and scatter described below, then calls the shared HDDC
+M-step to update means, mixture weights, orientations, individual signal
+variances, ranks and the single noise scalar. Every component must have positive
+effective mass; EM rejects unsupported components instead of skipping them.
+There are no Adam steps, learning-rate schedules, subsampled E-passes, or online
+averages. Cattell ranks and the shared-noise feasibility solve run every iteration.
+
+Fresh fits load or fit KMeans centroids through the existing initialization
+path, then make one full nearest-centroid pass over training activations to
+initialize **all** parameters. This hard pass uses indexed moments rather than
+dense soft memberships. Stored PCA directions are not required. Alternatively,
+`init_model_path` uses a compatible shared-b HDDC model directly as iteration
+zero, without refitting its parameters; K, D, q and noise mode must match.
+
+Float64 cached likelihoods explicitly center observations before evaluating
+quadratic forms, including for nonorthogonal warm-start loadings. Both
+likelihoods and centered moments use component chunks. Covariance eigensolvers
+are batched and only the leading q eigenvectors are retained. Model parameters
+and exported checkpoints stay float32. The main persistent scatter costs
+`8*K*D*D` bytes: **625 MiB at K=5000, D=128**. Working memory does not grow
+with the total number of activations. Covariance accumulation costs O(N K D²),
+while the eigensolver costs O(K D³) per iteration.
+
+`epochs` counts M-steps; iteration zero is initialization. The next E-pass scores
+each updated model while collecting the moments for its next M-step. The final
+pass only scores. `em_history.json` records train/validation NLL, ranks, rank
+changes, shared noise, effective memberships, timing and peak GPU allocation.
+Checkpoint scores always refer to their actual parameter state. The trainer
+selects the best validation NLL (or train NLL without validation), retaining
+that model as `mfa_model.pt`; `checkpoint.pt` holds the current iteration and
+best state for resume. Adam training checkpoints cannot be resumed as EM;
+use a new output directory and `init_model_path` to switch fitting methods.
+
+Convergence requires three consecutive iterations with unchanged ranks and
+`abs(new_nll-old_nll)/max(1,abs(old_nll)) < em_tol`. Set `em_tol: 0` to disable
+this criterion. Validation-patience controls also apply. The Adam
+`early_stop_delta` criterion does not apply to EM. Adaptive Cattell ranks can
+decrease likelihood; monotonic likelihood is only expected when ranks stay
+fixed and the numerical constraints are inactive.
+
+See the [YAML field reference](../reference/training-pipeline-config.md#full-data-em)
+and [one-million-activation example](../../configs/experiments/hddc_em_D128_1M.yaml).
+The temporary `scripts/temporary/benchmark_hddc_em.py` measures E/M and scoring
+times on random vectors held in host memory; it measures throughput rather than
+fit quality and excludes shard I/O, KMeans initialization and validation.
+
+Measured on one H100 80GB with N=1,000,000, D=128, q_max=32, activation
+batches of 2048 and component chunks of 32 (Slurm benchmark 1560498):
+
+| K | E-pass | M-step | Final scoring pass | Peak GPU allocation |
+| --- | --- | --- | --- | --- |
+| 500 | 3.37 s | 0.89 s | 2.01 s | 0.48 GB |
+| 5000 | 33.00 s | 7.83 s | 19.36 s | 2.80 GB |
+
+These measure one update on seeded random inputs, not convergence time on
+activation shards. All responsibilities are retained; no sparse approximation
+is used. Output: `outputs/experiments/hddc_em_benchmark_1560498.json`.
 
 ## What HDDC changes
 
@@ -61,32 +128,49 @@ reads `d_k = rank_mask.sum(-1)` straight off the buffer. The mask is part of the
 `state_dict`, so it round-trips through save/load and shards like the other
 per-component tensors.
 
-### 3. Periodic covariance surgery instead of pure SGD
+Toy-manifold evaluation uses this saved mask count directly for rank recovery
+and tangent containment. It does not filter active HDDC directions by their
+loading variance relative to noise; `evaluation.rank_threshold` is ignored for
+HDDC. Matched-dimensional tangent alignment still uses the planted intrinsic
+dimension.
+
+### 3. Periodic M-step surgery
 
 Training is unmodified `train_nll` between surgeries — `train_nll_hddc` differs
 from `train_nll` only by the `surgery=` argument and the block it gates. Every
-`--surgery-every-epochs` epochs a closed-form **partial M-step** runs:
+`--surgery-every-epochs` epochs a gated **M-step** runs. Following the
+[HDDC paper, sections 4.1–4.2](https://arxiv.org/pdf/math/0604064#page=12), it
+uses one frozen set of soft responsibilities for means, weights, and covariance:
 
 - **A — statistics.** One E-pass over the train loader accumulating, in float64,
-  `N_k = sum_n r_nk` and the responsibility-weighted scatter
-  `S_k = sum_n r_nk (x_n - mu_k)(x_n - mu_k)^T` about the **current model mean**
-  `mu_k`. Centering on `mu_k` rather than on the empirical
-  responsibility-weighted mean is deliberate: `mu_k` is retained, so this is the
-  ML covariance given a fixed mean. Pairing a covariance centered at `mu_hat_k`
-  with a retained `mu_k` would leak the mean shift into the spectrum and inflate
-  the apparent rank whenever the SGD means lag the data.
-- **B — rank selection and rewrite.** Per component, `eigh(S_k / N_k)`, then a
+  counts `N_k = sum_n r_nk`, residual sums
+  `A_k = sum_n r_nk (x_n - mu_k_old)`, and scatter
+  `B_k = sum_n r_nk (x_n - mu_k_old)(x_n - mu_k_old)^T`. Centering the
+  accumulation on the old means avoids subtracting raw second moments at the
+  scale of the data's absolute offset. For eligible components, compute
+  `mu_k_new = mu_k_old + A_k / N_k` and the empirical covariance
+  `C_hat_k = B_k / N_k - (A_k / N_k)(A_k / N_k)^T`, centered on the new mean.
+
+  Eligibility requires both `N_k > 0` and `N_k >= n_min`. Skipped means and
+  mixture probabilities are preserved. If `E` is the eligible set and
+  `P_E = sum_{k in E} pi_k_old`, the constrained weight update is
+  `pi_k_new = P_E * N_k / sum_{j in E} N_j` for `k in E`. When all components
+  are eligible this is the paper's `pi_k_new = N_k / n`. The model preserves
+  skipped logits and the eligible logits' total exponential mass, keeping the
+  softmax normalizer unchanged up to floating-point rounding. Component shards
+  compute eligible masses globally.
+- **B — rank selection and rewrite.** Per component, `eigh(C_hat_k)`, then a
   scale-free Cattell scree test on consecutive eigenvalue differences,
 
   ```text
   r_k = max{ j <= q_max : (lam_j - lam_{j+1}) / lam_1 > threshold }
-  b_k = (Tr(S_k) - sum_{j<=r_k} lam_j) / (D - r_k)        # mean discarded eigenvalue
+  b_k = (Tr(C_hat_k) - sum_{j<=r_k} lam_j) / (D - r_k)    # mean discarded eigenvalue
   ```
 
   In shared-b mode, equation 5 of the HDDC paper pools eligible components:
 
   ```text
-  b = sum_k N_k (Tr(S_k) - sum_{j<=r_k} lam_kj)
+  b = sum_k N_k (Tr(C_hat_k) - sum_{j<=r_k} lam_kj)
       / sum_k N_k (D - r_k)
   ```
 
@@ -120,19 +204,26 @@ from `train_nll` only by the `surgery=` argument and the block it gates. Every
   `scale_j = sqrt(lam_j - b_*)`. All `q_max` columns are written from the
   eigendecomposition and only the mask records `d_k`, so a later surgery can
   *raise* a component's rank with no revival logic. Components with
-  `N_k < n_min` do not contribute to the pooled estimate and keep their
-  directions and mask. The default `n_min = 0` disables this cutoff: every
-  component with positive soft responsibility mass is rewritten, including a
-  component with zero hard assignments. An exactly zero `N_k` cannot define an
-  empirical covariance and raises explicitly. Skipped components' covariance
-  floor still changes because `b` is global.
-- **C — optimizer hygiene.** Adam state for the rewritten tensors (`dir_raw`,
-  `scale_rho`, `psi_rho`) is dropped, optionally followed by a short LR warmup.
-  State for `mu` and `pi_logits` is preserved.
+  `N_k < n_min` or `N_k == 0` do not contribute to the pooled estimate and keep
+  their means, weights, directions, and mask. The default `n_min = 0` disables
+  the positive-count cutoff: every component with positive soft responsibility
+  mass is rewritten, including a
+  component with zero hard assignments. An exactly zero `N_k` is always skipped
+  because its empirical mean and covariance are undefined. Skipped components'
+  covariance floor still changes because `b` is global.
+- **C — optimizer hygiene.** Adam state for all five rewritten parameter tensors
+  (`mu`, `pi_logits`, `dir_raw`, `scale_rho`, `psi_rho`) is dropped, optionally
+  followed by a short LR warmup. If no components are eligible globally,
+  surgery leaves the model, optimizer state, and warmup schedule unchanged.
 
-Surgery touches covariances only. `mu` and `pi_logits` keep whatever SGD made
-them. It runs *after* each epoch's best-model bookkeeping, so the selected
-metric and the state it selected describe the same model — but it competes on
+Empty E-passes, negative counts, and nonfinite statistics raise explicitly.
+Parameter proposals are validated on every component shard before any commit;
+successful rewrites invalidate the affected model's inference cache. The
+statistics API returns `(N_k, residual_sum, scatter, n_rows)` and
+`reconstruct_components` consumes the three moment tensors plus its configuration.
+
+Epoch-boundary surgery runs *after* each epoch's best-model bookkeeping, so the
+selected metric and the state it selected describe the same model — but it competes on
 the same validation metric, otherwise a surgery landing on the final epoch would
 be thrown away by the end-of-run rollback.
 
@@ -143,12 +234,12 @@ be thrown away by the end-of-run rollback.
 | Rank | one global `q` | per-component `d_k <= q_max`, explicit |
 | Psi | diagonal, shared `(D,)` or `(K, D)` | `b_k I` `(K, 1)`, or single-process `b I` `(1,)` |
 | Extra state | — | `rank_mask` buffer `(K, q_max)` |
-| Optimization | Adam on mean NLL | Adam on mean NLL + closed-form M-step every `T` epochs |
+| Optimization | Adam on mean NLL | Adam with periodic M-steps, or streamed full EM |
 | Rank mechanism | — | Cattell scree test on the covariance eigenspectrum |
 | Checkpoint | — | **not** readable by `mfa.load_mfa` |
 | Relation to `mfa.py` | — | fork, not subclass |
 
-Set `--surgery-every-epochs 0` for a fixed-`q` baseline on the identical stack —
+With `fit_method: adam`, set `--surgery-every-epochs 0` for a fixed-`q` baseline on the identical stack —
 that is the control an adaptive-rank claim needs.
 
 ## Implementation organization
@@ -162,6 +253,8 @@ periodic surgery do not modify `mfa.py`, `train.py`, or `run_training.py`:
   parameter selection, and optimizer-state reset
 - `src/dalg/models/adaptive_q/train_hddc.py`: the training-loop fork gated by a
   `surgery` configuration
+- `src/dalg/models/adaptive_q/train_em_hddc.py`: full-data EM, hard initialization,
+  bounded moment accumulation, convergence and resume
 - `src/dalg/cli/adaptive_q/run_training_hddc.py`: the
   `dalg-run-training-hddc` entrypoint
 - `scripts/slurm/adaptive_q/sbatch_train_hddc.sh`: cluster launcher
@@ -188,13 +281,12 @@ five-file deletion.
 
 ## Costs and failure modes
 
-- **Checkpoint incompatibility.** The mask and isotropic `psi_rho` shapes make an
-  `MFA_HDDC` `state_dict` unreadable by `mfa.load_mfa`, so downstream analyses
-  do not consume HDDC runs. This is deliberate: a model worth analysing gets
-  retrained on the production stack. (`MFAEncoderDecoder` is the exception — it
-  calls public methods only and accepts an `MFA_HDDC` unchanged.)
+- **Checkpoint compatibility.** Use `load_mfa_hddc`, not `mfa.load_mfa`, for
+  HDDC parameters. The assignment loader and toy-manifold evaluator support
+  HDDC model files from either fitting method. `MFAEncoderDecoder` also accepts
+  the public model interface.
 - **D ≈ 128 scale only.** Phase A accumulates an explicit `(K, D, D)` scatter
-  (65 KB per component at `D=128`). Gemma-scale `D ≈ 2304` needs the sketching
+  (128 KiB per component in float64 at `D=128`). Gemma-scale `D ≈ 2304` needs the sketching
   route, which is a TODO.
 - **Reading `d_k` needs care.** Skipped low-count components keep a full mask and
   report `d_k = q_max`, which looks like false saturation; count saturation only

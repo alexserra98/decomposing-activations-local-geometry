@@ -24,6 +24,7 @@ The only top-level sections are:
 | `dataset` | yes | Existing activation shards and layer. |
 | `model` | yes | Trainer selection and model/method parameters. |
 | `training` | no | Optimization, stopping, initialization, and logging. |
+| `initialization` | no | PCA population for automatic KMeans/PCA initialization. |
 | `assignments` | no | Post-training MFA responsibility assignments. |
 | `evaluation` | no | Optional evaluation built from those assignments. |
 | `resources` | no | Slurm allocation and array concurrency. |
@@ -104,7 +105,7 @@ component sharding.
 | `shared_b` | boolean | `false` | Use one trainable isotropic noise scalar `b` for every component, so `Psi_k = b I` throughout the mixture. Mutually exclusive with `isotropic_psi` and supported only in `single_process` training mode. |
 | `surgery_every_epochs` | float | `0` | Surgery cadence in epochs. Supported values are `0`, a fraction strictly between 0 and 1, or a positive integer. Fractions run on the first optimizer step crossing each global fractional-epoch boundary and are `single_process`-only. `0` disables surgery and provides the fixed-rank baseline. |
 | `surgery_threshold` | float | `0.01` | Relative Cattell scree threshold. Must be positive when surgery is enabled. |
-| `surgery_min_count` | non-negative float | `0.0` | Components with `N_k` below this soft-responsibility-mass threshold are not rewritten. `0` disables the cutoff and includes every component with positive soft membership; an exact-zero membership cannot define `S_k / N_k` and raises. |
+| `surgery_min_count` | non-negative float | `0.0` | Gates mean, mixture-weight, and covariance updates by soft responsibility mass `N_k`. Components below the threshold retain their means and weights; eligible weights redistribute only their previous total probability mass. `0` includes every positive-mass component; exact-zero mass is always skipped. |
 | `surgery_warmup_steps` | integer | `0` | Linear learning-rate warmup steps after each surgery; `0` disables it. |
 
 When `surgery_every_epochs > 0`, exactly one of `isotropic_psi` or `shared_b`
@@ -135,6 +136,78 @@ The two relevant complete examples are
 and
 [`adaptive_q_toy_20k_hddc_shared_b_surgery_half.yaml`](../../configs/experiments/adaptive_q_toy_20k_hddc_shared_b_surgery_half.yaml).
 
+### Full-data EM
+
+For `model.kind: hddc`, set `training.fit_method: em` and
+`model.shared_b: true`. EM updates all parameters after each complete training
+pass, including Cattell rank selection using `model.surgery_threshold`.
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `fit_method` | `adam` or `em` | `adam` | HDDC fitting method; EM supports single-process CPU/CUDA shared scalar noise only. |
+| `em_component_chunk_size` | positive integer | `32` | Number of components in likelihood and centered-moment workspaces. |
+| `em_eig_batch_size` | positive integer | `128` | Covariances per eigensolver call. |
+| `em_tol` | non-negative float | `0.00001` | Relative training-NLL tolerance. Stop after three consecutive small changes with unchanged ranks; zero disables convergence stopping. |
+
+EM requires `1 <= q_max < D` and a positive `epochs` M-step limit. Set
+`surgery_every_epochs`, `surgery_min_count`, and `surgery_warmup_steps` to zero
+(their defaults). It rejects `steps_per_epoch`, `max_steps`, compilation,
+gradient clipping, and learning-rate overrides. Every E-pass includes all
+selected training rows and final partial batches. `early_stop_patience` and
+`early_stop_min_delta` apply to the selection metric; `early_stop_delta` is an
+Adam-only control.
+
+Fresh EM fits recompute all parameters from a full nearest-centroid training
+partition, including local covariance directions. Omit `direction_init`;
+`cluster_pca` is rejected because stored directions are not used. Centroid-only
+and enriched artifacts are both accepted via `centroids_path`. Compatible
+`init_model_path` models bypass this initialization. Resume uses EM-tagged
+`checkpoint.pt`; switching between Adam and EM requires a new run initialized
+from `mfa_model.pt`.
+
+The example [hddc_em_D128_1M.yaml](../../configs/experiments/hddc_em_D128_1M.yaml)
+uses 2048-activation batches and sweeps K=500 and K=5000. The
+[model page](../models/mfa-hddc.md#streamed-full-data-em) describes numerical
+precision, output files and convergence limits.
+
+## `initialization`
+
+These pipeline-only options select how automatic initialization computes PCA.
+Both methods fit the same Euclidean KMeans centroids on the exact training
+split. Omitting the section preserves cluster-assignment PCA and existing run
+identities. This section requires automatic initialization: it is rejected with
+supplied `training.centroids_path`, `training.init_model_path`, or HDDC EM.
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `pca_method` | `cluster` or `knn` | `cluster` | Compute PCA from hard KMeans cluster members, or from each centroid's nearest Euclidean training points. |
+| `pca_neighbors` | positive integer | `64` for `knn` | Number of nearest points per centroid. Requires `pca_method: knn` and `rank/q_max < pca_neighbors <= number of training activations`. |
+
+```yaml
+initialization:
+  pca_method: knn
+  pca_neighbors: 64
+```
+
+KNN neighborhoods can overlap and can include points assigned to another
+centroid. Covariance is computed in float64 around the stored KMeans centroid,
+not around the neighborhood mean. Small or empty hard clusters do not prevent
+KNN PCA; the requested neighborhood must still fit within the training data.
+Cluster PCA retains its requirement of at least `rank/q_max + 1` members per
+cluster. Both methods exclude validation rows and use the same prefix dropping
+and subset selection as training.
+
+The method and, for KNN, the neighbor count are part of the immutable run
+identity and are checked against saved PCA metadata on resume. The trainer
+still uses `training.direction_init: cluster_pca` to load the saved directions
+for either method; this is the automatic-initialization default. Explicit
+`direction_init: random` still computes and saves the selected PCA but uses
+random loading directions.
+
+To compare both methods in one Cartesian sweep, set
+`initialization.pca_method: cluster`, omit `pca_neighbors` to use 64 for KNN,
+and add `initialization.pca_method: [cluster, knn]` under `sweep`.
+
 ## `training`
 
 These arguments are shared by MFA, ARD, and HDDC unless noted otherwise.
@@ -150,15 +223,16 @@ These arguments are shared by MFA, ARD, and HDDC unless noted otherwise.
 | `val_frac` | float | `0.05` | Fraction of selected rows reserved for validation. Set `0` to disable validation; validation-based early stopping then cannot operate. |
 | `split_seed` | integer | `42` | Seed for the deterministic stratified train/validation row split. |
 | `val_on_gpu` | boolean | `false` | Materialize validation activations on the selected device in single-process training. |
-| `centroids_path` | `.pt` path or `null` | `null` | Reuse a precomputed centroid artifact instead of fitting KMeans. It may be a legacy `(K, D)` tensor or a bundle containing `centroids` and `principal_components`. The pipeline accepts only a direct lowercase `.pt` file, resolves it to an absolute path, and validates `K` and `D`. |
-| `direction_init` | `random` or `cluster_pca` | `random` | Initialize each component's loading directions randomly, or from the first `rank/q_max` principal components stored in the centroid artifact. The `cluster_pca` path is a temporary experimental option. |
+| `centroids_path` | `.pt` path or `null` | `null` | Reuse a precomputed centroid artifact. If neither this nor `init_model_path` is supplied, new MFA, ARD, and Adam-based HDDC pipelines generate training-only KMeans/PCA before training. Supplied files must be lowercase `.pt` files containing a legacy `(K, D)` tensor or a bundle with `centroids` and `principal_components`; planning validates their dimensions. |
+| `direction_init` | `random` or `cluster_pca` | `cluster_pca` with automatic initialization; otherwise `random` | Initialize loading directions from local PCA or randomly. Explicit `random` is respected even when automatic initialization saves PCA. The `cluster_pca` path is a temporary experimental option. |
 | `init_model_path` | `.pt` path or `null` | `null` | HDDC only. Seed an epoch-0 training checkpoint from a saved `MFA_HDDC` whose `K`, `D`, `q`, and Psi noise mode exactly match the YAML model configuration. |
 
 > **Temporary experimental feature:** `direction_init: cluster_pca` and the
 > enriched artifact's `principal_components` field support the current
 > W-initialization experiments and are not a stable pipeline contract. Reusing
 > centroid means with `centroids_path` does not depend on this feature;
-> `direction_init: random` remains the default.
+> `direction_init: random` remains the default with supplied artifacts and in
+> standalone training CLIs.
 
 When `centroids_path` is set, the trainer copies that artifact into the run
 directory and skips centroid fitting. The initialization arguments below have
@@ -168,6 +242,42 @@ when `Q_stored < rank/q_max`. The trainer slices the first requested directions;
 loading scales still initialize to 1. Legacy tensor-only artifacts remain valid
 with `direction_init: random`.
 
+Fresh MFA, ARD, and Adam-based HDDC training initializes mixture weights from
+nearest-Euclidean-centroid counts `n_k` over the selected training split, after
+dropping prefix tokens. This requires one full training pass, including when
+centroids are supplied; validation rows are excluded and debug step limits do
+not truncate the counts. Each empty cluster receives one pseudocount for
+initializing its weight:
+
+```text
+n_tilde_k = max(n_k, 1)
+pi_k = n_tilde_k / sum_j n_tilde_j = max(n_k, 1) / (N + n_empty)
+```
+
+Here `N = sum_k n_k` and `n_empty` is the number of zero-count components.
+Positive counts are unchanged; when every cluster is populated this reduces
+to `pi_k = n_k/N`. For example, counts `[0, 3, 6]` produce weights
+`[0.1, 0.3, 0.6]`. The floor keeps initial logits finite so an empty hard
+cluster can receive soft responsibility and gradients. It does not guarantee
+that the component will acquire substantial membership during training.
+
+The initializer logs how many components receive a pseudocount, previews their
+IDs, and reports raw cluster-size extrema. It returns the unmodified raw counts;
+pseudocounts do not add observations or change assignments, means, PCA
+directions, loading scales, or noise. An empty training stream or a mismatch
+between counted and expected training tokens still raises. Component-sharded
+runs count on rank zero, broadcast raw counts, and normalize the floored weights
+globally across all components, including when an entire shard is empty.
+
+This rule is automatic for both `random` and `cluster_pca` direction modes;
+there is no YAML setting. Resumed checkpoints and HDDC `init_model_path` starts
+retain their saved weights. The floor applies only at initialization, not as a
+weight constraint during optimization or HDDC surgery, and does not relax the
+sample requirements for computing cluster PCA. HDDC `fit_method: em` uses its
+separate hard-moment initialization and still requires positive membership for
+every component to estimate its mean and covariance; see the
+[EM contract](../models/mfa-hddc.md#streamed-full-data-em).
+
 Example using the enriched bundle to initialize `W_k`:
 
 ```yaml
@@ -176,8 +286,27 @@ training:
   direction_init: cluster_pca
 ```
 
-This option is available for all three model kinds. PCA is not fitted by the
-trainer; `principal_components` must already be stored in `centroids.pt`.
+This option is available for all three model kinds. The trainer reads PCA from
+`centroids.pt`; the pipeline builds it beforehand for automatic initialization.
+
+Automatic initialization uses the exact training split determined by `val_frac`,
+`split_seed`, subset selection, and prefix-token dropping. It fits all training
+activations with full-dimensional Euclidean KMeans (KMeans++, 100 iterations,
+10 restarts, tolerance `1e-6`) and computes `rank/q_max` local PCA directions.
+The training seed (or 0) and device are used. No validation activations are
+included. By default each cluster must have at least `rank/q_max + 1` points;
+the [initialization section](#initialization) enables nearest-neighbor PCA.
+
+The builder loads training activations into host and device memory and allocates
+float64 `(K, D, D)` scatter for cluster PCA. KNN PCA searches the same training
+population in blocks and computes covariance in batches of centroids. See the
+[initialization workflow](../workflows/training-pipeline.md#reusing-centroids-and-experimental-w-initialization)
+for artifacts, provenance, and resume behavior. Standalone builder commands
+retain whole-dataset defaults; `--val-frac`, `--split-seed`, and `--drop-prefix`
+select a training split explicitly. `--pca-method knn --pca-neighbors 64` selects
+neighborhood PCA in `scripts/temporary/build_toy_kmeans_centroids.py`.
+PCA-only upgrades require the original split and subsampling settings and reject
+existing PCA from a different method or neighbor count.
 
 `init_model_path` and `centroids_path` are mutually exclusive because the full
 model already supplies its means. The initial model must exactly match `K`, `D`,
@@ -193,6 +322,9 @@ a fresh Adam state; subsequent restarts use the normal local checkpoint exactly.
 | `proj_dim` | integer | `32` | Projection dimension used by reservoir KMeans. |
 | `refine_epochs` | integer | `25` | Extra centroid refinement passes with assignments fixed to the nearest centroid. |
 | `vocab_size` | integer | `50257` | Vocabulary-size parameter passed to the centroid initializer. |
+
+These reservoir settings apply to standalone trainers and older manifests.
+They have no effect on the new automatic KMeans/PCA pipeline initialization.
 
 ### Optimization and stopping
 
@@ -270,27 +402,30 @@ assignment count before the stage is marked complete.
 | `kind` | string or `null` | `null` | The only current evaluator is `toy_manifold_tiling`. |
 | `batch_size` | integer | `4096` | Batch size used for evaluation NLL. |
 | `device` | string | `cuda` | Evaluation device. |
-| `rank_threshold` | float | `1.0` | A loading column is effectively active when its variance exceeds this multiple of its component's mean unique variance. Applied identically to MFA, ARD, and HDDC. |
-| `max_mean_to_manifold_distance` | float | `0.1` | Maximum ambient Euclidean distance between a Gaussian mean and its unique nearest exact manifold projection for proximity association. |
+| `rank_threshold` | float | `1.0` | For vanilla MFA and ARD, a loading column is effectively active when its variance exceeds this multiple of its component's mean unique variance. Ignored for HDDC, which uses its saved rank-mask count directly. |
+| `max_mean_to_manifold_distance` | float or `null` | `null` | Optional maximum ambient Euclidean distance between a Gaussian mean and its unique nearest exact manifold projection. `null` associates each Gaussian with its unique nearest manifold without distance filtering. |
 
 `evaluation.enabled: true` requires `assignments.enabled: true`.
 `toy_manifold_tiling` accepts `model.kind: mfa`, `ard`, or `hddc` and requires
 shards created by the toy-manifold shard writer. It produces NLL, training-set
-BIC, clustering-recovery, live/dead-component, effective-rank,
+augmented BIC, clustering-recovery, live/dead-component, effective-rank,
 tangent-alignment, and tangent-containment metrics in
 `<run_dir>/metrics.json`. The effective-rank
-rule is deliberately
-common across model kinds: even a configured fixed-q MFA can make a loading
-column negligible relative to its learned noise floor. The output calls the
+rule for vanilla MFA and ARD filters columns relative to the learned noise
+floor. HDDC instead uses its final `rank_mask.sum(-1)` without further
+filtering, for both rank recovery and tangent containment. The output calls the
 configured number of available columns `q_capacity`, since it is fixed `q` for
 vanilla MFA and an upper bound for adaptive-rank models.
 
-Each Gaussian is associated with its unique nearest planted manifold when its
-exact projection distance is within `max_mean_to_manifold_distance`. Tied
-nearest distances remain ambiguous and unassociated. Rank recovery and tangent
-alignment use all proximity-associated components; assignments continue to
-define clustering metrics and the separately reported assignment-live/dead
-counts.
+By default, each Gaussian is associated with its unique nearest planted
+manifold. Setting `max_mean_to_manifold_distance` to a finite positive number
+additionally requires the exact projection distance to be within that cutoff.
+Tied nearest distances remain ambiguous and unassociated. Rank recovery and
+tangent alignment use all proximity-associated components; assignments
+define clustering metrics, the separately reported assignment-live/dead counts,
+and augmented BIC's training-only activity reward. See the
+[augmented BIC contract](../evaluation/toy-manifold-tiling.md#augmented-bic) for
+the higher-is-better score reported in `bic.value`.
 
 For a manifold with intrinsic dimension `r_i`, tangent alignment compares the
 ground-truth tangent space with the full covariance's leading `r_i`-dimensional
@@ -365,6 +500,12 @@ arguments:
 - resource defaults;
 - assignment and evaluation defaults;
 - stable run ID and full identity hash.
+
+New automatic-initialization runs also store a versioned `initialization`
+specification, included in run identity. The generated centroid path is resolved
+under `<run_dir>/initialization/`; its existence is checked during execution,
+not planning. Existing manifests without this specification keep their previous
+initialization behavior.
 
 Changing any dataset, model, training, assignment, or evaluation field changes
 the run identity. Slurm resources do not change the model run identity.

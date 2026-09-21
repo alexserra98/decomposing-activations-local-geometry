@@ -16,7 +16,7 @@ relevant to it.
 - [MFA-ARD](models/mfa-ard.md) explains adaptive component rank through ARD
   shrinkage, including its invariants and failure modes.
 - [MFA-HDDC](models/mfa-hddc.md) explains adaptive component rank through
-  periodic covariance surgery and hard rank masks.
+  periodic M-step surgery or streamed full-data EM, with hard rank masks.
 
 ## I want to build or understand data
 
@@ -54,6 +54,12 @@ scope.
   summarizes the toy-manifold ARD/HDDC comparison and its limitations.
 - [HDDC rank surgery](experiments/hddc-rank-surgery.md) records the experimental
   implementation and validation setup for covariance surgery.
+- [KMeans initialization evaluation](experiments/kmeans-initialization-evaluation.md)
+  documents the experimental Cattell-rank and tangent-geometry evaluation of a
+  toy-manifold KMeans partition.
+- [KNN-PCA centroid initialization](experiments/knn-pca-centroid-initialization.md)
+  documents the temporary 64-neighbor workaround used to provide 32 local
+  directions for sparse `K=1000` toy KMeans partitions.
 - [Synthetic MFA analyses](experiments/synthetic-mfa.md) describes the temporary
   synthetic sweep and related analysis.
 - [Wikipedia KMedoids slice](experiments/wikipedia-kmedoids.md) describes the

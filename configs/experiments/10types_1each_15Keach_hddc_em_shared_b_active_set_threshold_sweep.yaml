@@ -1,0 +1,69 @@
+# Shared-b HDDC EM sweep on ten manifold types with one 15K-point instance each.
+# Threshold 1.0 is the rank-one control; larger values are redundant because
+# the normalized Cattell gap is <= 1.
+
+experiment:
+  name: 10types_1each_15Keach_hddc_em_shared_b_active_set_threshold_sweep
+  output_root: dalg-cache/toy_manifold_models_10types_1each_15Keach
+
+dataset:
+  id: toy_manifolds_D128_10types_1each_15Keach_noise1e4
+  shard_dir: /u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/assets/toy_manifolds_10types_1each_D128_15Keach_noise1e4_shards
+  layer: 0
+
+model:
+  kind: hddc
+  K: 1000
+  q_max: 32
+  shared_b: true
+  surgery_threshold: 0.05
+  # EM updates every positive-mass component after each complete E-pass.
+  surgery_min_count: 0
+
+training:
+  fit_method: em
+  # Reuse the same centroid means. EM initializes weights, directions, scales,
+  # ranks and shared noise from the full nearest-centroid training partition.
+  centroids_path: /u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/toy_manifold_models_10types_1each_15Keach/centroids/kmeans_k1000_sample35pct_knn64_pca32_experimental/centroids.pt
+  epochs: 1000
+  em_component_chunk_size: 32
+  em_eig_batch_size: 128
+  em_tol: 0.00001
+  early_stop_patience: 10
+  early_stop_min_delta: 0.001
+  epoch_snapshot_every: 1
+  batch_size: 2048
+  num_workers: 2
+  pool_size: 45000
+  refine_epochs: 0
+  val_frac: 0.1
+  split_seed: 42
+  seed: 42
+  device: cuda
+  wandb: false
+
+assignments:
+  enabled: true
+  batch_size: 4096
+  device: cuda
+
+evaluation:
+  enabled: true
+  kind: toy_manifold_tiling
+  batch_size: 4096
+  device: cuda
+
+resources:
+  partition: H100
+  account: LADE
+  nodes: 1
+  ntasks_per_node: 1
+  cpus_per_task: 8
+  gpus: 1
+  gpu_type: H100
+  memory: 80G
+  time: "01:00:00"
+  max_parallel: 12
+
+sweep:
+  model.surgery_threshold: [0.005, 0.01, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 1.0]

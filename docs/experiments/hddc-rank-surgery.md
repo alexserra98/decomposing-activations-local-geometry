@@ -153,6 +153,7 @@ tiling. Reading `d_k` against the planted per-manifold dimensions still works.
 - **Live component count** matters as much as NLL. A mixture that collapses onto
   far fewer components than `K` is reporting the dimension of whatever each
   survivor covers, which may be a whole manifold rather than a local patch.
-- **BIC** is not computed in the training loop. The toy-manifold evaluator adds
-  standard training-set BIC to `metrics.json`; compare its `bic.value` across
-  runs with lower values preferred.
+- **Augmented BIC** is not computed in the training loop. The toy-manifold
+  evaluator reports the [active-BIC score](../evaluation/toy-manifold-tiling.md#augmented-bic)
+  in `metrics.json`; compare its `bic.value` across runs on the same dataset,
+  split, and nominal `K`, with higher values preferred.

@@ -379,6 +379,7 @@ def test_zero_min_count_disables_the_membership_cutoff():
     stats = reconstruct_components(
         model,
         N,
+        torch.zeros_like(model.mu, dtype=torch.float64),
         covariances * N[:, None, None],
         cfg,
     )
@@ -389,16 +390,20 @@ def test_zero_min_count_disables_the_membership_cutoff():
     assert stats["n_skipped"] == 0
 
 
-def test_zero_min_count_rejects_exactly_zero_soft_membership():
+@pytest.mark.parametrize("min_count", [0.0, 10.0])
+def test_zero_soft_membership_is_always_skipped(min_count):
     model = MFA_HDDC(torch.zeros(1, 4), rank=2, isotropic_psi=True)
-
-    with pytest.raises(RuntimeError, match="non-positive effective membership"):
-        reconstruct_components(
-            model,
-            torch.zeros(1, dtype=torch.float64),
-            torch.zeros(1, 4, 4, dtype=torch.float64),
-            SurgeryConfig(enabled=True, every=1, min_count=0.0),
-        )
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    stats = reconstruct_components(
+        model,
+        torch.zeros(1, dtype=torch.float64),
+        torch.zeros_like(model.mu, dtype=torch.float64),
+        torch.zeros(1, 4, 4, dtype=torch.float64),
+        SurgeryConfig(enabled=True, every=1, min_count=min_count),
+    )
+    assert stats["n_updated"] == 0
+    for key, value in model.state_dict().items():
+        assert torch.equal(value, before[key])
 
 
 def test_negative_or_nonfinite_min_count_is_rejected():
@@ -450,6 +455,7 @@ def test_shared_b_surgery_uses_membership_weighted_pooled_residual():
     stats = reconstruct_components(
         model,
         N,
+        torch.zeros_like(model.mu, dtype=torch.float64),
         S_acc,
         SurgeryConfig(enabled=True, every=1, threshold=0.2, min_count=1.0),
     )
@@ -477,6 +483,7 @@ def test_shared_b_active_set_prunes_infeasible_cattell_directions():
     stats = reconstruct_components(
         model,
         N,
+        torch.zeros_like(model.mu, dtype=torch.float64),
         covariances * N[:, None, None],
         SurgeryConfig(enabled=True, every=1, threshold=0.04, min_count=1.0),
     )
@@ -504,6 +511,7 @@ def test_shared_b_active_set_does_not_batch_prune_a_later_valid_direction():
     stats = reconstruct_components(
         model,
         N,
+        torch.zeros_like(model.mu, dtype=torch.float64),
         covariances * N[:, None, None],
         SurgeryConfig(enabled=True, every=1, threshold=0.04, min_count=1.0),
     )
@@ -529,6 +537,7 @@ def test_shared_b_active_set_treats_equality_with_floor_as_noise():
     stats = reconstruct_components(
         model,
         N,
+        torch.zeros_like(model.mu, dtype=torch.float64),
         covariance * N[:, None, None],
         SurgeryConfig(
             enabled=True,
@@ -561,6 +570,7 @@ def test_surgery_floor_respects_model_psi_parameterization_floor():
     stats = reconstruct_components(
         model,
         N,
+        torch.zeros_like(model.mu, dtype=torch.float64),
         covariance * N[:, None, None],
         SurgeryConfig(
             enabled=True,
@@ -595,6 +605,7 @@ def test_component_specific_surgery_rejects_floor_above_retained_eigenvalue():
         reconstruct_components(
             model,
             N,
+            torch.zeros_like(model.mu, dtype=torch.float64),
             covariance * N[:, None, None],
             SurgeryConfig(
                 enabled=True,
@@ -629,14 +640,17 @@ def test_hddc_surgery_reports_shared_b_without_dropping_b_k_mean():
 def test_shared_b_surgery_still_rejects_mandatory_first_direction_below_floor():
     model = MFA_HDDC(torch.zeros(2, 4), rank=3, shared_b=True)
     before = {key: value.clone() for key, value in model.state_dict().items()}
-    N = torch.tensor([100.0, 100.0], dtype=torch.float64)
+    N = torch.tensor([100.0, 50.0], dtype=torch.float64)
     covariances = torch.stack(
         [
             torch.diag(torch.tensor([5.0, 4.0, 3.0, 2.0], dtype=torch.float64)),
             torch.diag(torch.tensor([100.0, 50.0, 50.0, 50.0], dtype=torch.float64)),
         ]
     )
-    S_acc = covariances * N[:, None, None]
+    # Nonzero mean proposals and unequal counts would also change mu and pi
+    # if they were committed before the covariance feasibility check.
+    A = N[:, None] * torch.ones(2, 4, dtype=torch.float64)
+    S_acc = (covariances + 1.0) * N[:, None, None]
 
     with pytest.raises(
         RuntimeError,
@@ -645,6 +659,7 @@ def test_shared_b_surgery_still_rejects_mandatory_first_direction_below_floor():
         reconstruct_components(
             model,
             N,
+            A,
             S_acc,
             SurgeryConfig(enabled=True, every=1, threshold=0.1, min_count=1.0),
         )
@@ -658,6 +673,7 @@ def test_shared_b_surgery_with_no_eligible_components_is_a_no_op():
     stats = reconstruct_components(
         model,
         torch.tensor([1.0, 2.0], dtype=torch.float64),
+        torch.zeros_like(model.mu, dtype=torch.float64),
         torch.zeros(2, 4, 4, dtype=torch.float64),
         SurgeryConfig(enabled=True, every=1, min_count=10.0),
     )
@@ -724,8 +740,8 @@ def test_rank_can_increase_at_a_later_surgery():
     assert loose["d_k_per_component"][0] == 3
 
 
-def test_statistics_center_on_the_model_mean_not_the_empirical_mean():
-    """S_k is the ML covariance *given* mu_k, so a displaced mu inflates it."""
+def test_residual_statistics_recover_covariance_about_the_updated_mean():
+    """The first-moment correction removes displacement of the initial mean."""
     x, mu, _U, _lam = _planted_gaussian(D=16, d_true=2, b_true=0.05, n=20_000)
     shift = torch.zeros(16)
     shift[0] = 1.0
@@ -734,15 +750,21 @@ def test_statistics_center_on_the_model_mean_not_the_empirical_mean():
     off_mean = MFA_HDDC((mu + shift)[None, :].clone(), rank=4, isotropic_psi=True,
                    psi_init=0.5)
 
-    N_a, S_a, rows = accumulate_statistics(on_mean, _batches(x), device=x.device)
-    N_b, S_b, _ = accumulate_statistics(off_mean, _batches(x), device=x.device)
+    N_a, A_a, B_a, rows = accumulate_statistics(on_mean, _batches(x), device=x.device)
+    N_b, A_b, B_b, _ = accumulate_statistics(off_mean, _batches(x), device=x.device)
 
     assert rows == x.shape[0]
     assert float(N_a.sum()) == pytest.approx(x.shape[0], rel=1e-6)
-    trace_a = float(torch.diagonal(S_a[0] / N_a[0]).sum())
-    trace_b = float(torch.diagonal(S_b[0] / N_b[0]).sum())
-    # The displacement adds ||shift||^2 = 1 to the trace.
-    assert trace_b - trace_a == pytest.approx(1.0, rel=0.05)
+    S_a = B_a[0] / N_a[0] - torch.outer(A_a[0], A_a[0]) / N_a[0] ** 2
+    S_b = B_b[0] / N_b[0] - torch.outer(A_b[0], A_b[0]) / N_b[0] ** 2
+    torch.testing.assert_close(S_a, S_b, atol=1e-10, rtol=1e-10)
+    centered = x.double() - x.double().mean(0)
+    torch.testing.assert_close(S_b, centered.T @ centered / len(x))
+    cfg = SurgeryConfig(threshold=0.01)
+    reconstruct_components(on_mean, N_a, A_a, B_a, cfg)
+    reconstruct_components(off_mean, N_b, A_b, B_b, cfg)
+    torch.testing.assert_close(off_mean.mu, x.mean(0)[None])
+    torch.testing.assert_close(off_mean.W, on_mean.W)
 
 
 def test_surgery_requires_isotropic_psi():
@@ -750,6 +772,135 @@ def test_surgery_requires_isotropic_psi():
     model = MFA_HDDC(mu[None, :].clone(), rank=4)
     with pytest.raises(ValueError, match="isotropic_psi"):
         hddc_surgery(model, _batches(x), SurgeryConfig(enabled=True, every=1))
+
+
+@pytest.mark.parametrize("shared_b", [False, True])
+def test_m_step_matches_frozen_responsibilities_and_dense_covariance(shared_b, tmp_path):
+    torch.manual_seed(93)
+    x = torch.randn(150, 4) * torch.tensor([3.0, 1.5, 0.3, 0.2]) + 2.0
+    model = MFA_HDDC(
+        torch.randn(3, 4), rank=1, shared_b=shared_b,
+        isotropic_psi=not shared_b, psi_init=4.0,
+    )
+    batches = _batches(x, size=17)
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    with torch.no_grad():
+        r = torch.cat([model.responsibilities(batch) for batch in batches]).double()
+    counts = r.sum(0)
+    means = r.T @ x.double() / counts[:, None]
+    residual = x.double()[:, None, :] - means[None]
+    covariance = torch.einsum("nk,nkd,nke->kde", r, residual, residual) / counts[:, None, None]
+
+    N, A, B, rows = accumulate_statistics(
+        model, batches, device=x.device, chunk_elems=3 * model.K * model.D,
+    )
+    assert rows == len(x) and N.dtype == A.dtype == B.dtype == torch.float64
+    for key, value in model.state_dict().items():
+        assert torch.equal(value, before[key])
+    torch.testing.assert_close(N, counts)
+    reconstruct_components(model, N, A, B, SurgeryConfig(threshold=0.01))
+    torch.testing.assert_close(model.mu.double(), means, atol=2e-6, rtol=2e-6)
+    torch.testing.assert_close(model.pi_logits.softmax(0).double(), counts / counts.sum())
+
+    eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+    noise = eigenvalues[:, :-1].mean(-1)
+    if shared_b:
+        noise = ((counts * noise).sum() / counts.sum()).expand_as(noise)
+    principal = eigenvectors[:, :, -1]
+    expected = (
+        (eigenvalues[:, -1] - noise)[:, None, None]
+        * principal[:, :, None] * principal[:, None, :]
+        + noise[:, None, None] * torch.eye(model.D)
+    )
+    actual = model.W @ model.W.transpose(-1, -2) + torch.diag_embed(model._psi())
+    torch.testing.assert_close(actual.double(), expected, atol=3e-6, rtol=3e-6)
+    path = tmp_path / "m_step.pt"
+    save_mfa_hddc(model, str(path))
+    restored = load_mfa_hddc(str(path))
+    for key, value in model.state_dict().items():
+        assert torch.equal(value, restored.state_dict()[key])
+
+
+@pytest.mark.parametrize("shared_b", [False, True])
+def test_cutoff_preserves_skipped_means_logits_and_probabilities(shared_b):
+    model = MFA_HDDC(
+        torch.zeros(4, 4), rank=1, shared_b=shared_b, isotropic_psi=not shared_b,
+    )
+    with torch.no_grad():
+        model.pi_logits.copy_(torch.tensor([0.4, 0.2, 0.1, 0.3]).log() + 30.0)
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    old_pi = model.pi_logits.softmax(0).detach()
+    N = torch.tensor([60.0, 20.0, 2.0, 0.0], dtype=torch.float64)
+    means = torch.arange(16, dtype=torch.float64).reshape(4, 4) / 4
+    covariance = torch.diag(torch.tensor([9.0, 1.0, 1.0, 1.0], dtype=torch.float64))
+    B = N[:, None, None] * (covariance + means[:, :, None] * means[:, None, :])
+    stats = reconstruct_components(
+        model, N, N[:, None] * means, B, SurgeryConfig(min_count=20.0),
+    )
+    assert stats["eligible"].tolist() == [True, True, False, False]
+    torch.testing.assert_close(model.mu[:2].double(), means[:2])
+    for name in ("mu", "pi_logits", "dir_raw", "scale_rho", "rank_mask"):
+        assert torch.equal(getattr(model, name)[2:], before[name][2:])
+    pi = model.pi_logits.softmax(0).detach()
+    torch.testing.assert_close(pi[2:], old_pi[2:])
+    torch.testing.assert_close(pi[:2], old_pi[:2].sum() * torch.tensor([0.75, 0.25]))
+    if not shared_b:
+        assert torch.equal(model.psi_rho[2:], before["psi_rho"][2:])
+
+
+def test_component_without_hard_assignments_is_updated_from_positive_soft_mass():
+    torch.manual_seed(43)
+    model = MFA_HDDC(torch.zeros(2, 4), rank=1, isotropic_psi=True)
+    with torch.no_grad():
+        model.dir_raw[1].copy_(model.dir_raw[0])
+        model.pi_logits.copy_(torch.tensor([0.9, 0.1]).log())
+    x = torch.randn(100, 4) * torch.tensor([3.0, 0.4, 0.3, 0.2]) + 1
+    assert (model.responsibilities(x).argmax(-1) == 0).all()
+    summary = hddc_surgery(model, _batches(x, 11), SurgeryConfig(min_count=0.0))
+    assert summary["n_updated"] == 2
+    torch.testing.assert_close(model.mu, x.mean(0).expand(2, -1))
+
+
+@pytest.mark.parametrize("bad_stat", ["negative_count", "count", "residual", "scatter"])
+def test_invalid_statistics_fail_before_mutation(bad_stat):
+    model = MFA_HDDC(torch.zeros(2, 4), rank=1, isotropic_psi=True)
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    N = torch.ones(2, dtype=torch.float64)
+    A = torch.zeros(2, 4, dtype=torch.float64)
+    B = torch.eye(4, dtype=torch.float64).expand(2, -1, -1).clone()
+    if bad_stat == "negative_count":
+        N[0] = -1
+    elif bad_stat == "count":
+        N[0] = torch.nan
+    elif bad_stat == "residual":
+        A[0, 0] = torch.inf
+    else:
+        B[0, 0, 0] = torch.nan
+    with pytest.raises(ValueError, match="finite"):
+        reconstruct_components(model, N, A, B, SurgeryConfig())
+    for key, value in model.state_dict().items():
+        assert torch.equal(value, before[key])
+
+
+def test_empty_e_pass_is_rejected():
+    model = MFA_HDDC(torch.zeros(1, 4), rank=1, isotropic_psi=True)
+    with pytest.raises(ValueError, match="non-empty E-pass"):
+        hddc_surgery(model, [], SurgeryConfig())
+    assert model.training
+
+
+def test_surgery_invalidates_active_inference_cache():
+    torch.manual_seed(41)
+    model = MFA_HDDC(torch.zeros(1, 4), rank=1, isotropic_psi=True)
+    x = torch.randn(100, 4) * torch.tensor([3.0, 0.4, 0.3, 0.2]) + 2
+    with torch.no_grad(), model.inference_cache():
+        old_ll = model.log_prob(x)
+        hddc_surgery(model, _batches(x, 15), SurgeryConfig())
+        assert model._inference_cache is None
+        new_ll = model.log_prob(x)
+        assert not torch.allclose(old_ll, new_ll)
+    with torch.no_grad(), model.inference_cache():
+        torch.testing.assert_close(model.log_prob(x), new_ll, atol=2e-5, rtol=2e-5)
 
 
 def test_parameter_count_tracks_the_rank_mask():
@@ -803,9 +954,8 @@ def test_reset_optimizer_state_only_clears_surgery_params():
     assert len(opt.state) == len(list(model.parameters()))
 
     dropped = reset_optimizer_state(opt, surgery_params(model))
-    assert dropped == 3
-    assert model.mu in opt.state and model.pi_logits in opt.state
-    assert model.dir_raw not in opt.state
+    assert dropped == 5
+    assert not opt.state
 
 
 def test_train_nll_runs_surgery_on_schedule_without_blowing_up():
@@ -853,6 +1003,7 @@ def test_train_nll_runs_half_epoch_surgery_twice(monkeypatch):
     def fake_surgery(model, loader, cfg, *, device=None, log=None):
         calls.append(sum(batch.shape[0] for batch in loader))
         return {
+            "n_updated": model.K,
             "d_k_hist": [0, model.K],
             "d_k_per_component": [1] * model.K,
         }
@@ -891,3 +1042,30 @@ def test_train_nll_without_surgery_is_unchanged():
     train_nll_hddc(b, batches, epochs=2, lr=1e-3, log_interval=1_000, surgery=None)
     for key in a.state_dict():
         assert torch.allclose(a.state_dict()[key], b.state_dict()[key])
+
+
+def test_all_skipped_surgery_preserves_optimizer_and_training_trajectory(tmp_path):
+    torch.manual_seed(27)
+    batches = [torch.randn(12, 4) for _ in range(4)]
+    a = MFA_HDDC(torch.randn(2, 4), rank=1, isotropic_psi=True)
+    b = MFA_HDDC(torch.zeros(2, 4), rank=1, isotropic_psi=True)
+    b.load_state_dict(a.state_dict())
+    for model, name, surgery in (
+        (a, "baseline", None),
+        (b, "skipped", SurgeryConfig(
+            enabled=True, every=0.5, min_count=1e9, warmup_steps=5,
+        )),
+    ):
+        train_nll_hddc(
+            model, batches, epochs=2, steps_per_epoch=4, track_best=False,
+            early_stop_delta=0.0, log_interval=10_000, surgery=surgery,
+            ckpt_path=str(tmp_path / f"{name}.pt"),
+        )
+    for key, value in a.state_dict().items():
+        assert torch.equal(value, b.state_dict()[key])
+    baseline = torch.load(tmp_path / "baseline.pt", weights_only=False)["optimizer"]
+    skipped = torch.load(tmp_path / "skipped.pt", weights_only=False)["optimizer"]
+    assert baseline["param_groups"] == skipped["param_groups"]
+    for param_id, state in baseline["state"].items():
+        for key, value in state.items():
+            assert torch.equal(value, skipped["state"][param_id][key])

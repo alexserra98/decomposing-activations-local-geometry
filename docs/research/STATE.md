@@ -1,7 +1,6 @@
-# Research State (updated 2026-09-03)
+# Research State (updated 2026-09-05)
 
-> **Kind:** Research state · **Status:** Current as of 2026-09-01 · **Use when:**
+> **Kind:** Research state · **Status:** Current as of 2026-09-05 · **Use when:**
 > Establishing the current research direction, findings, and immediate goals.
 
-Apparently the model was already able to model the full tangent plane it just required to play a little bit with surgery_threshold and surgery_min_count. The latter in particular seems to be very important although this seems a bit fishy. I have also refined the alignment metric so that it computes also if the tange plane is included in the span of first q PCs of the gaussians. This second score is much more stable across the hyperparameter sweep. 
-In order to chose the best model I have used modified BIC where I add a penalty for inactive components. The real reason is purely practical: the best model seems to keep more components alive, but it also intuitive in a sense given that if you manage to keep more components alive with the same NLL it means the model is correctly modelling the local geometry. This also requires to control the ratio size_dataset / K, but if you are confident that each gaussian is receiving enough points to model the geometry you should be ok.
+Ok apparently I have found a solution. I created 5 copies dataset with 10 manifolds varying noise ratio in this window [10000, 1000, 100, 10]. The lower the noisier. For 10000,1000,100 both kmeans and MFA are able to recover tangent space and tile the manifold. For 10 instead kmeans fails on very simple manifold, such a line, or the sphere, while MFA works decently. So I have a reason to justify MFA: it works better with noisy dataset. The best would be to have an other dataset where kmeas fails and MFA works.

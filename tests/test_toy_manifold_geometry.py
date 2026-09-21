@@ -42,6 +42,9 @@ def _ambient_point(
     [
         ("segment", [2.0], [1.0], 1, 1e-10),
         ("circle", [math.cos(0.7), math.sin(0.7)], None, 1, 1e-10),
+        ("cylinder", [3.0, 2.0, 4.0], [0.6, 2.0, 0.8], 2, 1e-10),
+        ("cylinder", [0.5, -2.0, 0.0], [1.0, 0.0, 0.0], 2, 1e-10),
+        ("cylinder", [0.0, 7.0, 2.0], [0.0, 5.0, 1.0], 2, 1e-10),
         ("flat_disk", [2.0, 0.0], [1.0, 0.0], 2, 1e-10),
         (
             "sphere",
@@ -85,6 +88,18 @@ def _ambient_point(
             1e-8,
         ),
         ("helix", [1.0, 0.0, 0.0], None, 1, 1e-8),
+        (
+            "helix_4d",
+            [
+                math.cos(0.37),
+                math.sin(0.37),
+                math.cos(0.74),
+                math.sin(0.74),
+            ],
+            None,
+            1,
+            1e-8,
+        ),
     ],
 )
 def test_raw_projection_and_tangent_geometry_for_every_manifold(
@@ -121,6 +136,7 @@ def test_raw_projection_and_tangent_geometry_for_every_manifold(
     ("type_name", "target"),
     [
         ("circle", [0.0, 0.0]),
+        ("cylinder", [0.0, 2.0, 0.0]),
         ("sphere", [0.0, 0.0, 0.0]),
         ("torus", [0.0, 0.0, 0.0]),
         ("torus", [2.0, 0.0, 0.0]),
@@ -301,7 +317,7 @@ def test_ambient_projection_uses_type_calibration_for_multiple_instances() -> No
             n_samples=16,
             calibration_size=64,
             manifolds_per_type=2,
-            manifold_types=("circle", "helix"),
+            manifold_types=("circle", "helix", "cylinder"),
             offset_radius=2.0,
             seed=5,
         )
@@ -309,6 +325,7 @@ def test_ambient_projection_uses_type_calibration_for_multiple_instances() -> No
     alpha = float(metadata["config"]["helix_alpha"])
     raw_points = {
         "circle": torch.tensor((1.0, 0.0), dtype=torch.float64),
+        "cylinder": torch.tensor((1.0, 2.5, 0.0), dtype=torch.float64),
         "helix": torch.tensor((math.cos(1.0), math.sin(1.0), alpha), dtype=torch.float64),
     }
 

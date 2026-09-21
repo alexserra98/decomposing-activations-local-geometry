@@ -9,9 +9,14 @@ import pytest
 import torch
 import yaml
 
-from dalg.data.manifold_dataset import ToyManifoldConfig, save_toy_manifold_shards
+from dalg.data.manifold_dataset import (
+    MANIFOLD_NAMES,
+    ToyManifoldConfig,
+    save_toy_manifold_shards,
+)
 from dalg.pipeline import (
     PipelineConfigError,
+    _evaluation_artifact_valid,
     _training_command,
     execute_run,
     pipeline_status,
@@ -103,6 +108,7 @@ def test_shared_centroids_are_validated_resolved_and_forwarded(tmp_path: Path) -
     resolved = str(centroids_path.resolve())
 
     assert run["training"]["arguments"]["centroids_path"] == resolved
+    assert "initialization" not in run
     assert run["identity"]["training_args"]["centroids_path"] == resolved
     command = _training_command(run)
     assert command[command.index("--centroids-path") + 1] == resolved
@@ -224,13 +230,14 @@ def test_cluster_pca_requires_principal_components(tmp_path: Path) -> None:
         resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
-def test_cluster_pca_requires_centroids_path(tmp_path: Path) -> None:
+def test_cluster_pca_plans_generated_centroids(tmp_path: Path) -> None:
     shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
     config = _config(tmp_path, shard_dir)
     config["training"]["direction_init"] = "cluster_pca"
 
-    with pytest.raises(PipelineConfigError, match="requires --centroids-path"):
-        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+    assert run["initialization"]["pca_rank"] == 1
+    assert not Path(run["training"]["arguments"]["centroids_path"]).exists()
 
 
 def test_cluster_pca_rejects_insufficient_stored_rank(tmp_path: Path) -> None:
@@ -299,6 +306,7 @@ def test_hddc_initial_model_is_validated_resolved_and_forwarded(tmp_path: Path) 
     resolved = str(initial_path.resolve())
 
     assert run["training"]["arguments"]["init_model_path"] == resolved
+    assert "initialization" not in run
     assert run["identity"]["training_args"]["init_model_path"] == resolved
     command = _training_command(run)
     assert command[command.index("--init-model-path") + 1] == resolved
@@ -520,6 +528,9 @@ def test_component_sharded_command_uses_torchrun(tmp_path: Path) -> None:
 def test_execute_run_skips_valid_completed_stages(tmp_path: Path, monkeypatch) -> None:
     shard_dir = build_multi_shard(tmp_path / "shards", n_shards=2, rows_per_shard=4)
     config = _config(tmp_path, shard_dir)
+    centroids_path = tmp_path / "centroids.pt"
+    torch.save(torch.zeros(2, 2), centroids_path)
+    config["training"]["centroids_path"] = str(centroids_path)
     path = _write_yaml(tmp_path / "experiment.yaml", config)
     run = resolve_experiment(path)[0]
     commands: list[list[str]] = []
@@ -717,7 +728,7 @@ def test_toy_manifold_tiling_evaluation_accepts_vanilla_mfa_config(
     assert run["training"]["model_kind"] == "mfa"
     assert run["evaluation"]["kind"] == "toy_manifold_tiling"
     assert run["evaluation"]["rank_threshold"] == 1.0
-    assert run["evaluation"]["max_mean_to_manifold_distance"] == 0.1
+    assert run["evaluation"]["max_mean_to_manifold_distance"] is None
 
 
 @pytest.mark.parametrize("distance", [0.0, -0.1, float("inf"), float("nan")])
@@ -782,15 +793,28 @@ def test_real_toy_manifold_tiling_pipeline_runs_end_to_end(tmp_path: Path) -> No
     run_dir = execute_run(run)
 
     metrics = json.loads((run_dir / "metrics.json").read_text())
-    assert metrics["schema_version"] == 1
+    assert metrics["schema_version"] == 2
     assert metrics["evaluation"] == "toy_manifold_tiling"
-    assert metrics["rank"]["threshold"] == 1.0
-    assert metrics["association"]["max_mean_to_manifold_distance"] == 0.1
+    for rank_name in ("rank", "ambient_rank"):
+        assert metrics[rank_name]["definition"] == "hddc_rank_mask_count"
+        assert "threshold" not in metrics[rank_name]
+        assert metrics[rank_name]["mean_learned"] == 2.0
+    assert metrics["association"] == {
+        "rule": "unique_nearest_exact_projection",
+        "max_mean_to_manifold_distance": None,
+        "associated_components": metrics["K"],
+        "outside_cutoff_components": 0,
+        "ambiguous_components": 0,
+    }
     assert metrics["identity_hash"] == run["identity_hash"]
     assert metrics["dataset"]["selected_rows"] == 96
     assert metrics["bic"]["n"] == metrics["dataset"]["train_rows"]
     assert metrics["bic"]["parameters"] > 0
-    assert metrics["bic"]["convention"] == "lower_is_better"
+    assert metrics["bic"]["convention"] == "higher_is_better"
+    assert metrics["bic"]["value"] == pytest.approx(
+        -metrics["bic"]["standard_bic"] / metrics["bic"]["n"]
+        + metrics["bic"]["active_components"]
+    )
     assert torch.isfinite(torch.tensor(metrics["bic"]["value"]))
     association_counts = sum(
         metrics["association"][key]
@@ -801,7 +825,7 @@ def test_real_toy_manifold_tiling_pipeline_runs_end_to_end(tmp_path: Path) -> No
         )
     )
     assert association_counts == metrics["K"]
-    assert len(metrics["per_manifold"]) == 10
+    assert len(metrics["per_manifold"]) == len(MANIFOLD_NAMES)
     assert sum(
         manifold["components"]["associated"]
         for manifold in metrics["per_manifold"]
@@ -812,7 +836,7 @@ def test_real_toy_manifold_tiling_pipeline_runs_end_to_end(tmp_path: Path) -> No
     )
     containment = metrics["tangent_containment"]
     assert containment["definition"] == (
-        "leading_effective_rank_covariance_subspace_principal_angles"
+        "leading_learned_rank_covariance_subspace_principal_angles"
     )
     for metric in (alignment, containment):
         for score_name in ("subspace_overlap", "worst_direction_cosine"):
@@ -824,3 +848,48 @@ def test_real_toy_manifold_tiling_pipeline_runs_end_to_end(tmp_path: Path) -> No
                 assert 0.0 <= summary["mean"] <= 1.0
     assert (run_dir / "EVALUATION_COMPLETED.json").is_file()
     assert pipeline_status([run])[0]["pipeline"] is True
+    assert _evaluation_artifact_valid(run)
+    for rank_name in ("rank", "ambient_rank"):
+        metrics[rank_name].pop("definition")
+        metrics[rank_name]["threshold"] = 1.0
+    (run_dir / "metrics.json").write_text(json.dumps(metrics))
+    assert not _evaluation_artifact_valid(run)
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "convention", "formula", "value", "expected"),
+    [
+        (2, "higher_is_better", "-standard_bic / n + active_components", 12.0, True),
+        (1, "lower_is_better", None, 12.0, False),
+        (1, "higher_is_better", "-standard_bic / n + active_components", 12.0, False),
+        (2, "lower_is_better", "-standard_bic / n + active_components", 12.0, False),
+        (2, "higher_is_better", None, 12.0, False),
+        (2, "higher_is_better", "-standard_bic / n + active_components", float("nan"), False),
+    ],
+)
+def test_evaluation_artifact_requires_augmented_bic(
+    tmp_path: Path,
+    schema_version: int,
+    convention: str,
+    formula: str | None,
+    value: float,
+    expected: bool,
+) -> None:
+    run = {
+        "run_dir": str(tmp_path),
+        "training": {"model_kind": "mfa"},
+        "evaluation": {"kind": "toy_manifold_tiling"},
+        "identity_hash": "test-run",
+    }
+    (tmp_path / "metrics.json").write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "evaluation": "toy_manifold_tiling",
+                "identity_hash": "test-run",
+                "bic": {"value": value, "formula": formula, "convention": convention},
+            }
+        )
+    )
+
+    assert _evaluation_artifact_valid(run) is expected

@@ -99,15 +99,16 @@ def validate_centroid_artifact(
 def save_centroid_artifact(
     path: str | Path,
     centroids: torch.Tensor,
-    principal_components: torch.Tensor,
+    principal_components: torch.Tensor | None,
 ) -> None:
-    """Atomically save an enriched centroid bundle on CPU."""
+    """Atomically save a centroid bundle with optional PCA directions on CPU."""
     path = Path(path)
     payload = {
         "format": CENTROID_ARTIFACT_FORMAT,
         "centroids": centroids.detach().cpu(),
-        "principal_components": principal_components.detach().cpu(),
     }
+    if principal_components is not None:
+        payload["principal_components"] = principal_components.detach().cpu()
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
     torch.save(payload, tmp)
     tmp.replace(path)

@@ -32,6 +32,8 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 
+from dalg.init.mixture_weights import initialize_mixture_weights
+
 
 # Dataset setup
 
@@ -58,6 +60,8 @@ def _resolve_activation_data(args, *, log) -> dict:
     extract_cfg = json.loads((shard_dir / "config.json").read_text())
     window = int(extract_cfg["window"])
     d_model = int(extract_cfg["d_model"])
+    if getattr(args, "fit_method", "adam") == "em" and not 1 <= args.rank < d_model:
+        raise SystemExit(f"EM requires 1 <= q_max < D={d_model}")
     drop_prefix = int(extract_cfg.get("drop_prefix", 32))
     per_row_tokens = window - drop_prefix
     if per_row_tokens <= 0:
@@ -470,6 +474,10 @@ def _write_run_config(
         "direction_init": args.direction_init,
         "init_model_path": args.init_model_path,
         "model": "MFA_HDDC",
+        "fit_method": args.fit_method,
+        "em_component_chunk_size": args.em_component_chunk_size,
+        "em_eig_batch_size": args.em_eig_batch_size,
+        "em_tol": args.em_tol,
         "isotropic_psi": bool(args.isotropic_psi),
         "shared_b": bool(args.shared_b),
         "surgery_every_epochs": args.surgery_every_epochs or 0,
@@ -491,6 +499,7 @@ def _maybe_init_wandb(args, data: dict, *, training_mode: str, world_size: int, 
     import wandb
 
     run_config = {
+        "fit_method": args.fit_method,
         "K": args.K,
         "rank": args.rank,
         "epochs": args.epochs,
@@ -580,6 +589,9 @@ def cmd_train_single_process(args):
     )
     steps_per_epoch = _limit_steps_per_epoch(steps_per_epoch, args, log=print)
     surgery_loader = _build_surgery_loader(data, args, device=args.device)
+    if args.fit_method == "em":
+        # Every EM pass visits the same complete training split, including tails.
+        train_loader = surgery_loader
     val_tensor = _build_val_tensor_for_main(
         data,
         args,
@@ -657,6 +669,39 @@ def cmd_train_single_process(args):
     model = model.to(args.device)
 
     ckpt_path = out_dir / "checkpoint.pt"
+    if ckpt_path.exists():
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        saved_method = checkpoint.get("fit_method", "adam")
+        del checkpoint
+        if saved_method != args.fit_method:
+            raise SystemExit("checkpoint fit method differs; start a new run with --init-model-path mfa_model.pt")
+    if args.fit_method == "em":
+        from dalg.models.adaptive_q.train_em_hddc import EMConfig, train_em_hddc
+
+        _write_run_config(data, out_dir, args=args, training_mode="single_process", world_size=1)
+        try:
+            train_em_hddc(
+                model, train_loader,
+                cfg=EMConfig(
+                    threshold=args.surgery_threshold,
+                    component_chunk_size=args.em_component_chunk_size,
+                    eig_batch_size=args.em_eig_batch_size,
+                    tol=args.em_tol,
+                ),
+                epochs=args.epochs, initialize=initial_model is None,
+                expected_rows=data["n_train_tokens"], val_tensor=val_tensor,
+                batch_size=args.batch_size, out_dir=out_dir,
+                early_stop_patience=args.early_stop_patience,
+                early_stop_min_delta=args.early_stop_min_delta,
+                epoch_snapshot_every=args.epoch_snapshot_every,
+            )
+        finally:
+            _finish_wandb(wandb_run)
+        return
+    if initial_model is None and not ckpt_path.exists():
+        initialize_mixture_weights(
+            model, centroids, train_loader, n_train_tokens=data["n_train_tokens"],
+        )
     if initial_model is not None and not ckpt_path.exists():
         initial_metric = seed_training_checkpoint(
             model,
@@ -797,6 +842,10 @@ def cmd_train_component_shard(args):
         init_directions=init_directions,
         isotropic_psi=bool(args.isotropic_psi),
     ).to(device)
+    if not (out_dir / "checkpoint_rank0000.pt").exists():
+        initialize_mixture_weights(
+            model, centroids, base_loader, n_train_tokens=data["n_train_tokens"],
+        )
     log(
         f"Component sharding: rank {rank}/{world_size} owns "
         f"[{model.component_start}, {model.component_end})"
@@ -930,6 +979,27 @@ def validate_args(args) -> None:
         raise SystemExit("train: --layer is required")
 
     mode = args.training_mode
+    if args.fit_method == "em":
+        from dalg.models.adaptive_q.train_em_hddc import EMConfig
+
+        if mode != "single_process" or not args.shared_b:
+            raise SystemExit("EM requires --training-mode single_process --shared-b")
+        if torch.device(args.device).type not in {"cpu", "cuda"}:
+            raise SystemExit("EM float64 computations require --device cpu or cuda")
+        if args.epochs <= 0:
+            raise SystemExit("EM requires a positive --epochs iteration limit")
+        if args.surgery_every_epochs or args.surgery_min_count or args.surgery_warmup_steps:
+            raise SystemExit("EM updates every component each iteration; surgery cadence, cutoff and warmup must be zero")
+        if args.steps_per_epoch is not None or args.max_steps is not None:
+            raise SystemExit("EM requires full passes; use --epochs rather than step or batch limits")
+        if args.compile or args.grad_clip is not None or args.lr != 1e-3:
+            raise SystemExit("EM does not use --compile, --grad-clip or --lr overrides")
+        if args.direction_init != "random":
+            raise SystemExit("EM initializes directions from the full KMeans partition; omit --direction-init")
+        try:
+            EMConfig(args.surgery_threshold, args.em_component_chunk_size, args.em_eig_batch_size, args.em_tol).validate()
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
     if args.shared_b and args.isotropic_psi:
         raise SystemExit(
             "train: --shared-b and --isotropic-psi select different noise modes; "
@@ -1010,8 +1080,13 @@ def validate_args(args) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Train MFA with periodic HDDC covariance surgery on activation shards"
+        description="Train HDDC with Adam/covariance surgery or streamed full-data EM"
     )
+    p.add_argument("--fit-method", choices=["adam", "em"], default="adam")
+    p.add_argument("--em-component-chunk-size", type=int, default=32)
+    p.add_argument("--em-eig-batch-size", type=int, default=128)
+    p.add_argument("--em-tol", type=float, default=1e-5,
+                   help="Relative train-NLL tolerance; EM stops after three stable-rank iterations. 0 disables it.")
     p.add_argument("--device", default="cuda", help="Device (cuda/cpu/mps)")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=128)

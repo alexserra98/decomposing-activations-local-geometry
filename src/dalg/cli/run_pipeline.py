@@ -48,7 +48,7 @@ def cmd_status(args) -> None:
         state = "complete" if row["pipeline"] else "incomplete"
         print(
             f"{row['run_id']}: {state} "
-            f"(train={row['training']} assignments={row['assignments']} "
+            f"(init={row['initialization']} train={row['training']} assignments={row['assignments']} "
             f"evaluation={row['evaluation']})"
         )
     complete = sum(int(row["pipeline"]) for row in statuses)

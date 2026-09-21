@@ -1,7 +1,7 @@
 """Periodic HDDC-style covariance surgery for MFA, giving adaptive per-component rank.
 
 SGD training of `train_nll` is left untouched. Every `T` epochs this module
-applies the closed-form covariance update of either the HDDC model
+applies the closed-form mean, mixture-weight, and covariance updates of the HDDC model
 `[a_ij b_i Q_i d_i]` or its single-process shared-noise variant
 `[a_ij b Q_i d_i]` (Bouveyron, Girard & Schmid, arXiv:math/0604064). It
 re-estimates each component's covariance with an adaptive rank
@@ -9,19 +9,16 @@ re-estimates each component's covariance with an adaptive rank
 the columns beyond `d_k` are hard-masked by `MFA.rank_mask`, so they contribute
 nothing to the likelihood and receive no gradient.
 
-Surgery touches covariances only — `dir_raw`, `scale_rho`, `psi_rho`,
-`rank_mask`. `mu` and `pi_logits` stay whatever SGD has made them.
+Surgery updates components with positive soft mass at least `min_count`.
+Skipped means and mixture weights are preserved; eligible components share
+their old total mixture mass in proportion to their effective counts.
 
 Three phases:
 
-A. One E-pass over the train loader accumulating, in float64, the
-   responsibility-weighted second moment of each component about its *current*
-   model mean `mu_k`. Centering on `mu_k` rather than on the empirical
-   responsibility-weighted mean is deliberate: `mu_k` is retained, so this is
-   the ML covariance given the fixed mean — the coherent partial M-step. Pairing
-   a covariance centered at `mu_hat_k` with a retained `mu_k` would leak the
-   mean shift into the eigen-spectrum and inflate the apparent rank whenever the
-   SGD means lag the data.
+A. One E-pass over the train loader accumulating float64 counts, residual sums,
+   and scatter about the current model means. Responsibilities stay fixed for
+   the entire pass. The residual sums give the new weighted means and the
+   correction needed to center each covariance on its new mean.
 
 B. Per component: `eigh(S_k)`, a scale-free Cattell scree test on consecutive
    eigenvalue differences to propose `d_k`, and the HDDC noise level. The
@@ -69,6 +66,7 @@ class SurgeryConfig:
     psi_floor: float = 1e-6      # requested b floor; model._eps may impose a higher one
     eps: float = 1e-12           # clamp inside sqrt(lam_j - b_k)
     max_batches: Optional[int] = None  # cap the E-pass length (debug/smoke)
+    eig_batch_size: Optional[int] = None  # bound eigensolver workspace for EM
 
     def n_min(self) -> float:
         """Return the literal effective-membership cutoff used by surgery.
@@ -136,13 +134,13 @@ class SurgeryConfig:
 
 def surgery_params(model) -> List[torch.nn.Parameter]:
     """The parameters surgery rewrites, i.e. the ones whose Adam state is stale."""
-    return [model.dir_raw, model.scale_rho, model.psi_rho]
+    return [model.mu, model.pi_logits, model.dir_raw, model.scale_rho, model.psi_rho]
 
 
 def reset_optimizer_state(optimizer, params) -> int:
     """Drop `exp_avg`/`exp_avg_sq`/`step` for `params`; Adam re-initializes lazily.
 
-    State for parameters not listed (`mu`, `pi_logits`) is preserved.
+    State for parameters not listed is preserved.
     """
     dropped = 0
     for p in params:
@@ -179,10 +177,11 @@ def accumulate_statistics(
     max_batches: Optional[int] = None,
     chunk_elems: int = 1 << 23,
 ):
-    """One E-pass: returns `(N_k, S_acc_k, n_rows)` in float64.
+    """One E-pass: returns `(N_k, residual_sum, scatter, n_rows)`.
 
-    `N_k = sum_n r_nk` and `S_acc_k = sum_n r_nk (x_n - mu_k)(x_n - mu_k)^T`,
-    both for this rank's local components. The `(K, D, D)` accumulator is 65 KB
+    The float64 moments are `N_k = sum_n r_nk`, `A_k = sum_n r_nk (x_n - mu_k)`,
+    and `B_k = sum_n r_nk (x_n - mu_k)(x_n - mu_k)^T`, for the current model
+    means and this rank's local components. The `(K, D, D)` accumulator is 128 KiB
     per component at D=128; the large-D path (trace accumulation plus a
     randomized sketch for the top q_max+1 eigenpairs) is deliberately not
     implemented yet.
@@ -195,6 +194,7 @@ def accumulate_statistics(
     model.eval()
     K, D = model.K, model.D
     N = torch.zeros(K, dtype=torch.float64, device=device)
+    A = torch.zeros(K, D, dtype=torch.float64, device=device)
     S = torch.zeros(K, D, D, dtype=torch.float64, device=device)
     mu = model.mu.detach().to(torch.float64)
     n_rows = 0
@@ -215,12 +215,15 @@ def accumulate_statistics(
         for s in range(0, x64.shape[0], rows_per_chunk):
             xc = x64[s:s + rows_per_chunk, None, :] - mu[None, :, :]   # (b, K, D)
             rxc = r[s:s + rows_per_chunk, :, None] * xc                # (b, K, D)
+            A += rxc.sum(dim=0)
             S += torch.einsum("bkd,bke->kde", rxc, xc)
         n_rows += x.shape[0]
 
     if was_training:
         model.train()
-    return N, S, n_rows
+    if n_rows == 0:
+        raise ValueError("HDDC surgery requires a non-empty E-pass")
+    return N, A, S, n_rows
 
 
 # Phase B — rank selection and reconstruction
@@ -280,7 +283,7 @@ def _solve_shared_b_active_set(
     the model to admit rank-zero spherical components.
 
     This is a feasibility/profile update conditional on the current
-    responsibilities, fixed means, eligible components, and Cattell rank caps;
+    responsibilities, updated means, eligible components, and Cattell rank caps;
     it is not a new intrinsic-dimension criterion and does not replace model
     selection over the Cattell threshold. A later surgery recomputes the caps
     from scratch, so a direction removed here may be restored later.
@@ -401,14 +404,11 @@ def _solve_shared_b_active_set(
 
 
 @torch.no_grad()
-def reconstruct_components(model, N, S_acc, cfg: SurgeryConfig) -> Dict[str, Any]:
-    """Rewrite each eligible component's covariance from its scatter matrix.
+def _component_proposal(model, N, residual_sum, S_acc, cfg: SurgeryConfig):
+    """Prepare eligible means and covariance parameters without mutating the model.
 
-    Components with `N_k < n_min` keep their loading parameters and mask. Setting
-    `n_min = 0` disables that cutoff and makes every component eligible, including
-    components with no hard assignments but positive soft responsibility mass.
-    An exactly zero `N_k` cannot define `S_k / N_k` and raises explicitly instead
-    of being silently skipped. In shared-b mode skipped components' covariance
+    Components with `N_k < n_min` or `N_k == 0` keep their parameters and mask.
+    In shared-b mode skipped components' covariance
     floor still changes when eligible components produce a new global b. For
     eligible shared-b components, the Cattell ranks are upper bounds:
     `_solve_shared_b_active_set` may lower them to make the final rank mask
@@ -432,7 +432,7 @@ def reconstruct_components(model, N, S_acc, cfg: SurgeryConfig) -> Dict[str, Any
     b_k = torch.full((K,), float("nan"), dtype=torch.float64, device=device)
     shared_b = bool(getattr(model, "shared_b", False))
 
-    eligible = (N >= n_min) & torch.isfinite(N)
+    eligible = (N > 0) & (N >= n_min)
     idx = eligible.nonzero(as_tuple=True)[0]
     if idx.numel() == 0:
         return {
@@ -442,25 +442,29 @@ def reconstruct_components(model, N, S_acc, cfg: SurgeryConfig) -> Dict[str, Any
             "n_shared_b_pruned_components": 0,
             "n_shared_b_pruned_directions": 0,
             "n_updated": 0, "n_skipped": int(K), "N_k": N,
-        }
+        }, {}
 
-    zero_support = idx[N[idx] <= 0.0]
-    if zero_support.numel():
-        component = int(zero_support[0].item())
-        raise RuntimeError(
-            "HDDC surgery cannot estimate a covariance for an eligible "
-            f"component with non-positive effective membership: component={component}, "
-            f"N_k={float(N[component]):.8g}. Set surgery_min_count above zero "
-            "to skip unsupported components."
-        )
-
-    S = S_acc[idx] / N[idx][:, None, None]                 # (n, D, D)
+    shift = residual_sum[idx] / N[idx, None]
+    mu_new = (model.mu[idx].to(torch.float64) + shift).to(model.mu.dtype)
+    # Center on the weighted mean, removing the old mean's displacement.
+    S = S_acc[idx] / N[idx, None, None] - shift[:, :, None] * shift[:, None, :]
     S = 0.5 * (S + S.transpose(-1, -2))                    # symmetrize fp noise
     trace = torch.diagonal(S, dim1=-2, dim2=-1).sum(-1)    # (n,)
 
-    lam_asc, Q_asc = torch.linalg.eigh(S)                  # ascending
-    lam = lam_asc.flip(-1)                                 # (n, D) descending
-    Q = Q_asc.flip(-1)                                     # (n, D, D) matching columns
+    if cfg.eig_batch_size is None:
+        lam_asc, Q_asc = torch.linalg.eigh(S)
+        lam = lam_asc.flip(-1)
+        Q = Q_asc.flip(-1)
+    else:
+        if cfg.eig_batch_size <= 0:
+            raise ValueError("eig_batch_size must be positive")
+        lam = S.new_empty(S.shape[0], D)
+        Q = S.new_empty(S.shape[0], D, q)
+        for start in range(0, S.shape[0], cfg.eig_batch_size):
+            stop = min(start + cfg.eig_batch_size, S.shape[0])
+            values, vectors = torch.linalg.eigh(S[start:stop])
+            lam[start:stop] = values.flip(-1)
+            Q[start:stop] = vectors[:, :, -q:].flip(-1)
 
     # Cattell scree test on consecutive differences, normalized by lam_1 so the
     # threshold is scale-free: d_k = max{ j <= q_max : (lam_j - lam_j+1)/lam_1 > t }.
@@ -543,13 +547,13 @@ def reconstruct_components(model, N, S_acc, cfg: SurgeryConfig) -> Dict[str, Any
     # d_k, so a later surgery can raise the rank with no revival logic.
     scale = (lam[:, :q] - b[:, None]).clamp_min(float(cfg.eps)).sqrt()
 
-    model.dir_raw.data[idx] = Q[:, :, :q].to(dtype)
-    model.scale_rho.data[idx] = _softplus_inverse(scale).to(dtype)
-    if shared_b:
-        model.psi_rho.data.copy_(psi_rho_new.reshape_as(model.psi_rho))
-    else:
-        model.psi_rho.data[idx] = psi_rho_new[:, None]
-    model.rank_mask.data[idx] = (j <= d_sel[:, None]).to(model.rank_mask.dtype)
+    proposal = {
+        "mu": mu_new,
+        "dir_raw": Q[:, :, :q].to(dtype),
+        "scale_rho": _softplus_inverse(scale).to(dtype),
+        "psi_rho": psi_rho_new,
+        "rank_mask": (j <= d_sel[:, None]).to(model.rank_mask.dtype),
+    }
 
     d_k = d_k.clone()
     d_k[idx] = d_sel
@@ -566,7 +570,69 @@ def reconstruct_components(model, N, S_acc, cfg: SurgeryConfig) -> Dict[str, Any
         "n_updated": int(idx.numel()),
         "n_skipped": int(K - idx.numel()),
         "N_k": N,
-    }
+    }, proposal
+
+
+def _check_surgery_error(model, error: Optional[Exception]) -> None:
+    """Make all component shards reject an invalid proposal before any commit."""
+    failed = torch.tensor(int(error is not None), device=model.mu.device)
+    if isinstance(model, ComponentShardedMFA_HDDC) and dist.is_initialized():
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+    if error is not None:
+        raise error
+    if bool(failed):
+        raise RuntimeError("HDDC surgery proposal failed on another component shard")
+
+
+@torch.no_grad()
+def reconstruct_components(model, N, residual_sum, S_acc, cfg: SurgeryConfig) -> Dict[str, Any]:
+    """Commit the gated M-step from frozen counts, residual sums, and scatter.
+
+    Positive counts at least `min_count` select means, weights, and covariances
+    together. Skipped mixture probabilities stay fixed; eligible probabilities
+    divide their previous total mass in proportion to N. Zero counts are always
+    skipped. All component shards validate before any rank writes parameters.
+    """
+    error = None
+    try:
+        n_min = cfg.n_min()
+        if (N.shape != (model.K,) or residual_sum.shape != model.mu.shape
+                or S_acc.shape != (model.K, model.D, model.D)):
+            raise ValueError("HDDC surgery statistics have incompatible shapes")
+        if (not torch.isfinite(N).all() or bool((N < 0).any())
+                or not torch.isfinite(residual_sum).all()
+                or not torch.isfinite(S_acc).all()):
+            raise ValueError("HDDC surgery requires finite moments and finite non-negative counts")
+    except ValueError as exc:
+        error = exc
+    _check_surgery_error(model, error)
+
+    eligible = (N > 0) & (N >= n_min)
+    logits = model._propose_mixture_logits(N, eligible)
+    error = None
+    try:
+        stats, proposal = _component_proposal(model, N, residual_sum, S_acc, cfg)
+        if not torch.isfinite(logits).all() or any(
+            not torch.isfinite(value).all() for value in proposal.values()
+        ):
+            raise ValueError("HDDC surgery produced non-finite model parameters")
+    except (ValueError, RuntimeError) as exc:
+        error = exc
+    _check_surgery_error(model, error)
+
+    if stats["n_updated"]:
+        idx = eligible.nonzero(as_tuple=True)[0]
+        model.mu[idx] = proposal["mu"]
+        model.pi_logits.copy_(logits)
+        model.dir_raw[idx] = proposal["dir_raw"]
+        model.scale_rho[idx] = proposal["scale_rho"]
+        if getattr(model, "shared_b", False):
+            model.psi_rho.copy_(proposal["psi_rho"].reshape_as(model.psi_rho))
+        else:
+            model.psi_rho[idx] = proposal["psi_rho"][:, None]
+        model.rank_mask[idx] = proposal["rank_mask"]
+        model._inference_cache = None
+    return stats
 
 
 # Reporting
@@ -658,10 +724,10 @@ def hddc_surgery(model, loader, cfg: SurgeryConfig, *, device=None, log=None) ->
         )
     device = device if device is not None else model.mu.device
 
-    N, S_acc, n_rows = accumulate_statistics(
+    N, residual_sum, S_acc, n_rows = accumulate_statistics(
         model, loader, device=device, max_batches=cfg.max_batches
     )
-    stats = reconstruct_components(model, N, S_acc, cfg)
+    stats = reconstruct_components(model, N, residual_sum, S_acc, cfg)
     summary = _summarize(stats, model.q, device)
     summary["n_rows"] = n_rows
     summary["threshold"] = float(cfg.threshold)
