@@ -28,6 +28,9 @@ relevant to it.
 
 ## I want to run or inspect training
 
+- [Orfeo cluster operations](workflows/orfeo-cluster.md) defines the mandatory
+  login-node boundary, Slurm resource and GPU rules, validation sequence,
+  production authorization, monitoring, and recovery procedure.
 - [YAML training pipeline](workflows/training-pipeline.md) is the operational
   guide for planning, submitting, resuming, and inspecting pipeline runs.
 - [Training pipeline YAML reference](reference/training-pipeline-config.md)
@@ -43,6 +46,9 @@ reorganize this documentation collection.
 - [Toy-manifold tiling evaluation](evaluation/toy-manifold-tiling.md) defines
   association, rank-recovery, tangent-alignment, tangent-containment, and
   output-schema contracts.
+- [Held-out distribution coverage](evaluation/heldout-distribution-coverage.md)
+  defines train/validation/test isolation and point-to-nearest-live-centroid
+  coverage when the continuous manifold is unavailable.
 
 ## I want context for an experiment
 
@@ -64,6 +70,9 @@ scope.
   synthetic sweep and related analysis.
 - [Wikipedia KMedoids slice](experiments/wikipedia-kmedoids.md) describes the
   temporary sliced-activation KMedoids workflow and verified artifacts.
+- [Toy held-out coverage](experiments/toy-heldout-coverage.md) defines the
+  strict D=128 noiseless pilot and its fixed train/validation/test artifacts,
+  with paired noisy spheres retained as a low-dimensional visual control.
 
 ## Document roles
 

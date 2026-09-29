@@ -3,6 +3,33 @@
 This file gives future agents the minimum context needed to work effectively in
 this repository.
 
+## Mandatory Orfeo Safety Rules
+
+This repository is commonly opened directly on the AREA Science Park Orfeo
+login nodes. **Before running any command that executes project code, first
+check `hostname` and whether `SLURM_JOB_ID` is set.**
+
+When the host is an Orfeo login node and there is no active Slurm allocation:
+
+- never run Python, `pytest`, notebooks, project CLIs, model code, data
+  processing, large-file scans or hashes, builds, package installation, or any
+  other scientific or resource-intensive workload;
+- use the node only for lightweight text/file inspection, small edits, Git
+  synchronization, Slurm submission and scheduler/accounting inspection;
+- run every test, smoke test, validation, experiment, and other meaningful
+  computation through `sbatch` or inside an interactive `srun` allocation;
+- if there is any doubt about whether a command is safe for the login node,
+  submit it through Slurm.
+
+Before any Orfeo execution or submission, read
+[`docs/workflows/orfeo-cluster.md`](docs/workflows/orfeo-cluster.md). It is the
+canonical policy for project discovery, resource selection, typed GPU requests,
+environment validation, production authorization, monitoring, reproducibility,
+output protection, and failure recovery. In particular, do not submit a
+production job without the user's explicit authorization after presenting the
+exact plan. These rules override convenience instructions elsewhere in this
+repository.
+
 ## Project Goal
 
 This is a machine learning research codebase for **"From Directions to Regions:
@@ -274,7 +301,9 @@ user places that experiment in scope:
 ## Cluster and Scratch Notes
 
 The user usually works on a Slurm cluster and often debugs via VS Code remote or
-tunneling.
+tunneling. The mandatory operating policy is
+[`docs/workflows/orfeo-cluster.md`](docs/workflows/orfeo-cluster.md); read it
+before executing or submitting cluster work.
 
 Common locations:
 
@@ -301,6 +330,11 @@ may still appear in scripts or logs. Check symlink targets before assuming data
 is missing.
 
 ## Local Development
+
+The commands in this section are for a non-Orfeo development machine or an
+allocated Orfeo compute node only. They must never be run on an Orfeo login
+node. On Orfeo, submit even targeted tests through Slurm or first obtain an
+interactive `srun` allocation as described in the cluster workflow.
 
 The repo commonly uses `.venv` or `uv run`.
 
