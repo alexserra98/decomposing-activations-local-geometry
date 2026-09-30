@@ -32,6 +32,10 @@ from dalg.init.centroid_artifact import (
     validate_centroid_artifact,
 )
 from dalg.init.mixture_weights import initialize_mixture_weights
+from dalg.init.neighborhood_pca import (
+    compute_neighborhood_pca,
+    nearest_neighbor_indices,
+)
 from dalg.init.projected_knn import KMeansTorch
 from dalg.models.mfa import MFA, load_mfa, save_mfa
 from dalg.models.train import train_nll
@@ -125,6 +129,16 @@ def _coverage_input_fingerprints(args: argparse.Namespace) -> dict[str, str]:
 
 def _geometry_input_fingerprints(args: argparse.Namespace) -> dict[str, str]:
     fingerprints = _coverage_input_fingerprints(args)
+    kmeans_config = json.loads(
+        (args.output_dir / "kmeans_pca" / "config.json").read_text()
+    )
+    if kmeans_config.get("pca") == "nearest_neighbor_covariance":
+        neighborhood_path = args.output_dir / "kmeans_pca" / "pca_neighborhood.pt"
+        if not neighborhood_path.exists():
+            raise FileNotFoundError(
+                f"KNN PCA neighborhood artifact is missing: {neighborhood_path}"
+            )
+        fingerprints["kmeans_pca_neighborhood"] = _file_sha256(neighborhood_path)
     metadata_path = args.shard_dir / "manifold_metadata.pt"
     if not metadata_path.exists():
         raise FileNotFoundError(
@@ -137,6 +151,22 @@ def _source_ambient_dim(args: argparse.Namespace) -> int:
     return int(json.loads((args.shard_dir / "config.json").read_text())["d_model"])
 
 
+def _source_condition(source_config: dict[str, Any]) -> str:
+    noise_ratio = source_config["generator_config"].get("noise_ratio")
+    if noise_ratio is None:
+        return "noiseless"
+    return f"noise_ratio_{float(noise_ratio):g}"
+
+
+def _condition_label(condition: str) -> str:
+    if condition == "noiseless":
+        return "Noiseless"
+    prefix = "noise_ratio_"
+    if condition.startswith(prefix):
+        return f"Noise η={condition.removeprefix(prefix)}"
+    raise ValueError(f"unsupported dataset condition: {condition}")
+
+
 def _resolved_config(args: argparse.Namespace, source_config: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -147,7 +177,7 @@ def _resolved_config(args: argparse.Namespace, source_config: dict[str, Any]) ->
             "layer": args.layer,
             "rows": int(source_config["num_rows"]),
             "ambient_dim": int(source_config["d_model"]),
-            "condition": "noiseless",
+            "condition": _source_condition(source_config),
         },
         "split": {
             "train_fraction": args.train_fraction,
@@ -163,7 +193,16 @@ def _resolved_config(args: argparse.Namespace, source_config: dict[str, Any]) ->
             "iterations": args.kmeans_iterations,
             "restarts": args.kmeans_restarts,
             "tolerance": args.kmeans_tolerance,
-            "pca": "hard_training_assignment_cluster_covariance",
+            "pca": (
+                "hard_training_assignment_cluster_covariance"
+                if args.pca_method == "cluster"
+                else "nearest_neighbor_covariance"
+            ),
+            **(
+                {"pca_neighbors": args.pca_neighbors}
+                if args.pca_method == "knn"
+                else {}
+            ),
         },
         "mfa": {
             "epochs": args.epochs,
@@ -334,18 +373,12 @@ def _kmeans_pca_variances(
     directions: torch.Tensor,
     assignments: torch.Tensor,
 ) -> torch.Tensor:
-    """Recover the omitted local PCA spectrum from the fixed training partition."""
+    """Recover the omitted local PCA spectrum from its initialization population."""
     points = _materialize_points(args, split["train"])
     assignments = assignments.detach().cpu().long()
     if assignments.numel() != points.shape[0]:
         raise ValueError("KMeans assignments do not align with training points")
 
-    counts = torch.bincount(assignments, minlength=centroids.shape[0])
-    if torch.any(counts <= directions.shape[2]):
-        raise ValueError("KMeans clusters are too small for the stored PCA rank")
-    order = assignments.argsort(stable=True)
-    ordered_points = points[order]
-    offsets = torch.cat((torch.zeros(1, dtype=torch.long), counts.cumsum(dim=0)))
     variances = torch.empty(
         centroids.shape[0],
         directions.shape[2],
@@ -353,12 +386,45 @@ def _kmeans_pca_variances(
     )
     centers = centroids.detach().cpu().double()
     principal = directions.detach().cpu().double()
-    for component_id in range(centroids.shape[0]):
-        start = int(offsets[component_id])
-        stop = int(offsets[component_id + 1])
-        residual = ordered_points[start:stop].double() - centers[component_id]
-        projected = residual @ principal[component_id]
-        variances[component_id] = projected.square().mean(dim=0)
+    if args.pca_method == "cluster":
+        counts = torch.bincount(assignments, minlength=centroids.shape[0])
+        if torch.any(counts <= directions.shape[2]):
+            raise ValueError("KMeans clusters are too small for the stored PCA rank")
+        order = assignments.argsort(stable=True)
+        ordered_points = points[order]
+        offsets = torch.cat((torch.zeros(1, dtype=torch.long), counts.cumsum(dim=0)))
+        for component_id in range(centroids.shape[0]):
+            start = int(offsets[component_id])
+            stop = int(offsets[component_id + 1])
+            residual = ordered_points[start:stop].double() - centers[component_id]
+            projected = residual @ principal[component_id]
+            variances[component_id] = projected.square().mean(dim=0)
+    else:
+        neighborhood = torch.load(
+            args.output_dir / "kmeans_pca" / "pca_neighborhood.pt",
+            map_location="cpu",
+            weights_only=True,
+        )
+        if neighborhood["split_fingerprint"] != split["fingerprint"]:
+            raise ValueError("KNN PCA neighborhood split fingerprint mismatch")
+        neighbor_indices = neighborhood["neighbor_indices"].long()
+        expected_shape = (centroids.shape[0], args.pca_neighbors)
+        if tuple(neighbor_indices.shape) != expected_shape:
+            raise ValueError(
+                "KNN PCA neighborhood shape mismatch: "
+                f"{tuple(neighbor_indices.shape)} != {expected_shape}"
+            )
+        if torch.any(neighbor_indices < 0) or torch.any(
+            neighbor_indices >= points.shape[0]
+        ):
+            raise ValueError("KNN PCA neighborhood indices are out of range")
+        for component_id in range(centroids.shape[0]):
+            residual = (
+                points[neighbor_indices[component_id]].double()
+                - centers[component_id]
+            )
+            projected = residual @ principal[component_id]
+            variances[component_id] = projected.square().mean(dim=0)
     return variances
 
 
@@ -394,6 +460,22 @@ def _load_kmeans_stage(
     directory = args.output_dir / "kmeans_pca"
     if not (directory / "COMPLETED.json").exists():
         raise FileNotFoundError(f"KMeans stage is not complete: {directory}")
+    config = json.loads((directory / "config.json").read_text())
+    expected_pca = (
+        "hard_training_assignment_cluster_covariance"
+        if args.pca_method == "cluster"
+        else "nearest_neighbor_covariance"
+    )
+    recorded_pca = config.get("pca", "hard_training_assignment_cluster_covariance")
+    if recorded_pca != expected_pca:
+        raise ValueError(
+            f"KMeans PCA method mismatch: stored {recorded_pca}, expected {expected_pca}"
+        )
+    if args.pca_method == "knn":
+        if config.get("pca_neighbors") != args.pca_neighbors:
+            raise ValueError("KMeans KNN PCA neighbor count mismatch")
+        if not (directory / "pca_neighborhood.pt").exists():
+            raise FileNotFoundError("KMeans KNN PCA neighborhood artifact is missing")
     centroids, directions = load_centroid_artifact(
         directory / "centroids.pt", map_location="cpu"
     )
@@ -451,14 +533,33 @@ def _fit_kmeans_pca(
     centroids_device = kmeans.fit(points_device)
     assignments_device = kmeans._assign_streamed(points_device, centroids_device)
     cluster_sizes = torch.bincount(assignments_device, minlength=args.K).cpu()
-    directions = compute_cluster_pca_directions(
-        points_device,
-        assignments_device,
-        centroids_device,
-        rank=args.rank,
-        chunk_elems=args.pca_chunk_elements,
-        eig_batch_size=args.pca_eig_batch_size,
-    ).float().cpu()
+    neighbor_indices = None
+    neighbor_distances = None
+    if args.pca_method == "cluster":
+        directions = compute_cluster_pca_directions(
+            points_device,
+            assignments_device,
+            centroids_device,
+            rank=args.rank,
+            chunk_elems=args.pca_chunk_elements,
+            eig_batch_size=args.pca_eig_batch_size,
+        ).float().cpu()
+    else:
+        neighbor_indices, neighbor_distances = nearest_neighbor_indices(
+            points_device,
+            centroids_device,
+            neighbors=args.pca_neighbors,
+            device=device,
+            point_block_size=args.distance_batch_size,
+        )
+        directions = compute_neighborhood_pca(
+            points_device,
+            centroids_device,
+            neighbor_indices,
+            rank=args.rank,
+            device=device,
+            eig_batch_size=args.pca_eig_batch_size,
+        ).float().cpu()
     centroids = centroids_device.float().cpu()
     assignments = assignments_device.cpu()
     save_centroid_artifact(temporary / "centroids.pt", centroids, directions)
@@ -472,12 +573,32 @@ def _fit_kmeans_pca(
         },
         temporary / "train_assignments.pt",
     )
+    if neighbor_indices is not None and neighbor_distances is not None:
+        torch.save(
+            {
+                "neighbor_indices": neighbor_indices,
+                "squared_distances": neighbor_distances,
+                "neighbors_per_centroid": args.pca_neighbors,
+                "split_fingerprint": split["fingerprint"],
+                "population": "train",
+                "selection": "nearest_euclidean_points_per_centroid",
+            },
+            temporary / "pca_neighborhood.pt",
+        )
     _write_json(
         temporary / "config.json",
         {
             "K": args.K,
             "ambient_dim": int(points.shape[1]),
             "rank": args.rank,
+            "pca": (
+                "hard_training_assignment_cluster_covariance"
+                if args.pca_method == "cluster"
+                else "nearest_neighbor_covariance"
+            ),
+            "pca_neighbors": (
+                args.pca_neighbors if args.pca_method == "knn" else None
+            ),
             "train_rows": int(points.shape[0]),
             "split_fingerprint": split["fingerprint"],
             "inertia": float(kmeans.inertia_),
@@ -632,7 +753,12 @@ def _fit_mfa(
     return model.cpu().eval(), assignments, cluster_sizes
 
 
-def _write_coverage_plot(path: Path, metrics: dict[str, Any]) -> None:
+def _write_coverage_plot(
+    path: Path,
+    metrics: dict[str, Any],
+    *,
+    condition: str,
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -653,6 +779,10 @@ def _write_coverage_plot(path: Path, metrics: dict[str, Any]) -> None:
     axis.set_ylim(0.0, 1.01)
     axis.grid(alpha=0.25)
     axis.legend()
+    axis.set_title(
+        f"{_condition_label(condition)}, D={metrics['ambient_dim']}: "
+        "held-out coverage"
+    )
     figure.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(path, dpi=180)
@@ -673,6 +803,7 @@ def _write_embedding_plot(
     mfa_live: torch.Tensor,
     mfa_distances: torch.Tensor,
     metrics: dict[str, Any],
+    condition: str,
     device: str,
 ) -> None:
     import matplotlib
@@ -754,16 +885,23 @@ def _write_embedding_plot(
             label="ambient distance to nearest live centroid (clipped at larger r99)",
         )
     figure.suptitle(
-        f"Noiseless D={test_points.shape[1]} toy manifolds: untouched test split"
+        f"{_condition_label(condition)}, D={test_points.shape[1]} toy manifolds: "
+        "untouched test split"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(path, dpi=180)
     plt.close(figure)
 
 
-def _write_result_readme(path: Path, metrics: dict[str, Any]) -> None:
+def _write_result_readme(
+    path: Path,
+    metrics: dict[str, Any],
+    *,
+    condition: str,
+) -> None:
     lines = [
-        f"# D={metrics['ambient_dim']} noiseless held-out coverage test",
+        f"# D={metrics['ambient_dim']} {_condition_label(condition)} "
+        "held-out coverage test",
         "",
         f"Split fingerprint: `{metrics['split_fingerprint']}`",
         "",
@@ -796,7 +934,15 @@ def _render_coverage_outputs(
     mfa: MFA,
     mfa_sizes: torch.Tensor,
 ) -> None:
-    _write_coverage_plot(args.output_dir / "figures" / "coverage_curve.png", metrics)
+    experiment_config = json.loads(
+        (args.output_dir / "experiment_config.json").read_text()
+    )
+    condition = str(experiment_config["dataset"]["condition"])
+    _write_coverage_plot(
+        args.output_dir / "figures" / "coverage_curve.png",
+        metrics,
+        condition=condition,
+    )
     train_points = _materialize_points(args, split["train"])
     test_points = _materialize_points(args, split["test"])
     _write_embedding_plot(
@@ -811,9 +957,14 @@ def _render_coverage_outputs(
         mfa_live=mfa_sizes > 0,
         mfa_distances=distances["mfa"],
         metrics=metrics,
+        condition=condition,
         device=args.device,
     )
-    _write_result_readme(args.output_dir / "README.md", metrics)
+    _write_result_readme(
+        args.output_dir / "README.md",
+        metrics,
+        condition=condition,
+    )
 
 
 @torch.no_grad()
@@ -847,6 +998,17 @@ def _compute_coverage(
             raise ValueError("coverage distance rows do not match the test split")
         if not torch.equal(distances["test_global_rows"], split["test_global_rows"]):
             raise ValueError("coverage global rows do not match the test split")
+        if args.render_existing:
+            _render_coverage_outputs(
+                args,
+                split,
+                metrics,
+                distances,
+                kmeans_centroids,
+                kmeans_sizes,
+                mfa,
+                mfa_sizes,
+            )
         if not (args.output_dir / "COMPLETED.json").exists():
             _mark_complete(args.output_dir, directory / "metrics.json")
         return metrics
@@ -937,6 +1099,7 @@ def _validate_geometry_metrics(
     *,
     split: dict[str, Any],
     input_fingerprints: dict[str, str],
+    kmeans_covariance: str,
 ) -> None:
     if metrics.get("metric") != "toy_manifold_tangent_geometry":
         raise ValueError("geometry artifact has the wrong metric identifier")
@@ -944,9 +1107,7 @@ def _validate_geometry_metrics(
         raise ValueError("geometry artifact split fingerprint mismatch")
     if metrics.get("input_artifact_sha256") != input_fingerprints:
         raise ValueError("geometry artifact input fingerprint mismatch")
-    if metrics.get("kmeans_covariance") != (
-        "stored_pc_directions_scaled_by_training_assignment_variance"
-    ):
+    if metrics.get("kmeans_covariance") != kmeans_covariance:
         raise ValueError("geometry artifact has the wrong KMeans covariance definition")
     for method_name in ("KMeans+PCA", "MFA"):
         method = metrics.get("methods", {}).get(method_name)
@@ -989,6 +1150,11 @@ def _compute_geometry(
     directory = args.output_dir / "geometry"
     metrics_path = directory / "metrics.json"
     input_fingerprints = _geometry_input_fingerprints(args)
+    kmeans_covariance = (
+        "stored_pc_directions_scaled_by_training_assignment_variance"
+        if args.pca_method == "cluster"
+        else "stored_knn_pc_directions_scaled_by_neighborhood_variance"
+    )
     if (directory / "COMPLETED.json").exists():
         if not metrics_path.exists() or not (directory / "kmeans_pca_variances.pt").exists():
             raise FileNotFoundError("completed geometry stage is missing an artifact")
@@ -997,6 +1163,7 @@ def _compute_geometry(
             metrics,
             split=split,
             input_fingerprints=input_fingerprints,
+            kmeans_covariance=kmeans_covariance,
         )
         return metrics
     if directory.exists():
@@ -1036,9 +1203,7 @@ def _compute_geometry(
         "population": "proximity_associated_components",
         "K": int(mfa.K),
         "ambient_dim": int(mfa.D),
-        "kmeans_covariance": (
-            "stored_pc_directions_scaled_by_training_assignment_variance"
-        ),
+        "kmeans_covariance": kmeans_covariance,
         "split_fingerprint": split["fingerprint"],
         "input_artifact_sha256": input_fingerprints,
         "rank_threshold": float(args.geometry_rank_threshold),
@@ -1051,6 +1216,7 @@ def _compute_geometry(
         metrics,
         split=split,
         input_fingerprints=input_fingerprints,
+        kmeans_covariance=kmeans_covariance,
     )
 
     temporary = directory.with_name(
@@ -1074,6 +1240,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("coverage thresholds must be sorted and unique")
     if args.geometry_rank_threshold <= 0.0:
         raise ValueError("geometry rank threshold must be positive")
+    if args.pca_method == "knn" and args.pca_neighbors <= args.rank:
+        raise ValueError("KNN PCA requires pca-neighbors greater than rank")
 
     source_config = json.loads((args.shard_dir / "config.json").read_text())
     if int(source_config["window"]) != 1 or int(source_config.get("drop_prefix", 0)) != 0:
@@ -1143,6 +1311,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--pca-chunk-elements", type=int, default=1 << 23)
     parser.add_argument("--pca-eig-batch-size", type=int, default=256)
     parser.add_argument(
+        "--pca-method",
+        choices=("cluster", "knn"),
+        default="cluster",
+    )
+    parser.add_argument("--pca-neighbors", type=int, default=64)
+    parser.add_argument(
         "--coverage-thresholds",
         type=float,
         nargs="+",
@@ -1163,6 +1337,7 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--coverage-only", action="store_true")
+    parser.add_argument("--render-existing", action="store_true")
     parser.add_argument("--geometry-only", action="store_true")
     parser.add_argument("--geometry-rank-threshold", type=float, default=1.0)
     parser.add_argument(
