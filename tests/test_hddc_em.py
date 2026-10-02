@@ -108,22 +108,36 @@ def test_hard_initialization_uses_full_partition_and_weighted_means():
     assert model.component_ranks.tolist() == [2, 2]
 
 
-@pytest.mark.parametrize("failure", ["zero_mass", "noise", "nonfinite"])
+@pytest.mark.parametrize("failure", ["negative_mass", "all_zero_mass", "nonfinite"])
 def test_failed_m_step_does_not_mutate_any_parameters(failure):
     model, x = fixture()
     stats = expectation_step(model, [x])
-    if failure == "zero_mass":
-        stats.counts[0] = 0
-    elif failure == "nonfinite":
-        stats.scatter[0, 0, 0] = float("nan")
+    if failure == "negative_mass":
+        stats.counts[0] = -1
+    elif failure == "all_zero_mass":
+        stats.counts.zero_()
     else:
-        stats.residual_sum.zero_()
-        stats.scatter.zero_()
+        stats.scatter[0, 0, 0] = float("nan")
     before = copy.deepcopy(model.state_dict())
     with pytest.raises((ValueError, RuntimeError)):
         maximization_step(model, stats, EMConfig())
     for key, value in before.items():
         torch.testing.assert_close(model.state_dict()[key], value, rtol=0, atol=0)
+
+
+def test_zero_scatter_m_step_keeps_spherical_components_and_can_run_next_e_step():
+    model, x = fixture()
+    stats = expectation_step(model, [x])
+    stats.residual_sum.zero_()
+    stats.scatter.zero_()
+    summary = maximization_step(model, stats, EMConfig())
+    assert model.component_ranks.tolist() == [0, 0]
+    assert summary["n_updated"] == 2
+    assert torch.count_nonzero(model._W()) == 0
+    torch.testing.assert_close(model.pi_logits.softmax(0), (stats.counts / stats.counts.sum()).float())
+    subsequent = expectation_step(model, [model.mu.detach().clone()], component_chunk_size=1)
+    assert subsequent.nll is not None and torch.isfinite(torch.tensor(subsequent.nll))
+    assert (subsequent.counts > 0).all()
 
 
 def test_resume_equals_uninterrupted_and_model_file_is_best_state(tmp_path):
@@ -198,7 +212,11 @@ def test_stream_contract_rejects_missing_rows():
 
 def test_rank_can_decrease_and_increase():
     model, _ = fixture()
-    for spectrum, expected in [([4., .1, .1, .1], 1), ([4., 2., .1, .1], 2)]:
+    for spectrum, expected in [
+        ([4., .1, .1, .1], 1),
+        ([0., 0., 0., 0.], 0),
+        ([4., 2., .1, .1], 2),
+    ]:
         stats = EMStatistics(
             torch.ones(2, dtype=torch.float64) * 100,
             torch.zeros(2, 4, dtype=torch.float64),
@@ -225,12 +243,14 @@ def test_em_pipeline_with_shards_and_assignments(tmp_path, monkeypatch, workers)
     monkeypatch.setenv("OMP_NUM_THREADS", "2")
     shard_dir = build_multi_shard(tmp_path / "shards", n_shards=2, rows_per_shard=6)
     config = _config(tmp_path, shard_dir)
-    centroids = tmp_path / "centroids.pt"
-    torch.save(torch.tensor([[260., 261.], [1260., 1261.]]), centroids)
+    from dalg.models.kmeans import KMeans, save_kmeans
+
+    initializer = tmp_path / "kmeans_model.pt"
+    save_kmeans(KMeans.from_centroids(torch.tensor([[260., 261.], [1260., 1261.]])), initializer)
     config["model"] = {"kind": "hddc", "K": 2, "q_max": 1, "shared_b": True}
     config["training"].update({
         "fit_method": "em", "epochs": 2, "num_workers": workers,
-        "centroids_path": str(centroids), "em_component_chunk_size": 1,
+        "kmeans_model_path": str(initializer), "em_component_chunk_size": 1,
         "em_eig_batch_size": 1, "epoch_snapshot_every": 1,
     })
     run = resolve_experiment(_write_yaml(tmp_path / "em.yaml", config))[0]
@@ -244,3 +264,35 @@ def test_em_pipeline_with_shards_and_assignments(tmp_path, monkeypatch, workers)
     assert (run_dir / "epoch_0001" / "mfa_model.pt").exists()
     assert load_mfa_hddc(run_dir / "mfa_model.pt").shared_b
     assert list(run_dir.rglob("*assignment*.pt"))
+    assert not list(run_dir.rglob("centroids.pt"))
+
+
+@pytest.mark.parametrize("hard", [False, True])
+def test_zero_membership_components_stay_dead_through_resume(tmp_path, hard):
+    model, x = fixture()
+    with torch.no_grad():
+        model.mu[1].fill_(1e4)
+    before = copy.deepcopy(model.state_dict())
+    stats = expectation_step(model, x.split(41), hard=hard)
+    assert stats.counts[1] == 0
+    summary = maximization_step(model, stats, EMConfig())
+    assert summary["n_updated"] == 1
+    torch.testing.assert_close(model.pi_logits.softmax(0), torch.tensor([1., 0.]))
+    for key in ("mu", "dir_raw", "scale_rho", "rank_mask"):
+        torch.testing.assert_close(model.state_dict()[key][1], before[key][1], rtol=0, atol=0)
+    # The shared floor and live covariance must match a fit with only the live component.
+    single = MFA_HDDC(before["mu"][:1].clone(), rank=2, shared_b=True)
+    single_stats = EMStatistics(stats.counts[:1], stats.residual_sum[:1], stats.scatter[:1], len(x), None)
+    maximization_step(single, single_stats, EMConfig())
+    torch.testing.assert_close(model._psi()[0], single._psi()[0])
+    torch.testing.assert_close(model._W()[0] @ model._W()[0].T, single._W()[0] @ single._W()[0].T)
+    cfg = EMConfig(tol=0)
+    train_em_hddc(model, x.split(41), cfg=cfg, initialize=False, epochs=1, out_dir=tmp_path, log=lambda _: None)
+    loaded = load_mfa_hddc(tmp_path / "mfa_model.pt")
+    history = train_em_hddc(loaded, x.split(41), cfg=cfg, initialize=False, epochs=3, out_dir=tmp_path, log=lambda _: None)
+    assert history[-1]["iteration"] == 3
+    assert all(row["dead_components"] == 1 for row in history)
+    subsequent = expectation_step(loaded, [x])
+    assert subsequent.counts[1] == 0
+    assert torch.isfinite(torch.tensor(subsequent.nll))
+    assert torch.count_nonzero(loaded.responsibilities(x)[:, 1]) == 0

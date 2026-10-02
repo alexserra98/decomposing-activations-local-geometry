@@ -6,6 +6,11 @@
 > [Toy-manifold tiling evaluation](../evaluation/toy-manifold-tiling.md) and
 > [HDDC rank surgery](hddc-rank-surgery.md).
 
+> **DEPRECATED KMEANS WORKFLOW:** This page describes historical centroid bundles
+> and temporary tooling. New work uses [KMeans+PCA](../models/kmeans.md) through
+> the training pipeline, with model checkpoints and standard assignments.
+
+
 This is a removable experimental feature implemented entirely under
 `scripts/temporary/` and `scripts/slurm/temporary/`. It is not part of the
 public `dalg.evaluation` API or the YAML training pipeline, and it does not

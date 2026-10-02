@@ -347,7 +347,12 @@ def _fit_and_save_centroids(
         token_loader=None,
         refine_epochs=args.refine_epochs,
     )
-    torch.save(centroids.cpu(), centroids_path)
+    if centroids_path.name == "kmeans_model.pt":
+        from dalg.init.kmeans_model import save_reservoir_initialization
+
+        save_reservoir_initialization(centroids_path, centroids, data=data, args=args)
+    else:
+        torch.save(centroids.cpu(), centroids_path)
     print(f"Centroids: {tuple(centroids.shape)} saved to {centroids_path}")
 
 
@@ -360,14 +365,27 @@ def _ensure_centroids(
     device: str,
     barrier: bool,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Resolve centroids for the run, then load them on every rank.
+    """Load model means/PCs, legacy centroids, or fit a reservoir initializer."""
+    from dalg.init.kmeans_model import load_kmeans_initialization
 
-    Order of precedence on rank 0:
-    1. If ``<out_dir>/centroids.pt`` already exists, use it.
-    2. Otherwise, if ``--centroids-path`` points to an existing file (or a
-       directory containing ``centroids.pt``), copy it into the run dir.
-    3. Otherwise, fit a fresh KMeans from streamed shards.
-    """
+    required_pca_rank = args.rank if args.direction_init == "cluster_pca" else None
+    provided_model = getattr(args, "kmeans_model_path", None)
+    if provided_model:
+        return load_kmeans_initialization(
+            provided_model, expected_k=args.K, expected_d=data["d_model"],
+            rank=required_pca_rank, device=device,
+        )
+    model_path = out_dir / "initialization" / "kmeans_model.pt"
+    legacy_path = out_dir / "centroids.pt"
+    if not getattr(args, "centroids_path", None) and not legacy_path.exists():
+        if is_main and not model_path.exists():
+            _fit_and_save_centroids(model_path, data, args, device=device)
+        if barrier and dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        return load_kmeans_initialization(
+            model_path, expected_k=args.K, expected_d=data["d_model"],
+            rank=required_pca_rank, device=device,
+        )
     centroids_path = out_dir / "centroids.pt"
     if is_main and not centroids_path.exists():
         provided = getattr(args, "centroids_path", None)
@@ -454,6 +472,7 @@ def _write_run_config(
     cfg = {
         "K": args.K,
         "rank": args.rank,
+        "kmeans_model_path": getattr(args, "kmeans_model_path", None),
         "epochs": args.epochs,
         "early_stop_delta": args.early_stop_delta,
         "steps_per_epoch": args.steps_per_epoch,
@@ -483,6 +502,7 @@ def _write_run_config(
         "surgery_every_epochs": args.surgery_every_epochs or 0,
         "surgery_threshold": float(args.surgery_threshold),
         "surgery_min_count": float(args.surgery_min_count),
+        "hard_assignment_covariance": bool(args.hard_assignment_covariance),
         "surgery_warmup_steps": int(args.surgery_warmup_steps or 0),
     }
     (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
@@ -502,6 +522,7 @@ def _maybe_init_wandb(args, data: dict, *, training_mode: str, world_size: int, 
         "fit_method": args.fit_method,
         "K": args.K,
         "rank": args.rank,
+        "kmeans_model_path": getattr(args, "kmeans_model_path", None),
         "epochs": args.epochs,
         "early_stop_delta": args.early_stop_delta,
         "steps_per_epoch": args.steps_per_epoch,
@@ -524,6 +545,7 @@ def _maybe_init_wandb(args, data: dict, *, training_mode: str, world_size: int, 
         "surgery_every_epochs": args.surgery_every_epochs or 0,
         "surgery_threshold": float(args.surgery_threshold),
         "surgery_min_count": float(args.surgery_min_count),
+        "hard_assignment_covariance": bool(args.hard_assignment_covariance),
         "surgery_warmup_steps": int(args.surgery_warmup_steps or 0),
     }
     return wandb.init(
@@ -553,6 +575,7 @@ def _surgery_config(args):
         threshold=float(args.surgery_threshold),
         min_count=float(args.surgery_min_count),
         warmup_steps=int(args.surgery_warmup_steps),
+        hard_assignment_covariance=args.hard_assignment_covariance,
     )
 
 
@@ -628,23 +651,6 @@ def cmd_train_single_process(args):
         if getattr(source_model, "_rotation_on", False):
             raise SystemExit("--init-model-path must not have an active factor rotation")
         initial_model = source_model
-
-        centroids_path = out_dir / "centroids.pt"
-        source_centroids = source_model.mu.detach().cpu()
-        if centroids_path.exists():
-            from dalg.init.centroid_artifact import load_centroid_artifact
-
-            cached, _principal_components = load_centroid_artifact(
-                centroids_path,
-                map_location="cpu",
-            )
-            if not torch.equal(cached, source_centroids):
-                raise SystemExit(
-                    f"cached centroids do not match --init-model-path: {centroids_path}"
-                )
-        else:
-            torch.save(source_centroids, centroids_path)
-            print(f"Centroids: copied from model means in {args.init_model_path}")
 
     if initial_model is None:
         centroids, init_directions = _ensure_centroids(
@@ -979,6 +985,12 @@ def validate_args(args) -> None:
         raise SystemExit("train: --layer is required")
 
     mode = args.training_mode
+    if args.hard_assignment_covariance and (
+        args.fit_method != "adam" or args.surgery_every_epochs <= 0
+    ):
+        raise SystemExit(
+            "--hard-assignment-covariance requires Adam with enabled periodic surgery"
+        )
     if args.fit_method == "em":
         from dalg.models.adaptive_q.train_em_hddc import EMConfig
 
@@ -1023,6 +1035,8 @@ def validate_args(args) -> None:
             raise SystemExit(
                 "train: --shared-b supports --training-mode single_process only"
             )
+    if args.init_model_path and getattr(args, "kmeans_model_path", None):
+        raise SystemExit("train: set only one of --init-model-path and --kmeans-model-path")
     if args.init_model_path and args.centroids_path:
         raise SystemExit(
             "train: set only one of --init-model-path and --centroids-path; "
@@ -1030,10 +1044,14 @@ def validate_args(args) -> None:
         )
     if args.steps_per_epoch is not None and args.steps_per_epoch <= 0:
         raise SystemExit("train: --steps-per-epoch must be positive")
-    if args.direction_init == "cluster_pca" and not args.centroids_path:
+    if getattr(args, "kmeans_model_path", None) and args.centroids_path:
+        raise SystemExit("train: set only one of --kmeans-model-path and --centroids-path")
+    if args.direction_init == "cluster_pca" and not (
+        args.centroids_path or getattr(args, "kmeans_model_path", None)
+    ):
         raise SystemExit(
-            "train: --direction-init cluster_pca requires --centroids-path "
-            "pointing to an enriched centroid artifact"
+            "train: --direction-init cluster_pca requires --kmeans-model-path "
+            "with stored PCs (or legacy --centroids-path)"
         )
     surgery_every = float(args.surgery_every_epochs or 0)
     if surgery_every < 0:
@@ -1095,6 +1113,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--layer", type=int, required=True, help="Layer to train on")
     p.add_argument("--out-dir", default=None, help="Where to save centroids/model")
     p.add_argument(
+        "--kmeans-model-path", default=None,
+        help="KMeans checkpoint supplying mu and optional KNN initialization directions W_init.",
+    )
+    p.add_argument(
         "--centroids-path",
         default=None,
         help="Path to a pre-computed centroid artifact (or a directory containing one) "
@@ -1105,7 +1127,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["random", "cluster_pca"],
         default="random",
         help="Initialize loading directions randomly or from the first --rank "
-             "principal components stored in --centroids-path.",
+             "KNN principal components (W_init) stored in --kmeans-model-path.",
     )
     p.add_argument(
         "--init-model-path",
@@ -1134,12 +1156,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "fractions below 1 or a positive integer "
                         "(0 = fixed-q baseline). "
                         "Requires --isotropic-psi or --shared-b.")
+    p.add_argument("--hard-assignment-covariance", action="store_true",
+                   help="Experimental: use posterior argmax memberships for all "
+                        "surgery counts, means, weights, and covariance. "
+                        "Requires Adam with enabled periodic surgery.")
     p.add_argument("--surgery-threshold", type=float, default=0.01,
                    help="Cattell scree threshold t, relative to the leading eigenvalue.")
     p.add_argument("--surgery-min-count", type=float, default=0.0,
                    help="n_min: components with fewer effective points are left "
                         "untouched. 0 disables the cutoff and includes every "
-                        "component with positive soft membership.")
+                        "component with positive membership (hard counts when "
+                        "--hard-assignment-covariance is enabled).")
     p.add_argument("--surgery-warmup-steps", type=int, default=0,
                    help="Linear LR warmup steps after each surgery (0 = none).")
     p.add_argument("--epochs", type=int, default=10,

@@ -5,11 +5,14 @@ applies the closed-form mean, mixture-weight, and covariance updates of the HDDC
 `[a_ij b_i Q_i d_i]` or its single-process shared-noise variant
 `[a_ij b Q_i d_i]` (Bouveyron, Girard & Schmid, arXiv:math/0604064). It
 re-estimates each component's covariance with an adaptive rank
-`d_k <= q_max`, and rewrites the result in MFA parameters. Between surgeries
-the columns beyond `d_k` are hard-masked by `MFA.rank_mask`, so they contribute
-nothing to the likelihood and receive no gradient.
+`0 <= d_k <= q_max` in shared-noise mode, and rewrites the result in MFA
+parameters. Between surgeries the columns beyond `d_k` are hard-masked by
+`MFA.rank_mask`, so they contribute nothing to the likelihood and receive no
+gradient.
 
-Surgery updates components with positive soft mass at least `min_count`.
+Surgery updates components with positive membership mass at least `min_count`.
+Memberships are soft by default, or one-hot posterior argmax assignments when
+`hard_assignment_covariance` is enabled.
 Skipped means and mixture weights are preserved; eligible components share
 their old total mixture mass in proportion to their effective counts.
 
@@ -67,12 +70,13 @@ class SurgeryConfig:
     eps: float = 1e-12           # clamp inside sqrt(lam_j - b_k)
     max_batches: Optional[int] = None  # cap the E-pass length (debug/smoke)
     eig_batch_size: Optional[int] = None  # bound eigensolver workspace for EM
+    hard_assignment_covariance: bool = False  # hard counts, means, and covariance
 
     def n_min(self) -> float:
         """Return the literal effective-membership cutoff used by surgery.
 
         ``min_count=0`` disables the cutoff, so every component with positive
-        soft membership is eligible. A negative or non-finite cutoff is invalid;
+        membership is eligible. A negative or non-finite cutoff is invalid;
         there is no sentinel value that silently selects a heuristic threshold.
         """
         value = float(self.min_count)
@@ -169,6 +173,28 @@ def _responsibilities(model, x: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
+def _hard_memberships(model, responsibilities: torch.Tensor) -> torch.Tensor:
+    """One-hot global posterior argmax; ties choose the lowest component index."""
+    if not isinstance(model, ComponentShardedMFA_HDDC):
+        winners = responsibilities.argmax(dim=1)
+        return F.one_hot(winners, num_classes=model.K).to(responsibilities.dtype)
+
+    local_max, local_index = responsibilities.max(dim=1)
+    global_max = local_max.clone()
+    distributed = dist.is_available() and dist.is_initialized()
+    if distributed:
+        dist.all_reduce(global_max, op=dist.ReduceOp.MAX)
+    winners = local_index + model.component_start
+    winners = winners.masked_fill(local_max != global_max, model.global_K)
+    if distributed:
+        dist.all_reduce(winners, op=dist.ReduceOp.MIN)
+    components = torch.arange(
+        model.component_start, model.component_end, device=responsibilities.device
+    )
+    return (winners[:, None] == components[None, :]).to(responsibilities.dtype)
+
+
+@torch.no_grad()
 def accumulate_statistics(
     model,
     loader,
@@ -176,6 +202,7 @@ def accumulate_statistics(
     device,
     max_batches: Optional[int] = None,
     chunk_elems: int = 1 << 23,
+    hard_assignment_covariance: bool = False,
 ):
     """One E-pass: returns `(N_k, residual_sum, scatter, n_rows)`.
 
@@ -185,6 +212,9 @@ def accumulate_statistics(
     per component at D=128; the large-D path (trace accumulation plus a
     randomized sketch for the top q_max+1 eigenpairs) is deliberately not
     implemented yet.
+
+    With `hard_assignment_covariance=True`, all three moments use one-hot
+    posterior argmax memberships, including global winners for component shards.
 
     TODO(large-D): at D ~ 2304 replace the explicit (K, D, D) accumulator with
     `sum_n r_nk ||x_n - mu_k||^2` for the trace plus top-(q_max+1) eigenpairs
@@ -210,6 +240,8 @@ def accumulate_statistics(
         x = batch[0] if isinstance(batch, (tuple, list)) else batch
         x = x.view(x.size(0), -1).to(device)
         r = _responsibilities(model, x).to(torch.float64)      # (B, K)
+        if hard_assignment_covariance:
+            r = _hard_memberships(model, r)
         x64 = x.to(torch.float64)
         N += r.sum(dim=0)
         for s in range(0, x64.shape[0], rows_per_chunk):
@@ -267,7 +299,7 @@ def _solve_shared_b_active_set(
     ``A = sum_k N_k sum_{j > r_k} lambda_kj``
     ``B = sum_k N_k (D - r_k)``,  so ``b = max(A / B, psi_floor)``.
 
-    Directions ``2 <= j <= r_k`` are optional. They are sorted *globally* by
+    Directions ``1 <= j <= r_k`` are optional. They are sorted *globally* by
     increasing eigenvalue, retaining their component weight ``N_k``. Starting
     from the mandatory pool, the smallest optional direction is moved into the
     noise pool exactly when ``lambda_kj <= b``; then ``A``, ``B``, and ``b`` are
@@ -277,10 +309,9 @@ def _solve_shared_b_active_set(
     initial floor in one batch can over-prune, because adding small eigenvalues
     to the pool lowers ``b`` and can make a larger candidate valid.
 
-    The first direction is deliberately not optional. The HDDC path currently
-    requires ``d_k >= 1``. If the final shared floor reaches ``lambda_k1``, the
-    caller's retained-eigenvalue validation raises instead of silently changing
-    the model to admit rank-zero spherical components.
+    Removing every direction gives ``d_k = 0`` and a spherical covariance
+    ``b I``. That component contributes its full trace and ``D`` noise
+    dimensions to the pool; its mean and mixture weight still get updated.
 
     This is a feasibility/profile update conditional on the current
     responsibilities, updated means, eligible components, and Cattell rank caps;
@@ -299,25 +330,22 @@ def _solve_shared_b_active_set(
         psi_floor: Lower numerical bound applied to the pooled floor after every
             update. The caller passes the larger of the configured surgery floor
             and ``model._eps + 1e-12``. The caller then round-trips the target
-            through the model dtype and validates against the floor that will
-            actually be written.
+            through the model dtype and pools any further direction invalidated
+            by rounding before writing the parameters.
 
     Returns:
-        ``(rank, b, b_at_cattell_cap)``. ``rank`` contains the rank-one-
-        constrained candidate ranks after resolving every optional direction,
+        ``(rank, b, b_at_cattell_cap)``. ``rank`` contains ranks in
+        ``[0, rank_cap[k]]`` after resolving every optional direction,
         ``b`` is the corresponding pooled floor, and
         ``b_at_cattell_cap`` is the floor before optional directions were moved
         into the noise pool. The latter is useful for diagnosing how strongly
-        shared-floor consistency changed the scree proposals. The caller must
-        still validate the mandatory first direction of every component.
+        shared-floor consistency changed the scree proposals.
 
     Raises:
         ValueError: If the inputs have incompatible shapes, contain no
             components, or contain a rank cap outside ``[1, D - 1]``.
         RuntimeError: If the pooled residual or residual degrees of freedom are
-            non-finite, or the latter are non-positive. The caller separately
-            reports an impossible mandatory first direction with its original
-            component index.
+            non-finite, or the latter are non-positive.
     """
     n, D = lam.shape
     if trace.shape != (n,) or N.shape != (n,) or rank_cap.shape != (n,):
@@ -348,13 +376,9 @@ def _solve_shared_b_active_set(
 
     b_at_cap = (numerator / denominator).clamp_min(float(psi_floor))
 
-    # Direction one remains mandatory. All later directions below each Cattell
-    # cap are optional and participate in the globally coupled active set.
-    optional = (j > 1) & (j <= rank_cap[:, None])
+    # Every direction under the Cattell cap participates, including the first.
+    optional = j <= rank_cap[:, None]
     candidate_lam = lam_cap[optional]
-    if candidate_lam.numel() == 0:
-        return rank_cap.clone(), b_at_cap, b_at_cap
-
     candidate_weight = N[:, None].expand(-1, q)[optional]
     candidate_component = torch.arange(n, device=lam.device)[:, None].expand(
         -1, q
@@ -413,8 +437,8 @@ def _component_proposal(model, N, residual_sum, S_acc, cfg: SurgeryConfig):
     eligible shared-b components, the Cattell ranks are upper bounds:
     `_solve_shared_b_active_set` may lower them to make the final rank mask
     consistent with the common floor. That helper's docstring gives the complete
-    derivation, sorted stopping rule, rank-one policy, and statistical scope of
-    this extra step.
+    derivation, sorted stopping rule, spherical components, and statistical
+    scope of this extra step.
 
     All rank selection, pooled-floor estimation, and retained-eigenvalue
     validation finish before any parameter is mutated. A failed shared-b fit
@@ -495,10 +519,6 @@ def _component_proposal(model, N, residual_sum, S_acc, cfg: SurgeryConfig):
             d_cattell,
             psi_floor=effective_psi_floor,
         )
-        pruned = d_cattell - d_sel
-        n_shared_b_pruned_components = int((pruned > 0).sum().item())
-        n_shared_b_pruned_directions = int(pruned.sum().item())
-
         b = b_shared.expand(idx.numel())
     else:
         b_shared = None
@@ -513,22 +533,40 @@ def _component_proposal(model, N, residual_sum, S_acc, cfg: SurgeryConfig):
     # for validation, scale reconstruction, and reporting. This closes the small
     # but real gap between a float64 pooled target and its stored model dtype.
     dtype = model.dir_raw.dtype
-    psi_target = (b - model._eps).clamp_min(1e-12)
     if shared_b:
-        psi_rho_new = _softplus_inverse(psi_target[:1]).to(dtype)
-        b = (
-            F.softplus(psi_rho_new).to(b.dtype) + model._eps
-        ).expand(idx.numel())
+        while True:
+            psi_target = (b[:1] - model._eps).clamp_min(1e-12)
+            psi_rho_new = _softplus_inverse(psi_target).to(model.psi_rho.dtype)
+            # Match _psi() exactly: add eps in the model dtype before promotion.
+            b = (F.softplus(psi_rho_new) + model._eps).to(lam.dtype).expand(idx.numel())
+            retained = j <= d_sel[:, None]
+            invalid = retained & (lam[:, :q] <= b[:, None])
+            if not invalid.any():
+                break
+
+            # Rounding may overtake a signal eigenvalue. Pool only the smallest
+            # offender, then encode the updated floor before considering others.
+            weakest = lam[:, :q].masked_fill(~invalid, float("inf")).amin(dim=1)
+            d_sel[weakest.argmin()] -= 1
+            retained = j <= d_sel[:, None]
+            kept = torch.where(retained, lam[:, :q].clamp_min(0.0), 0.0).sum(dim=1)
+            numerator = (N[idx] * (trace - kept)).sum()
+            denominator = (N[idx] * (D - d_sel).to(N.dtype)).sum()
+            b = (numerator / denominator).clamp_min(effective_psi_floor).expand(idx.numel())
+
         b_shared = b[0]
+        pruned = d_cattell - d_sel
+        n_shared_b_pruned_components = int((pruned > 0).sum().item())
+        n_shared_b_pruned_directions = int(pruned.sum().item())
     else:
+        psi_target = (b - model._eps).clamp_min(1e-12)
         psi_rho_new = _softplus_inverse(psi_target).to(dtype)
         b = F.softplus(psi_rho_new).to(b.dtype) + model._eps
 
     # Retained directions must be strictly above the floor that is actually
-    # written. The shared active set guarantees this apart from a mandatory
-    # first direction or a dtype-rounding boundary. Component-specific tail
-    # means normally guarantee it algebraically; an imposed numerical floor can
-    # still make that model infeasible, so both modes use the same strict check.
+    # written. The shared active set and rounding correction guarantee this.
+    # Component-specific tail means normally guarantee it algebraically; an
+    # imposed floor can still make that model infeasible, so both modes check it.
     retained = j <= d_sel[:, None]
     invalid = retained & (lam[:, :q] <= b[:, None])
     if invalid.any():
@@ -585,17 +623,23 @@ def _check_surgery_error(model, error: Optional[Exception]) -> None:
 
 
 @torch.no_grad()
-def reconstruct_components(model, N, residual_sum, S_acc, cfg: SurgeryConfig) -> Dict[str, Any]:
+def reconstruct_components(
+    model, N, residual_sum, S_acc, cfg: SurgeryConfig, *, full_mixture_update=False,
+) -> Dict[str, Any]:
     """Commit the gated M-step from frozen counts, residual sums, and scatter.
 
     Positive counts at least `min_count` select means, weights, and covariances
     together. Skipped mixture probabilities stay fixed; eligible probabilities
     divide their previous total mass in proportion to N. Zero counts are always
-    skipped. All component shards validate before any rank writes parameters.
+    skipped. Full-mixture EM instead sets weights to normalized counts, with
+    zero-count components assigned zero weight. This mode requires one process
+    and no count cutoff. All proposals validate before parameters are written.
     """
     error = None
     try:
         n_min = cfg.n_min()
+        if full_mixture_update and (isinstance(model, ComponentShardedMFA_HDDC) or n_min != 0):
+            raise ValueError("Full mixture update requires one process and min_count=0")
         if (N.shape != (model.K,) or residual_sum.shape != model.mu.shape
                 or S_acc.shape != (model.K, model.D, model.D)):
             raise ValueError("HDDC surgery statistics have incompatible shapes")
@@ -608,11 +652,19 @@ def reconstruct_components(model, N, residual_sum, S_acc, cfg: SurgeryConfig) ->
     _check_surgery_error(model, error)
 
     eligible = (N > 0) & (N >= n_min)
-    logits = model._propose_mixture_logits(N, eligible)
+    if full_mixture_update:
+        if not eligible.any():
+            raise ValueError("Full mixture update requires positive total membership")
+        logits = (N.double().log() - N.double().sum().log()).to(model.pi_logits.dtype)
+    else:
+        logits = model._propose_mixture_logits(N, eligible)
     error = None
     try:
         stats, proposal = _component_proposal(model, N, residual_sum, S_acc, cfg)
-        if not torch.isfinite(logits).all() or any(
+        valid_logits = torch.isfinite(logits)
+        if full_mixture_update:
+            valid_logits |= (N == 0) & torch.isneginf(logits)
+        if not valid_logits.all() or any(
             not torch.isfinite(value).all() for value in proposal.values()
         ):
             raise ValueError("HDDC surgery produced non-finite model parameters")
@@ -725,11 +777,13 @@ def hddc_surgery(model, loader, cfg: SurgeryConfig, *, device=None, log=None) ->
     device = device if device is not None else model.mu.device
 
     N, residual_sum, S_acc, n_rows = accumulate_statistics(
-        model, loader, device=device, max_batches=cfg.max_batches
+        model, loader, device=device, max_batches=cfg.max_batches,
+        hard_assignment_covariance=cfg.hard_assignment_covariance,
     )
     stats = reconstruct_components(model, N, residual_sum, S_acc, cfg)
     summary = _summarize(stats, model.q, device)
     summary["n_rows"] = n_rows
+    summary["hard_assignment_covariance"] = cfg.hard_assignment_covariance
     summary["threshold"] = float(cfg.threshold)
     summary["n_min"] = cfg.n_min()
     summary["d_k_per_component"] = [int(v) for v in stats["d_k"].tolist()]

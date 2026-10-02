@@ -65,3 +65,10 @@ After this research sprint I was able to finally obtain a model that is able to 
 Apparently there was an issue with the way W columns (the loadings) were initilized if the flag `direction_init` `cluster_pca`was set. The major change occured though when I extended the M-step during training, before I used to updated only the loadings and b, (W and b which is the noise), now I implemented the full M-step which updates also the means and the mixing coefficients. With this new implementation I was able to recover the tangent space and the manifold tiling EVEN when kmeans is fittend only 35% of the training set. Notably If I init with random directions the higher dimensional manifold are not reconstructed well.
 This means that MFA training at least is not moving away from the good minima at the init (so they same training objective) but also is able to partially recover the tangent space and the manifold tiling even when the initialization is not perfect. 
 At this point the goal is to create a good benchmark where MFA can outperform.
+
+# Research State (updated 2026-09-05)
+
+> **Kind:** Research state · **Status:** Current as of 2026-09-05 · **Use when:**
+> Establishing the current research direction, findings, and immediate goals.
+
+Ok apparently I have found a solution. I created 5 copies dataset with 10 manifolds varying noise ratio in this window [10000, 1000, 100, 10]. The lower the noisier. For 10000,1000,100 both kmeans and MFA are able to recover tangent space and tile the manifold. For 10 instead kmeans fails on very simple manifold, such a line, or the sphere, while MFA works decently. So I have a reason to justify MFA: it works better with noisy dataset. The best would be to have an other dataset where kmeas fails and MFA works.

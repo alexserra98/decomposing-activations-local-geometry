@@ -13,6 +13,9 @@ relevant to it.
 
 ## I want to understand a model
 
+- [KMeans+PCA](models/kmeans.md) defines hard assignments, local PCs,
+  Cattell rank masks, and model checkpoint initialization.
+
 - [MFA-ARD](models/mfa-ard.md) explains adaptive component rank through ARD
   shrinkage, including its invariants and failure modes.
 - [MFA-HDDC](models/mfa-hddc.md) explains adaptive component rank through
@@ -29,7 +32,9 @@ relevant to it.
 ## I want to run or inspect training
 
 - [YAML training pipeline](workflows/training-pipeline.md) is the operational
-  guide for planning, submitting, resuming, and inspecting pipeline runs.
+  guide for planning, submitting, resuming, inspecting pipeline runs, and
+  [reevaluating saved models](workflows/training-pipeline.md#evaluate-saved-runs)
+  from one or more manifests.
 - [Training pipeline YAML reference](reference/training-pipeline-config.md)
   defines every supported configuration field and constraint.
 
@@ -40,7 +45,7 @@ reorganize this documentation collection.
 
 ## I want to evaluate a model
 
-- [Toy-manifold tiling evaluation](evaluation/toy-manifold-tiling.md) defines
+- [Toy-manifold tiling evaluation](experiments/evaluation/toy-manifold-tiling.md) defines
   association, rank-recovery, tangent-alignment, tangent-containment, and
   output-schema contracts.
 

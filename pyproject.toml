@@ -32,7 +32,9 @@ dependencies = [
 [project.scripts]
 dalg-run-extraction = "dalg.cli.run_extraction:main"
 dalg-run-metrics = "dalg.cli.run_metrics:main"
+dalg-aggregate-metrics = "dalg.analysis.aggregate_metrics:main"
 dalg-run-training = "dalg.cli.run_training:main"
+dalg-run-training-kmeans = "dalg.cli.run_training_kmeans:main"
 dalg-run-training-ard = "dalg.cli.adaptive_q.run_training_ard:main"
 dalg-run-training-hddc = "dalg.cli.adaptive_q.run_training_hddc:main"
 dalg-run-pipeline = "dalg.cli.run_pipeline:main"

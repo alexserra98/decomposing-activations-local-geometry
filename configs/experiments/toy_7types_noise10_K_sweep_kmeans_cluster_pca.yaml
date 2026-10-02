@@ -1,0 +1,54 @@
+# Full KMeans pipeline: fitting, nearest-centroid assignments, and toy evaluation.
+# Matches the noise10 HDDC sweep's data, split, seed, K values, and thresholds.
+# PCs use hard-cluster training members; Cattell selects the active directions
+# from the complete covariance spectrum.
+
+experiment:
+  name: toy_7types_noise10_sweepk_kmeans_cluster_pca
+  output_root: dalg-cache/toy_manifolds_7types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10/models
+
+dataset:
+  id: toy_manifolds_7types_1each_D128_30Keach_noise10
+  shard_dir: dalg-cache/assets/toy_manifolds_7types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_10
+  layer: 0
+
+model:
+  kind: kmeans
+  K: 1000
+  surgery_threshold: 0.05
+
+training:
+  training_mode: single_process
+  max_iter: 100
+  restarts: 10
+  tol: 1.0e-6
+  val_frac: 0.1
+  split_seed: 42
+  seed: 42
+  device: cuda
+
+assignments:
+  enabled: true
+  batch_size: 4096
+  device: cuda
+
+evaluation:
+  enabled: true
+  kind: toy_manifold_tiling
+  batch_size: 4096
+  device: cuda
+
+resources:
+  partition: H100
+  account: LADE
+  nodes: 1
+  ntasks_per_node: 1
+  cpus_per_task: 8
+  gpus: 1
+  gpu_type: H100
+  memory: 80G
+  time: "01:00:00"
+
+sweep:
+  model.K: [100, 250, 500, 1000, 2000]
+  model.surgery_threshold: [0.00025, 0.005, 0.01, 0.05, 0.1, 0.15, 0.2, 0.5, 1.0]

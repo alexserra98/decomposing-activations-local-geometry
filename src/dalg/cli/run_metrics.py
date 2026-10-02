@@ -1,13 +1,12 @@
 """
-CLI for cluster-level metrics on a trained MFA.
+CLI for cluster assignments and model or partition analysis.
 
 Subcommands:
     gaussian-overlap
                    Pairwise Gaussian-overlap metrics between MFA components.
     intrinsic-dim  PCA- and GRIDE-based intrinsic dimensionality per cluster.
-    assignments    Hard cluster assignments. With an MFA, streams activations
-                   through responsibilities; with medoids, assigns by nearest
-                   Euclidean centroid.
+    assignments    Hard cluster assignments from MFA/HDDC responsibilities,
+                   a KMeans model, or legacy nearest Euclidean centroids.
     description-fit
                    Description-vs-context metrics for labeled clusters.
     description-semantics
@@ -39,16 +38,17 @@ os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 import torch
 
 
-def _resolve_model_path(data_dir: str) -> tuple[Path, Path]:
+def _resolve_model_path(data_dir: str, model_type: str = "mfa") -> tuple[Path, Path]:
     """Return ``(model_path, run_dir)`` from a CLI ``--data-dir`` argument.
 
-    Accepts either a directory containing ``mfa_model.pt`` /
-    ``mfa_model_shards.json`` or a direct path to a model ``.pt`` file.
+    Resolve the selected implementation's checkpoint filename in a run directory,
+    or accept a direct path to a model ``.pt`` file.
     """
     if os.path.isfile(data_dir):
         return Path(data_dir), Path(os.path.dirname(data_dir))
     run_dir = Path(data_dir)
-    return run_dir / "mfa_model.pt", run_dir
+    filename = "kmeans_model.pt" if model_type == "kmeans" else "mfa_model.pt"
+    return run_dir / filename, run_dir
 
 
 def cmd_gaussian_overlap(args) -> None:
@@ -141,13 +141,12 @@ def cmd_assignments(args) -> None:
     """Compute hard cluster assignments.
 
     Streams activations from ``--shard-dir`` (at ``--layer``). By default it
-    uses MFA responsibilities from ``--data-dir``. If ``--medoids-path`` is
-    provided, it assigns by nearest Euclidean medoid instead.
+    uses MFA responsibilities from ``--data-dir``; ``--model-type kmeans``
+    selects hard predictions from ``kmeans_model.pt``. If ``--medoids-path``
+    is provided, it assigns by nearest Euclidean medoid instead.
 
-    The default save path is ``<run_dir>/<model_stem>_assignments.pt`` so
-    that ``intrinsic-dim`` can pick it up via its ``--assignments-path``
-    default of ``<data-dir>/mfa_model_assignments.pt``. For medoids, the
-    default save path is next to the medoid file.
+    The default save path is ``<run_dir>/<model_stem>_assignments.pt``.
+    For legacy medoids, the default save path is next to the medoid file.
     """
     import json
     from torch.utils.data import DataLoader
@@ -168,7 +167,7 @@ def cmd_assignments(args) -> None:
     window = int(extract_cfg["window"])
     drop_prefix = args.drop_prefix
     if drop_prefix is None:
-        drop_prefix = int(extract_cfg.get("drop_prefix", 32))
+        drop_prefix = int(extract_cfg.get("drop_prefix", 0 if args.model_type == "kmeans" else 32))
 
     meta_index = load_meta_index(shard_dir, layer=args.layer)
     positions = resolve_spec_positions(
@@ -224,7 +223,7 @@ def cmd_assignments(args) -> None:
         default_suffix = "_nearest_centroid_assignments.pt" if args.max_batches is None \
             else f"_nearest_centroid_assignments_first{args.max_batches}_batches.pt"
     else:
-        model_path, run_dir = _resolve_model_path(args.data_dir)
+        model_path, run_dir = _resolve_model_path(args.data_dir, args.model_type)
         sizes, assignments, max_responsibilities, peakedness = compute_assignments(
             model_path,
             loader,
@@ -240,7 +239,14 @@ def cmd_assignments(args) -> None:
             "peakedness": peakedness,
             "K": int(sizes.numel()),
             "model_type": args.model_type,
+            "model_path": str(model_path),
             "subset_spec": subset_spec,
+            "source": {
+                "shard_dir": str(shard_dir),
+                "layer": int(args.layer),
+                "drop_prefix": int(drop_prefix),
+                "num_items": int(assignments.numel()),
+            },
         }
         default_dir = run_dir
         default_stem = model_path.stem
@@ -504,7 +510,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_intrinsic_dim)
 
     sp = sub.add_parser("assignments",
-                        help="Compute MFA or nearest-medoid cluster assignments")
+                        help="Compute model or nearest-medoid cluster assignments")
     add_common(sp)
     sp.add_argument("--medoids-path", "--centroids-path", dest="medoids_path",
                     default=None,
@@ -520,7 +526,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Stop after this many batches (for smoke tests)")
     sp.add_argument("--save-path", default=None,
                     help="Explicit save path (overrides --out-dir-based default)")
-    sp.add_argument("--model-type", choices=("mfa", "hddc"), default="mfa",
+    sp.add_argument("--model-type", choices=("mfa", "hddc", "kmeans"), default="mfa",
                     help="Checkpoint implementation to load (ARD uses the mfa default)")
     sp.add_argument("--no-inference-cache", "--slow-responsibilities",
                     dest="use_inference_cache",

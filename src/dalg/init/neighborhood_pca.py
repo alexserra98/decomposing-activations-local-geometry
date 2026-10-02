@@ -82,8 +82,14 @@ def compute_neighborhood_pca(
     rank: int,
     device: torch.device,
     eig_batch_size: int,
-) -> torch.Tensor:
-    """Compute PCA around each fixed centroid using its selected neighborhood."""
+    return_eigenvalues: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Compute PCA around each fixed centroid using its selected neighborhood.
+
+    ``return_eigenvalues`` also returns the full descending float64 spectrum.
+    This mode preserves input precision and returns directions in centroid dtype.
+    The legacy directions-only output remains float32 on CPU.
+    """
     if neighbor_indices.ndim != 2:
         raise ValueError("neighbor_indices must have shape (K, neighbors)")
     K, D = map(int, centroids.shape)
@@ -97,10 +103,12 @@ def compute_neighborhood_pca(
     if eig_batch_size <= 0:
         raise ValueError("eig_batch_size must be positive")
 
-    points_device = points.to(device=device, dtype=torch.float32)
+    output_dtype = centroids.dtype if return_eigenvalues else torch.float32
+    points_device = points.to(device=device, dtype=None if return_eigenvalues else torch.float32)
     centers = centroids.to(device=device, dtype=torch.float64)
     indices = neighbor_indices.to(device=device, dtype=torch.long)
-    directions = torch.empty(K, D, rank, dtype=torch.float32)
+    directions = torch.empty(K, D, rank, dtype=output_dtype)
+    spectra = torch.empty(K, D, dtype=torch.float64)
 
     for start in range(0, K, eig_batch_size):
         stop = min(start + eig_batch_size, K)
@@ -109,10 +117,12 @@ def compute_neighborhood_pca(
         covariance = residuals.transpose(1, 2) @ residuals
         covariance /= neighbors
         covariance = 0.5 * (covariance + covariance.transpose(-1, -2))
-        _eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
         directions[start:stop] = (
-            eigenvectors[:, :, -rank:].flip(-1).to(torch.float32).cpu()
+            eigenvectors[:, :, -rank:].flip(-1).to(output_dtype).cpu()
         )
 
-    return directions
+        spectra[start:stop] = eigenvalues.flip(-1).clamp_min(0).cpu()
+
+    return (directions, spectra) if return_eigenvalues else directions
 

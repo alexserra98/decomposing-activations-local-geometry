@@ -30,8 +30,12 @@ The EM trainer freezes parameters for a complete pass and computes soft
 responsibilities over **all K components**. It accumulates the same float64
 counts, residual sums and scatter described below, then calls the shared HDDC
 M-step to update means, mixture weights, orientations, individual signal
-variances, ranks and the single noise scalar. Every component must have positive
-effective mass; EM rejects unsupported components instead of skipping them.
+variances, ranks and the single noise scalar. Components with zero effective
+mass keep their means, loadings and rank masks, but receive exactly zero mixture
+weight (`pi_logits = -inf`). They remain inactive in subsequent soft E-passes.
+Only positive-mass components contribute to the shared-noise estimate; the new
+global noise floor still applies to every component. This also handles empty
+components in hard initialization. Negative or nonfinite moments remain errors.
 There are no Adam steps, learning-rate schedules, subsampled E-passes, or online
 averages. Cattell ranks and the shared-noise feasibility solve run every iteration.
 
@@ -54,7 +58,8 @@ while the eigensolver costs O(K D³) per iteration.
 `epochs` counts M-steps; iteration zero is initialization. The next E-pass scores
 each updated model while collecting the moments for its next M-step. The final
 pass only scores. `em_history.json` records train/validation NLL, ranks, rank
-changes, shared noise, effective memberships, timing and peak GPU allocation.
+changes, shared noise, effective memberships, dead-component counts, timing and
+peak GPU allocation.
 Checkpoint scores always refer to their actual parameter state. The trainer
 selects the best validation NLL (or train NLL without validation), retaining
 that model as `mfa_model.pt`; `checkpoint.pt` holds the current iteration and
@@ -69,7 +74,7 @@ decrease likelihood; monotonic likelihood is only expected when ranks stay
 fixed and the numerical constraints are inactive.
 
 See the [YAML field reference](../reference/training-pipeline-config.md#full-data-em)
-and [one-million-activation example](../../configs/experiments/hddc_em_D128_1M.yaml).
+and [one-million-activation example](../../configs/archived/hddc_em_D128_1M.yaml).
 The temporary `scripts/temporary/benchmark_hddc_em.py` measures E/M and scoring
 times on random vectors held in host memory; it measures throughput rather than
 fit quality and excludes shard I/O, KMeans initialization and validation.
@@ -124,8 +129,11 @@ return d_hat * s[:, None, :]            # (K, D, q)
 A masked column is therefore *exactly* zero in `W`, drops out of
 `C_k = W W^T + Psi`, and both `dir_raw` and `scale_rho` receive exactly zero
 gradient through it — no stop-gradient machinery needed. `component_ranks`
-reads `d_k = rank_mask.sum(-1)` straight off the buffer. The mask is part of the
-`state_dict`, so it round-trips through save/load and shards like the other
+reads `d_k = rank_mask.sum(-1)` straight off the buffer. An all-zero row gives
+signal rank zero and covariance `Psi_k`, or `b I` in shared-noise mode. The
+Gaussian stays in the mixture with its mean and weight. Allocated `q_max`
+remains positive, so later surgery can restore directions. The mask is part of
+the `state_dict`, so it round-trips through save/load and shards like the other
 per-component tensors.
 
 Toy-manifold evaluation uses this saved mask count directly for rank recovery
@@ -140,7 +148,7 @@ Training is unmodified `train_nll` between surgeries — `train_nll_hddc` differ
 from `train_nll` only by the `surgery=` argument and the block it gates. Every
 `--surgery-every-epochs` epochs a gated **M-step** runs. Following the
 [HDDC paper, sections 4.1–4.2](https://arxiv.org/pdf/math/0604064#page=12), it
-uses one frozen set of soft responsibilities for means, weights, and covariance:
+by default uses one frozen set of soft responsibilities for means, weights, and covariance:
 
 - **A — statistics.** One E-pass over the train loader accumulating, in float64,
   counts `N_k = sum_n r_nk`, residual sums
@@ -174,14 +182,15 @@ uses one frozen set of soft responsibilities for means, weights, and covariance:
       / sum_k N_k (D - r_k)
   ```
 
-  For component-specific `b_k`, the Cattell proposal is the final rank
+  An empty Cattell selection still proposes rank one. For component-specific
+  `b_k`, the Cattell proposal is the final rank
   `d_k = r_k`; surgery raises if an imposed numerical floor nevertheless
   overtakes a retained eigenvalue. For shared `b`, the independently proposed
   ranks can be inconsistent with the common absolute floor: reconstruction
   requires every retained eigenvalue to satisfy `lam_kj > b`, because its
   loading variance is `lam_kj - b`. Shared-b surgery therefore treats `r_k` as
   a rank cap and runs an active-set solve. It starts with all `j > r_k` in the
-  pooled noise estimate, then considers optional directions `2 <= j <= r_k`
+  pooled noise estimate, then considers optional directions `1 <= j <= r_k`
   globally from smallest to largest eigenvalue. A candidate enters the noise
   pool when `lam_kj <= b`; the weighted pooled floor is updated before
   considering the next candidate. Once the next candidate is above `b`, all
@@ -189,16 +198,23 @@ uses one frozen set of soft responsibilities for means, weights, and covariance:
   would result from discarding every violation against the initial, higher
   floor in one batch.
 
-  Direction one remains mandatory, preserving `d_k >= 1`. Surgery still fails
-  explicitly if the final floor reaches `lam_k1`, because that component would
-  require an unsupported rank-zero covariance. The active set is a feasibility
-  update conditional on Cattell's caps, not a replacement intrinsic-dimension
-  criterion. Surgery reports the initial `b_shared_at_cattell` and the numbers
-  of pruned directions and affected components for diagnosis. Before validating
-  or reconstructing loadings, it round-trips the selected floor through the
-  model dtype and `softplus(psi_rho) + model._eps`. The reported `b`, the strict
-  retained-eigenvalue check, and `sqrt(lam_j - b)` therefore all use the value
-  actually stored by the model rather than an idealized float64 target.
+  The first direction can enter the noise pool too, giving `d_k = 0` and
+  `Sigma_k = b I`. A spherical component contributes its full covariance trace
+  and all `D` dimensions, weighted by `N_k`, to the pooled noise estimate. Its
+  mean and mixture weight continue updating; no Gaussian is removed. The active
+  set is a feasibility update conditional on Cattell's caps, not a replacement
+  intrinsic-dimension criterion.
+
+  Before reconstructing loadings, surgery round-trips the selected floor through
+  `softplus(psi_rho) + model._eps`, including the epsilon addition in the model
+  dtype. If rounding invalidates a retained direction, the smallest offending
+  eigenvalue enters the noise pool and the floor is recomputed and encoded
+  again. This repeats until every retained eigenvalue exceeds the stored floor,
+  allowing every component to become spherical. The reported `b`, validation,
+  and `sqrt(lam_j - b)` all use that stored value. Surgery reports the initial
+  `b_shared_at_cattell` and the final numbers of pruned directions and affected
+  components, including directions removed during rounding correction. Rank
+  histograms include spherical components in bin zero.
 
   The reconstruction uses `Sigma_k = W_k W_k^T + b_* I` with
   `scale_j = sqrt(lam_j - b_*)`. All `q_max` columns are written from the
@@ -226,6 +242,29 @@ Epoch-boundary surgery runs *after* each epoch's best-model bookkeeping, so the
 selected metric and the state it selected describe the same model — but it competes on
 the same validation metric, otherwise a surgery landing on the final epoch would
 be thrown away by the end-of-run rollback.
+
+### Experimental hard-assignment surgery
+
+Set `experimental.hard_assignment_covariance: true` in pipeline YAML, or pass
+`--hard-assignment-covariance` to `dalg-run-training-hddc`. The default is false.
+This option requires Adam with periodic surgery enabled; full-data EM rejects it.
+
+For each frozen E-pass, replace responsibilities with one-hot posterior argmax
+memberships before accumulating **all** statistics. Counts, updated means,
+mixture weights, covariance, and shared-noise pooling therefore use the hard
+partition. Covariance is centered on the updated hard-cluster mean and divided
+by its count `N_k`, without a sample-covariance correction. Rank selection and
+optimizer-state reset use the existing surgery implementation.
+
+The minimum-count cutoff now uses hard counts. Empty clusters are skipped even
+when `surgery_min_count: 0`; skipped components preserve their means and mixture
+weights, and still inherit any change to the global shared noise floor.
+Component-sharded runs select a single winner across all shards, breaking ties
+by the lowest global component index. Adam steps and likelihood scoring continue
+to use the usual soft mixture model.
+
+See the [experimental YAML fields](../reference/training-pipeline-config.md#experimental)
+for configuration and sweep examples.
 
 ## At a glance
 
@@ -297,10 +336,12 @@ five-file deletion.
   `training_mode=component_shard`; component-sharded checkpoints retain their
   existing noise modes and formats.
 - **The shared floor must remain below every retained eigenvalue.** The active
-  set removes optional Cattell directions that do not clear the jointly updated
-  floor. Surgery still fails with the offending component if even its mandatory
-  first eigenvalue is not above `b`; clamping would report a rank-one component
-  whose only loading variance was actually zero.
+  set and dtype-rounding correction remove directions that do not clear the
+  jointly updated floor, including the first. A component with no remaining
+  signal directions has rank zero and covariance `b I`; subsequent updates can
+  restore its rank. This does not relax nonfinite-statistics or parameter checks.
+  Component-specific-noise surgery keeps its existing minimum-rank and strict
+  floor checks.
 - On noiseless data, `b_k` is driven to the numerical floor and the NLL goes
   strongly negative; do not compare it naively with noisy-data likelihoods.
 

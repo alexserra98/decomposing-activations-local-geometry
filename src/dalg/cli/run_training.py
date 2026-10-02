@@ -315,7 +315,12 @@ def _fit_and_save_centroids(
         token_loader=None,
         refine_epochs=args.refine_epochs,
     )
-    torch.save(centroids.cpu(), centroids_path)
+    if centroids_path.name == "kmeans_model.pt":
+        from dalg.init.kmeans_model import save_reservoir_initialization
+
+        save_reservoir_initialization(centroids_path, centroids, data=data, args=args)
+    else:
+        torch.save(centroids.cpu(), centroids_path)
     print(f"Centroids: {tuple(centroids.shape)} saved to {centroids_path}")
 
 
@@ -328,14 +333,27 @@ def _ensure_centroids(
     device: str,
     barrier: bool,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Resolve centroids for the run, then load them on every rank.
+    """Load model means/PCs, legacy centroids, or fit a reservoir initializer."""
+    from dalg.init.kmeans_model import load_kmeans_initialization
 
-    Order of precedence on rank 0:
-    1. If ``<out_dir>/centroids.pt`` already exists, use it.
-    2. Otherwise, if ``--centroids-path`` points to an existing file (or a
-       directory containing ``centroids.pt``), copy it into the run dir.
-    3. Otherwise, fit a fresh KMeans from streamed shards.
-    """
+    required_pca_rank = args.rank if args.direction_init == "cluster_pca" else None
+    provided_model = getattr(args, "kmeans_model_path", None)
+    if provided_model:
+        return load_kmeans_initialization(
+            provided_model, expected_k=args.K, expected_d=data["d_model"],
+            rank=required_pca_rank, device=device,
+        )
+    model_path = out_dir / "initialization" / "kmeans_model.pt"
+    legacy_path = out_dir / "centroids.pt"
+    if not getattr(args, "centroids_path", None) and not legacy_path.exists():
+        if is_main and not model_path.exists():
+            _fit_and_save_centroids(model_path, data, args, device=device)
+        if barrier and dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        return load_kmeans_initialization(
+            model_path, expected_k=args.K, expected_d=data["d_model"],
+            rank=required_pca_rank, device=device,
+        )
     centroids_path = out_dir / "centroids.pt"
     if is_main and not centroids_path.exists():
         provided = getattr(args, "centroids_path", None)
@@ -422,6 +440,7 @@ def _write_run_config(
     cfg = {
         "K": args.K,
         "rank": args.rank,
+        "kmeans_model_path": getattr(args, "kmeans_model_path", None),
         "epochs": args.epochs,
         "early_stop_delta": args.early_stop_delta,
         "steps_per_epoch": args.steps_per_epoch,
@@ -457,6 +476,7 @@ def _maybe_init_wandb(args, data: dict, *, training_mode: str, world_size: int, 
     run_config = {
         "K": args.K,
         "rank": args.rank,
+        "kmeans_model_path": getattr(args, "kmeans_model_path", None),
         "epochs": args.epochs,
         "early_stop_delta": args.early_stop_delta,
         "steps_per_epoch": args.steps_per_epoch,
@@ -818,10 +838,14 @@ def validate_args(args) -> None:
             raise SystemExit("train: component_shard requires --device cuda")
     if args.steps_per_epoch is not None and args.steps_per_epoch <= 0:
         raise SystemExit("train: --steps-per-epoch must be positive")
-    if args.direction_init == "cluster_pca" and not args.centroids_path:
+    if getattr(args, "kmeans_model_path", None) and args.centroids_path:
+        raise SystemExit("train: set only one of --kmeans-model-path and --centroids-path")
+    if args.direction_init == "cluster_pca" and not (
+        args.centroids_path or getattr(args, "kmeans_model_path", None)
+    ):
         raise SystemExit(
-            "train: --direction-init cluster_pca requires --centroids-path "
-            "pointing to an enriched centroid artifact"
+            "train: --direction-init cluster_pca requires --kmeans-model-path "
+            "with stored PCs (or legacy --centroids-path)"
         )
     if (
         args.epochs <= 0
@@ -843,6 +867,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--layer", type=int, required=True, help="Layer to train on")
     p.add_argument("--out-dir", default=None, help="Where to save centroids/model")
     p.add_argument(
+        "--kmeans-model-path", default=None,
+        help="KMeans checkpoint supplying mu and optional KNN initialization directions W_init.",
+    )
+    p.add_argument(
         "--centroids-path",
         default=None,
         help="Path to a pre-computed centroid artifact (or a directory containing one) "
@@ -853,7 +881,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["random", "cluster_pca"],
         default="random",
         help="Initialize loading directions randomly or from the first --rank "
-             "principal components stored in --centroids-path.",
+             "KNN principal components (W_init) stored in --kmeans-model-path.",
     )
     p.add_argument("--val-frac", type=float, default=0.05)
     p.add_argument("--split-seed", type=int, default=42)

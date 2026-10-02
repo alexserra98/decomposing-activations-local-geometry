@@ -1,11 +1,11 @@
-"""Evaluate how an MFA tiles a dataset with planted toy manifolds."""
+"""Evaluate how a model tiles a dataset with planted toy manifolds."""
 
 from __future__ import annotations
 
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 from sklearn.metrics import (
@@ -33,6 +33,10 @@ def _resolve_device(value: str) -> torch.device:
 
 
 def _load_model(run_dir: Path, model_kind: str):
+    if model_kind == "kmeans":
+        from dalg.models.kmeans import load_kmeans
+
+        return load_kmeans(run_dir / "kmeans_model.pt", map_location="cpu")
     model_path = run_dir / "mfa_model.pt"
     if model_kind == "mfa":
         from dalg.models.mfa import load_mfa
@@ -86,6 +90,47 @@ def _mean_nll(
     return total_nll / total_points
 
 
+@torch.no_grad()
+def _quantization_error(
+    model,
+    *,
+    shard_dir: Path,
+    layer: int,
+    positions: list[int],
+    batch_size: int,
+    drop_prefix: int,
+    device: torch.device,
+) -> dict[str, float | int | None]:
+    """Measure squared distances, reporting no mean for an empty split."""
+    if not positions:
+        return {"sum_squared_distance": 0.0, "mean_squared_distance": None, "n": 0}
+    dataset = ActivationBatchDataset(
+        shard_dir,
+        layer=layer,
+        row_subset=positions,
+        batch_size=batch_size,
+        drop_prefix=drop_prefix,
+        dtype=torch.float32,
+        shuffle_shards=False,
+        shuffle_within_shard=False,
+        seed=0,
+    )
+    total_squared_distance = 0.0
+    total_points = 0
+    for batch in DataLoader(dataset, batch_size=None, num_workers=0):
+        x = batch.to(device, non_blocking=(device.type == "cuda"))
+        assigned_means = model.mu[model.predict(x)]
+        total_squared_distance += float((x.double() - assigned_means.double()).square().sum())
+        total_points += len(x)
+    if total_points == 0:
+        raise ValueError("cannot evaluate quantization error on an empty split")
+    return {
+        "sum_squared_distance": total_squared_distance,
+        "mean_squared_distance": total_squared_distance / total_points,
+        "n": total_points,
+    }
+
+
 def evaluate_toy_manifold_tiling(
     run_dir: str | Path,
     *,
@@ -98,8 +143,8 @@ def evaluate_toy_manifold_tiling(
     rank_threshold: float = 1.0,
     max_mean_to_manifold_distance: float | None = None,
 ) -> dict[str, Any]:
-    """Evaluate one MFA-family run against planted toy-manifold structure."""
-    if model_kind != "hddc" and rank_threshold <= 0.0:
+    """Evaluate one model run against planted toy-manifold structure."""
+    if model_kind not in {"hddc", "kmeans"} and rank_threshold <= 0.0:
         raise ValueError("rank_threshold must be positive")
     if max_mean_to_manifold_distance is not None and (
         not math.isfinite(max_mean_to_manifold_distance)
@@ -108,15 +153,16 @@ def evaluate_toy_manifold_tiling(
         raise ValueError("max_mean_to_manifold_distance must be finite and positive")
 
     run_dir = Path(run_dir)
+    model_stem = "kmeans_model" if model_kind == "kmeans" else "mfa_model"
     assignments_path = (
         Path(assignments_path)
         if assignments_path is not None
-        else run_dir / "mfa_model_assignments.pt"
+        else run_dir / f"{model_stem}_assignments.pt"
     )
     required = [
         run_dir / "config.json",
         run_dir / "val_indices.json",
-        run_dir / "mfa_model.pt",
+        run_dir / f"{model_stem}.pt",
         assignments_path,
     ]
     missing = [str(path) for path in required if not path.is_file()]
@@ -162,6 +208,35 @@ def evaluate_toy_manifold_tiling(
         mmap=True,
         weights_only=True,
     )
+    if model_kind == "kmeans":
+        integer_dtypes = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
+        for field in ("assignments", "cluster_sizes"):
+            value = assignment_bundle.get(field)
+            if not isinstance(value, torch.Tensor) or value.dtype not in integer_dtypes:
+                raise ValueError(f"KMeans assignment {field} must contain integer values")
+        if assignment_bundle.get("model_type") != "kmeans":
+            raise ValueError("KMeans assignment model_type must be 'kmeans'")
+        saved_model_path = assignment_bundle.get("model_path")
+        if not isinstance(saved_model_path, str) or (
+            Path(saved_model_path).resolve() != (run_dir / "kmeans_model.pt").resolve()
+        ):
+            raise ValueError("KMeans assignment model_path does not match the evaluated checkpoint")
+        if "subset_spec" not in assignment_bundle:
+            raise ValueError("KMeans assignments must record subset_spec")
+        source = assignment_bundle.get("source")
+        if not isinstance(source, Mapping):
+            raise ValueError("KMeans assignments must record source provenance")
+        saved_shard_dir = source.get("shard_dir")
+        if not isinstance(saved_shard_dir, str) or (
+            Path(saved_shard_dir).resolve() != clean_shard_dir.resolve()
+        ):
+            raise ValueError("KMeans assignment source.shard_dir does not match the evaluation dataset")
+        for field, expected in (
+            ("layer", layer), ("drop_prefix", drop_prefix), ("num_items", len(positions))
+        ):
+            if type(source.get(field)) is not int or source[field] != expected:
+                raise ValueError(f"KMeans assignment source.{field} does not match the evaluation dataset")
+
     assignments = assignment_bundle["assignments"].reshape(-1).long()
     cluster_sizes = assignment_bundle["cluster_sizes"].reshape(-1).long()
     if assignment_bundle.get("subset_spec") != subset_spec:
@@ -204,44 +279,84 @@ def evaluate_toy_manifold_tiling(
 
     resolved_device = _resolve_device(device)
     model = model.to(resolved_device).eval()
-    train_nll = _mean_nll(
-        model,
-        shard_dir=clean_shard_dir,
-        layer=layer,
-        positions=train_positions,
-        batch_size=batch_size,
-        drop_prefix=drop_prefix,
-        device=resolved_device,
-    )
-    val_nll = _mean_nll(
-        model,
-        shard_dir=clean_shard_dir,
-        layer=layer,
-        positions=val_positions,
-        batch_size=batch_size,
-        drop_prefix=drop_prefix,
-        device=resolved_device,
-    )
-    n_train = len(train_positions) * (window - drop_prefix)
-    bic_parameters = model_parameter_count(model, model_kind)
-    standard_bic = bic_from_mean_nll(
-        model,
-        model_kind,
-        mean_nll=train_nll,
-        n=n_train,
-    )
-    train_mask = torch.tensor(
-        [position not in val_position_set for position in positions],
-        dtype=torch.bool,
-    )
-    train_cluster_sizes = torch.bincount(assignments[train_mask], minlength=model.K)
-    active_components = int((train_cluster_sizes > 0).sum())
-    bic = active_bic_from_standard(
-        standard_bic,
-        n=n_train,
-        active_components=active_components,
-        K=model.K,
-    )
+    if model_kind == "kmeans":
+        if not train_positions:
+            raise ValueError("cannot evaluate KMeans quantization error on an empty training split")
+        fit_metrics = {
+            "quantization": {
+                name: _quantization_error(
+                    model,
+                    shard_dir=clean_shard_dir,
+                    layer=layer,
+                    positions=split_positions,
+                    batch_size=batch_size,
+                    drop_prefix=drop_prefix,
+                    device=resolved_device,
+                )
+                for name, split_positions in (
+                    ("train", train_positions), ("validation", val_positions)
+                )
+            }
+        }
+        fit_metrics["quantization"]["convention"] = "lower_is_better"
+    else:
+        train_nll = _mean_nll(
+            model,
+            shard_dir=clean_shard_dir,
+            layer=layer,
+            positions=train_positions,
+            batch_size=batch_size,
+            drop_prefix=drop_prefix,
+            device=resolved_device,
+        )
+        val_nll = _mean_nll(
+            model,
+            shard_dir=clean_shard_dir,
+            layer=layer,
+            positions=val_positions,
+            batch_size=batch_size,
+            drop_prefix=drop_prefix,
+            device=resolved_device,
+        )
+        n_train = len(train_positions) * (window - drop_prefix)
+        bic_parameters = model_parameter_count(model, model_kind)
+        standard_bic = bic_from_mean_nll(
+            model,
+            model_kind,
+            mean_nll=train_nll,
+            n=n_train,
+        )
+        train_mask = torch.tensor(
+            [position not in val_position_set for position in positions],
+            dtype=torch.bool,
+        )
+        train_cluster_sizes = torch.bincount(assignments[train_mask], minlength=model.K)
+        active_components = int((train_cluster_sizes > 0).sum())
+        bic = active_bic_from_standard(
+            standard_bic,
+            n=n_train,
+            active_components=active_components,
+            K=model.K,
+        )
+
+        fit_metrics = {
+            "nll": {"train": train_nll, "validation": val_nll},
+            "bic": {
+                "value": bic,
+                "standard_bic": standard_bic,
+                "standard_bic_per_sample_reward": -standard_bic / n_train,
+                "activity_reward": active_components,
+                "active_components": active_components,
+                "inactive_components": int(model.K) - active_components,
+                "K": int(model.K),
+                "parameters": bic_parameters,
+                "n": n_train,
+                "split": "train",
+                "assignment_rule": "hard_map_count_greater_than_zero",
+                "formula": "-standard_bic / n + active_components",
+                "convention": "higher_is_better",
+            },
+        }
 
     true_ids = row_manifold_ids.numpy()
     predicted_ids = assignments.numpy()
@@ -277,22 +392,7 @@ def evaluate_toy_manifold_tiling(
             "train_rows": len(train_positions),
             "validation_rows": len(val_positions),
         },
-        "nll": {"train": train_nll, "validation": val_nll},
-        "bic": {
-            "value": bic,
-            "standard_bic": standard_bic,
-            "standard_bic_per_sample_reward": -standard_bic / n_train,
-            "activity_reward": active_components,
-            "active_components": active_components,
-            "inactive_components": int(model.K) - active_components,
-            "K": int(model.K),
-            "parameters": bic_parameters,
-            "n": n_train,
-            "split": "train",
-            "assignment_rule": "hard_map_count_greater_than_zero",
-            "formula": "-standard_bic / n + active_components",
-            "convention": "higher_is_better",
-        },
+        **fit_metrics,
         "clustering": clustering,
         "components": {
             "live": int(assignment_live.sum()),
@@ -303,3 +403,22 @@ def evaluate_toy_manifold_tiling(
 
 
 __all__ = ["evaluate_toy_manifold_tiling"]
+
+
+def evaluate_pipeline_run(run: Mapping[str, Any], *, evaluation: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Evaluate a manifest row using its saved model and assignment artifacts."""
+    cfg = run["evaluation"] if evaluation is None else evaluation
+    if cfg["kind"] != "toy_manifold_tiling":
+        raise ValueError(f"unsupported evaluator: {cfg['kind']!r}")
+    stem = "kmeans_model" if run["training"]["model_kind"] == "kmeans" else "mfa_model"
+    metrics = evaluate_toy_manifold_tiling(
+        run["run_dir"], shard_dir=run["dataset"]["shard_dir"],
+        layer=int(run["dataset"]["layer"]), model_kind=run["training"]["model_kind"],
+        assignments_path=Path(run["run_dir"]) / f"{stem}_assignments.pt",
+        batch_size=int(cfg["batch_size"]), device=str(cfg["device"]),
+        rank_threshold=float(cfg["rank_threshold"]),
+        max_mean_to_manifold_distance=(None if cfg["max_mean_to_manifold_distance"] is None
+                                      else float(cfg["max_mean_to_manifold_distance"])),
+    )
+    metrics.update(run_id=run["run_id"], identity_hash=run["identity_hash"])
+    return metrics

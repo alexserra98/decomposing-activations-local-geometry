@@ -2,6 +2,7 @@ import os
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
 
@@ -12,13 +13,17 @@ from dalg.models.mfa import load_mfa
 
 
 def _load_assignment_model(model_path: Path, model_type: str):
-    """Load the explicitly selected MFA implementation."""
+    """Load the explicitly selected model implementation."""
+    if model_type == "kmeans":
+        from dalg.models.kmeans import load_kmeans
+
+        return load_kmeans(model_path, map_location="cpu")
     if model_type == "hddc":
         from dalg.models.adaptive_q.mfa_hddc import load_mfa_hddc
 
         return load_mfa_hddc(model_path, map_location="cpu")
     if model_type != "mfa":
-        raise ValueError(f"Unknown model_type={model_type!r}; expected 'mfa' or 'hddc'")
+        raise ValueError(f"Unknown model_type={model_type!r}; expected 'mfa', 'hddc', or 'kmeans'")
     return load_mfa(model_path, map_location="cpu")
 
 
@@ -59,7 +64,7 @@ def compute_assignments(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """
     Single-pass streaming over `loader`. Per point, takes the argmax of the
-    MFA responsibilities and accumulates:
+    model responsibilities and accumulates:
       - cluster sizes (K,)
       - hard assignments (N,)
       - max responsibility per sample (N,)
@@ -70,7 +75,7 @@ def compute_assignments(
     model = _load_assignment_model(model_path, model_type).to(device)
     model.eval()
     K = model.K
-    print(f"MFA: K={K} components  D={model.D}  rank={model.q}")
+    print(f"{model_type}: K={K} components  D={model.D}  rank={model.q}")
 
     sizes = torch.zeros(K, dtype=torch.long, device=device)
     peakedness_sums = {
@@ -80,21 +85,35 @@ def compute_assignments(
     assignment_chunks: list[torch.Tensor] = []
     max_resp_chunks: list[torch.Tensor] = []
 
-    with torch.no_grad(), model.inference_cache(enabled=use_inference_cache):
+    cache = (
+        nullcontext()
+        if model_type == "kmeans"
+        else model.inference_cache(enabled=use_inference_cache)
+    )
+    with torch.no_grad(), cache:
         for batch_idx, batch in enumerate(tqdm(loader, desc="streaming assignments + peakedness")):
             if max_batches is not None and batch_idx >= max_batches:
                 break
             x = batch[0] if isinstance(batch, (list, tuple)) else batch
             x = x.to(device, non_blocking=(device.type == "cuda"))
-            r = model.responsibilities(x)           # (B, K)
-            top = r.max(dim=1)
-            assign = top.indices                    # stays on device
-            max_resp = top.values                   # (B,)
+            if model_type == "kmeans":
+                assign = model.predict(x)
+                max_resp = torch.ones(len(assign), device=device)
+                point_peakedness = {
+                    "entropy": torch.zeros_like(max_resp),
+                    "one_minus_max": torch.zeros_like(max_resp),
+                    "top1_minus_top2": max_resp,
+                }
+            else:
+                r = model.responsibilities(x)
+                top = r.max(dim=1)
+                assign, max_resp = top.indices, top.values
+                point_peakedness = {name: fn(r) for name, fn in PEAKEDNESS_METRICS.items()}
             sizes += torch.bincount(assign, minlength=K)
             assignment_chunks.append(assign.cpu())
             max_resp_chunks.append(max_resp.cpu())
-            for name, fn in PEAKEDNESS_METRICS.items():
-                peakedness_sums[name].scatter_add_(0, assign, fn(r).float())
+            for name, values in point_peakedness.items():
+                peakedness_sums[name].scatter_add_(0, assign, values.float())
 
     assignments = torch.cat(assignment_chunks) if assignment_chunks else torch.empty(0, dtype=torch.long)
     max_responsibilities = torch.cat(max_resp_chunks) if max_resp_chunks else torch.empty(0, dtype=torch.float32)
@@ -123,8 +142,8 @@ def main() -> None:
     )
     from dalg.data.subset_spec import resolve_spec_positions, split_shard_dir_spec
 
-    parser = argparse.ArgumentParser(description="Compute MFA cluster assignments for sharded activations")
-    parser.add_argument("--model-path", type=Path, required=True, help="Path to mfa_model.pt")
+    parser = argparse.ArgumentParser(description="Compute model cluster assignments for sharded activations")
+    parser.add_argument("--model-path", type=Path, required=True, help="Path to a model checkpoint")
     parser.add_argument("--shard-dir", type=Path, required=True, help="Directory produced by extract-windows")
     parser.add_argument("--layer", type=int, required=True, help="Layer index to stream from shard-dir")
     parser.add_argument("--batch-size", "--batch_size", dest="batch_size", type=int, default=1024)
@@ -135,7 +154,7 @@ def main() -> None:
     parser.add_argument("--save-path", type=Path, default=None)
     parser.add_argument(
         "--model-type",
-        choices=("mfa", "hddc"),
+        choices=("mfa", "hddc", "kmeans"),
         default="mfa",
         help="Checkpoint implementation to load (ARD checkpoints use the mfa default)",
     )
@@ -153,7 +172,7 @@ def main() -> None:
     window = int(extract_cfg["window"])
     drop_prefix = args.drop_prefix
     if drop_prefix is None:
-        drop_prefix = int(extract_cfg.get("drop_prefix", 32))
+        drop_prefix = int(extract_cfg.get("drop_prefix", 0 if args.model_type == "kmeans" else 32))
 
     meta_index = load_meta_index(shard_dir, layer=args.layer)
     positions = resolve_spec_positions(
@@ -203,7 +222,14 @@ def main() -> None:
         "peakedness": peakedness,
         "K": int(sizes.numel()),
         "model_type": args.model_type,
+        "model_path": str(args.model_path),
         "subset_spec": subset_spec,
+        "source": {
+            "shard_dir": str(shard_dir),
+            "layer": int(args.layer),
+            "drop_prefix": int(drop_prefix),
+            "num_items": int(assignments.numel()),
+        },
     }, save_path)
     print(f"Assignments saved to {save_path}")
 

@@ -11,7 +11,9 @@ Compute only the assignment variant requested by the user. Do not automatically 
 
 1. Read `references/assignments.md` before planning or executing an assignment job.
 2. Inspect `src/dalg/cli/run_metrics.py`, the selected implementation module, and the relevant Slurm script when behavior or defaults matter.
-3. Determine the requested assignment rule: MFA responsibility argmax or nearest Euclidean centroid. Treat the latter as agnostic to how the centroids were obtained.
+3. A pipeline KMeans checkpoint uses the standard model-assignment route with
+   `--model-type kmeans`; its one-hot responsibilities encode nearest centroids.
+   Determine the requested assignment rule: MFA responsibility argmax or nearest Euclidean centroid. Treat the latter as agnostic to how the centroids were obtained.
 4. Verify the model or centroid artifact, activation shard configuration, layer, subset suffix, and intended save path.
 5. Reuse an existing valid assignment file unless recomputation or repair was requested.
 6. Save MFA-derived assignments inside the model run directory. Save centroid-only assignments beside the centroid or medoid artifact unless the user specifies otherwise.

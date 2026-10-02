@@ -124,17 +124,15 @@ def expectation_step(
 
 @torch.no_grad()
 def maximization_step(model, statistics: EMStatistics, cfg: EMConfig):
-    """Update every component atomically from one frozen full-data E-pass."""
+    """Update live components and give zero weight to zero-membership components."""
     _validate_model(model)
     cfg.validate()
     if statistics.residual_sum is None or statistics.scatter is None:
         raise ValueError("M-step requires first and second moments")
-    empty = (statistics.counts <= 0).nonzero(as_tuple=True)[0]
-    if empty.numel():
-        raise ValueError(f"EM requires positive effective membership; unsupported components: {empty[:10].tolist()}")
     return reconstruct_components(
         model, statistics.counts, statistics.residual_sum, statistics.scatter,
         SurgeryConfig(threshold=cfg.threshold, min_count=0, eig_batch_size=cfg.eig_batch_size),
+        full_mixture_update=True,
     )
 
 
@@ -245,6 +243,7 @@ def train_em_hddc(
                 "b": float(model._psi()[0, 0]), "rank_min": int(ranks.min()),
                 "rank_max": int(ranks.max()), "rank_mean": float(ranks.double().mean()),
                 "rank_histogram": torch.bincount(ranks, minlength=model.q + 1).tolist(),
+                "dead_components": int(torch.isneginf(model.pi_logits).sum()),
                 "rank_changes": rank_changes, "membership_min": float(statistics.counts.min()),
                 "membership_max": float(statistics.counts.max()), "n_rows": statistics.n_rows,
                 "e_step_seconds": e_step_seconds, "m_step_seconds": m_step_seconds,
@@ -256,7 +255,7 @@ def train_em_hddc(
             history.append(record)
             log(f"[em] iteration={epoch} train_nll={statistics.nll:.8g} val_nll={val_nll} "
                 f"b={record['b']:.6g} ranks={record['rank_min']}..{record['rank_max']} "
-                f"changed={rank_changes} seconds={record['iteration_seconds']:.2f}")
+                f"changed={rank_changes} dead={record['dead_components']} seconds={record['iteration_seconds']:.2f}")
             if _wandb_active():
                 import wandb
                 wandb.log({f"em/{key}": value for key, value in record.items() if value is not None})

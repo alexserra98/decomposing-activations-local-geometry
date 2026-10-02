@@ -25,9 +25,16 @@ MANIFOLD_NAMES = (
     "hypersphere_10d",
     "product_torus_12d",
     "cylinder",
+    "swiss_roll_10d",
+    "cylinder_10d",
+    "swiss_roll_12d",
+    "helix_12d",
+    "product_torus_6d",
+    "hypersphere_6d",
+    "product_torus_4d",
 )
-INTRINSIC_DIMS = (1, 1, 2, 2, 2, 2, 2, 1, 1, 10, 12, 2)
-EMBEDDING_DIMS = (1, 2, 2, 3, 3, 3, 3, 3, 4, 11, 24, 3)
+INTRINSIC_DIMS = (1, 1, 2, 2, 2, 2, 2, 1, 1, 10, 12, 2, 10, 10, 2, 1, 6, 6, 4)
+EMBEDDING_DIMS = (1, 2, 2, 3, 3, 3, 3, 3, 4, 11, 24, 3, 11, 11, 12, 12, 12, 7, 8)
 
 
 @dataclass(frozen=True)
@@ -61,7 +68,7 @@ class ToyManifoldConfig:
     swiss_theta_min: float = 1.5 * math.pi
     swiss_theta_max: float = 4.5 * math.pi
     swiss_height_min: float = 0.0
-    swiss_height_max: float = 10.0 * 4.5 * math.pi
+    swiss_height_max: float = 2.0 * 4.5 * math.pi  # Default outer diameter.
     helix_theta_min: float = 0.0
     helix_theta_max: float = 4.0 * math.pi
     helix_alpha: float = 0.2
@@ -320,6 +327,16 @@ def _sample_hypersphere_10d(
     return points / norms
 
 
+def _sample_hypersphere_6d(
+    n: int, generator: torch.Generator, _config: ToyManifoldConfig
+) -> torch.Tensor:
+    points = torch.randn(n, 7, generator=generator, dtype=torch.float64)
+    norms = points.norm(dim=1, keepdim=True)
+    if torch.any(norms == 0.0):
+        raise RuntimeError("hypersphere sampler produced a zero direction")
+    return points / norms
+
+
 def _sample_product_torus_12d(
     n: int, generator: torch.Generator, _config: ToyManifoldConfig
 ) -> torch.Tensor:
@@ -332,6 +349,26 @@ def _sample_product_torus_12d(
     return torch.stack((torch.cos(angles), torch.sin(angles)), dim=2).reshape(n, 24)
 
 
+def _sample_product_torus_6d(
+    n: int, generator: torch.Generator, _config: ToyManifoldConfig
+) -> torch.Tensor:
+    """Sample six independent unit circles in twelve native coordinates."""
+    angles = 2.0 * math.pi * torch.rand(
+        n, 6, generator=generator, dtype=torch.float64
+    )
+    return torch.stack((torch.cos(angles), torch.sin(angles)), dim=2).reshape(n, 12)
+
+
+def _sample_product_torus_4d(
+    n: int, generator: torch.Generator, _config: ToyManifoldConfig
+) -> torch.Tensor:
+    """Sample four independent unit circles in eight native coordinates."""
+    angles = 2.0 * math.pi * torch.rand(
+        n, 4, generator=generator, dtype=torch.float64
+    )
+    return torch.stack((torch.cos(angles), torch.sin(angles)), dim=2).reshape(n, 8)
+
+
 def _sample_cylinder(
     n: int, generator: torch.Generator, config: ToyManifoldConfig
 ) -> torch.Tensor:
@@ -339,6 +376,68 @@ def _sample_cylinder(
     circle = _sample_circle(n, generator, config)
     height = _uniform(n, 0.0, 5.0, generator=generator)
     return torch.stack((circle[:, 0], height, circle[:, 1]), dim=1)
+
+
+def _sample_swiss_roll_10d(
+    n: int, generator: torch.Generator, config: ToyManifoldConfig
+) -> torch.Tensor:
+    """Sample a planar Swiss spiral times nine independent height intervals."""
+    theta = _uniform(
+        n, config.swiss_theta_min, config.swiss_theta_max, generator=generator
+    )
+    heights = _uniform(
+        n * 9, config.swiss_height_min, config.swiss_height_max, generator=generator
+    ).reshape(n, 9)
+    spiral = torch.stack((theta * torch.cos(theta), theta * torch.sin(theta)), dim=1)
+    return torch.cat((spiral, heights), dim=1)
+
+
+def _sample_cylinder_10d(
+    n: int, generator: torch.Generator, _config: ToyManifoldConfig
+) -> torch.Tensor:
+    """Sample the unit nine-sphere times the height interval [-2.5, 2.5]."""
+    radial = torch.randn(n, 10, generator=generator, dtype=torch.float64)
+    norms = radial.norm(dim=1, keepdim=True)
+    if torch.any(norms == 0.0):
+        raise RuntimeError("10D-cylinder sampler produced a zero direction")
+    height = _uniform(n, -2.5, 2.5, generator=generator)
+    return torch.cat((radial / norms, height[:, None]), dim=1)
+
+
+def _swiss_roll_12d_points(theta: torch.Tensor, height: torch.Tensor) -> torch.Tensor:
+    """Evaluate the harmonic Swiss roll for scalar or batched parameters."""
+    frequencies = torch.arange(1, 6, dtype=theta.dtype, device=theta.device)
+    angles = theta[..., None] * frequencies
+    radii = theta[..., None] / frequencies
+    spiral = torch.stack((radii * angles.cos(), radii * angles.sin()), dim=-1)
+    return torch.cat((theta[..., None], height[..., None], spiral.flatten(-2)), dim=-1)
+
+
+def _sample_swiss_roll_12d(
+    n: int, generator: torch.Generator, config: ToyManifoldConfig
+) -> torch.Tensor:
+    """Sample five spiral pairs plus angle and height, with intrinsic dimension two."""
+    theta = _uniform(
+        n, config.swiss_theta_min, config.swiss_theta_max, generator=generator
+    )
+    height = _uniform(
+        n, config.swiss_height_min, config.swiss_height_max, generator=generator
+    )
+    return _swiss_roll_12d_points(theta, height)
+
+
+def _helix_12d_points(theta: torch.Tensor) -> torch.Tensor:
+    """Evaluate six unit circular pairs driven by a single angle."""
+    frequencies = torch.arange(1, 7, dtype=theta.dtype, device=theta.device)
+    angles = theta[..., None] * frequencies
+    return torch.stack((angles.cos(), angles.sin()), dim=-1).flatten(-2)
+
+
+def _sample_helix_12d(
+    n: int, generator: torch.Generator, _config: ToyManifoldConfig
+) -> torch.Tensor:
+    theta = _uniform(n, 0.0, 2.0 * math.pi, generator=generator)
+    return _helix_12d_points(theta)
 
 
 def _surface_max_abs_principal_curvature(
@@ -445,6 +544,19 @@ def _raw_max_abs_curvatures(config: ToyManifoldConfig) -> torch.Tensor:
         + (config.helix_4d_radius_zw * config.helix_4d_frequency_zw**2) ** 2
     )
     helix_4d_curvature = helix_4d_acceleration_norm / helix_4d_speed_squared
+    # The harmonic Swiss spiral's curvature decreases with |theta|. Its
+    # independent, orthogonal height direction has zero curvature.
+    theta_squared = closest_swiss_theta**2
+    swiss_12d_speed_squared = (
+        1.0 + sum(1.0 / k**2 for k in range(1, 6)) + 5.0 * theta_squared
+    )
+    swiss_12d_acceleration_squared = 20.0 + 55.0 * theta_squared
+    swiss_12d_curvature = math.sqrt(
+        swiss_12d_speed_squared * swiss_12d_acceleration_squared - 25.0 * theta_squared
+    ) / swiss_12d_speed_squared**1.5
+    helix_12d_curvature = math.sqrt(sum(k**4 for k in range(1, 7))) / sum(
+        k**2 for k in range(1, 7)
+    )
 
     return torch.tensor(
         (
@@ -457,6 +569,13 @@ def _raw_max_abs_curvatures(config: ToyManifoldConfig) -> torch.Tensor:
             swiss_curvature,
             helix_curvature,
             helix_4d_curvature,
+            1.0,
+            1.0,
+            1.0,
+            swiss_curvature,
+            1.0,
+            swiss_12d_curvature,
+            helix_12d_curvature,
             1.0,
             1.0,
             1.0,
@@ -479,6 +598,13 @@ _SAMPLERS: tuple[_Sampler, ...] = (
     _sample_hypersphere_10d,
     _sample_product_torus_12d,
     _sample_cylinder,
+    _sample_swiss_roll_10d,
+    _sample_cylinder_10d,
+    _sample_swiss_roll_12d,
+    _sample_helix_12d,
+    _sample_product_torus_6d,
+    _sample_hypersphere_6d,
+    _sample_product_torus_4d,
 )
 
 

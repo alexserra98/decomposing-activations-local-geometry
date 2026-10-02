@@ -22,9 +22,15 @@ from dalg.data.manifold_dataset import (
     MANIFOLD_NAMES,
     _generator,
     _sample_cylinder,
+    _sample_cylinder_10d,
+    _sample_swiss_roll_10d,
     _sample_helix_4d,
+    _sample_helix_12d,
+    _sample_swiss_roll_12d,
     _sample_hypersphere_10d,
     _sample_product_torus_12d,
+    _sample_product_torus_6d,
+    _sample_product_torus_4d,
 )
 from dalg.models.mfa import MFA
 from dalg.models.train import train_nll
@@ -170,6 +176,40 @@ def test_special_raw_samples_satisfy_manifold_constraints() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("dim", "sampler"), [(4, _sample_product_torus_4d), (6, _sample_product_torus_6d)]
+)
+def test_product_torus_samples_and_saved_geometry(dim, sampler) -> None:
+    config = _tiny_config(
+        ambient_dim=2 * dim,
+        manifold_types=(f"product_torus_{dim}d",),
+        manifolds_per_type=1,
+        noise_ratio=None,
+    )
+    raw = sampler(128, _generator(config.seed, 0), config)
+    assert raw.shape == (128, 2 * dim)
+    assert torch.allclose(
+        raw.reshape(128, dim, 2).norm(dim=2),
+        torch.ones((128, dim), dtype=torch.float64),
+        atol=1e-12,
+        rtol=0.0,
+    )
+    dataset, metadata = make_toy_manifold_dataset(config)
+    raw_points = (
+        (dataset.tensors[0].double() - metadata["offsets"][0])
+        @ metadata["embeddings"][0].T
+    ) * metadata["calibration_scales"][0] + metadata["calibration_means"][0]
+    assert torch.allclose(
+        raw_points.reshape(-1, dim, 2).norm(dim=2),
+        torch.ones((config.n_samples, dim), dtype=torch.float64),
+        atol=1e-6,
+        rtol=0.0,
+    )
+    assert metadata["intrinsic_dims"] == (dim,)
+    assert metadata["embedding_dims"] == (2 * dim,)
+    assert metadata["raw_max_abs_curvatures"].tolist() == [1.0]
+
+
 def test_generation_is_deterministic_and_seeded() -> None:
     config = _tiny_config()
     dataset_a, metadata_a = make_toy_manifold_dataset(config)
@@ -238,7 +278,9 @@ def test_raw_curvatures_match_manifold_geometry() -> None:
     assert float(curvatures[8]) == pytest.approx(
         acceleration_norm / speed_squared
     )
-    assert torch.equal(curvatures[9:], torch.ones(3, dtype=torch.float64))
+    assert torch.equal(curvatures[9:12], torch.ones(3, dtype=torch.float64))
+    assert curvatures[12] == curvatures[6]
+    assert curvatures[13] == 1.0
     assert torch.allclose(
         metadata["max_abs_curvatures"],
         curvatures * metadata["calibration_scales"],
@@ -373,7 +415,8 @@ def test_tensor_dataset_runs_through_train_nll() -> None:
 
 
 def test_shard_writer_matches_activation_training_protocol(tmp_path) -> None:
-    config = _tiny_config(n_samples=124)
+    n_samples = max(124, len(MANIFOLD_NAMES) * 8 + 1)
+    config = _tiny_config(n_samples=n_samples)
     expected_dataset, expected_metadata = make_toy_manifold_dataset(config)
     root = save_toy_manifold_shards(
         tmp_path / "toy_manifold_shards",
@@ -389,8 +432,8 @@ def test_shard_writer_matches_activation_training_protocol(tmp_path) -> None:
     assert shard_config["drop_prefix"] == 0
     assert shard_config["d_model"] == 32
     assert shard_config["dtype"] == "float32"
-    assert shard_config["num_rows"] == 124
-    assert shard_config["num_shards"] == 5
+    assert shard_config["num_rows"] == n_samples
+    assert shard_config["num_shards"] == math.ceil(n_samples / 25)
     assert not (root / "tokens").exists()
 
     shard_paths = sorted((root / "layer00").glob("shard_*.pt"))
@@ -408,8 +451,8 @@ def test_shard_writer_matches_activation_training_protocol(tmp_path) -> None:
         assert shard.untyped_storage().nbytes() == shard.numel() * shard.element_size()
 
     meta_index = load_meta_index(root, layer=0)
-    assert len(meta_index) == 124
-    assert [row["global_row"] for row in meta_index] == list(range(124))
+    assert len(meta_index) == n_samples
+    assert [row["global_row"] for row in meta_index] == list(range(n_samples))
     assert {row["subset"] for row in meta_index} == set(MANIFOLD_NAMES)
 
     first_meta = json.loads((root / "meta" / "shard_00000.json").read_text())
@@ -429,7 +472,7 @@ def test_shard_writer_matches_activation_training_protocol(tmp_path) -> None:
         shuffle_within_shard=False,
     )
     streamed = torch.cat(list(dataset))
-    assert dataset.num_items == 124
+    assert dataset.num_items == n_samples
     assert torch.equal(streamed, expected_dataset.tensors[0])
 
     saved_metadata = torch.load(
@@ -466,6 +509,14 @@ def test_shard_writer_rejects_nonempty_output(tmp_path) -> None:
             },
             "largest selected native embedding dimension",
         ),
+        (
+            {"ambient_dim": 11, "manifold_types": ("product_torus_6d",)},
+            "largest selected native embedding dimension",
+        ),
+        (
+            {"ambient_dim": 7, "manifold_types": ("product_torus_4d",)},
+            "largest selected native embedding dimension",
+        ),
         ({"n_samples": 0}, "n_samples"),
         ({"calibration_size": 1}, "calibration_size"),
         ({"manifolds_per_type": 0}, "manifolds_per_type"),
@@ -497,3 +548,193 @@ def test_invalid_configs_raise_clear_errors(overrides, message) -> None:
 def test_non_finite_geometry_is_rejected() -> None:
     with pytest.raises(ValueError, match="finite"):
         make_toy_manifold_dataset(_tiny_config(swiss_theta_max=float("inf")))
+
+
+@pytest.mark.parametrize("custom_bounds", [False, True])
+def test_swiss_roll_10d_raw_geometry(custom_bounds):
+    config = _tiny_config()
+    if custom_bounds:
+        config = replace(config, swiss_theta_min=0.3, swiss_theta_max=1.2,
+                         swiss_height_min=-3.0, swiss_height_max=7.0)
+    raw = _sample_swiss_roll_10d(256, _generator(17, 0), config)
+    assert raw.shape == (256, 11) and raw.dtype == torch.float64
+    theta = raw[:, :2].norm(dim=1)
+    assert torch.all((theta >= config.swiss_theta_min) & (theta <= config.swiss_theta_max))
+    expected = torch.stack((theta * theta.cos(), theta * theta.sin()), dim=1)
+    assert torch.allclose(raw[:, :2], expected, atol=1e-12, rtol=0)
+    assert torch.all((raw[:, 2:] >= config.swiss_height_min) &
+                     (raw[:, 2:] <= config.swiss_height_max))
+    assert not torch.equal(raw[:, 2], raw[:, 3])
+
+
+def test_cylinder_10d_raw_geometry():
+    raw = _sample_cylinder_10d(256, _generator(17, 0), _tiny_config())
+    assert raw.shape == (256, 11) and raw.dtype == torch.float64
+    assert torch.allclose(raw[:, :10].norm(dim=1), torch.ones(256).double(), atol=1e-12)
+    assert torch.all((raw[:, 10] >= -2.5) & (raw[:, 10] <= 2.5))
+    assert raw[:, 10].min() < 0 < raw[:, 10].max()
+
+
+@pytest.mark.parametrize("type_name", ["swiss_roll_10d", "cylinder_10d"])
+def test_ten_dimensional_native_embedding_requirement(type_name):
+    config = _tiny_config(manifold_types=(type_name,), manifolds_per_type=1)
+    with pytest.raises(ValueError, match="dimension \\(11\\)"):
+        make_toy_manifold_dataset(replace(config, ambient_dim=10))
+    dataset, metadata = make_toy_manifold_dataset(replace(config, ambient_dim=11))
+    assert dataset.tensors[0].shape == (120, 11)
+    assert metadata["intrinsic_dims"] == (10,)
+    assert metadata["embedding_dims"] == (11,)
+
+
+def test_mixed_ten_dimensional_shards_and_evaluation_geometry(tmp_path):
+    from dalg.evaluation.toy_manifold_geometry import _project_mean_to_manifold
+
+    names = ("hypersphere_10d", "swiss_roll_10d", "cylinder_10d")
+    config = _tiny_config(n_samples=30, manifold_types=names,
+                         manifolds_per_type=1, noise_ratio=None)
+    dataset, metadata = make_toy_manifold_dataset(config)
+    assert metadata["intrinsic_dims"] == (10, 10, 10)
+    assert metadata["embedding_dims"] == (11, 11, 11)
+    assert torch.equal(metadata["noise_stds"], torch.zeros(3).double())
+    for point, manifold_id in zip(*dataset.tensors):
+        projection = _project_mean_to_manifold(
+            point, metadata["manifolds"][int(manifold_id)], metadata,
+        )
+        assert projection.unique
+        assert projection.distance_squared < 1e-11
+        assert projection.tangent.shape == (32, 10)
+        assert torch.allclose(projection.tangent.T @ projection.tangent,
+                              torch.eye(10).double(), atol=1e-10)
+    root = save_toy_manifold_shards(tmp_path / "mixed_10d", config, shard_size=11)
+    saved = torch.load(root / "manifold_metadata.pt", weights_only=True)
+    shard_config = json.loads((root / "config.json").read_text())
+    assert shard_config["generator_config"]["manifold_types"] == list(names)
+    assert torch.equal(saved["row_manifold_ids"], dataset.tensors[1])
+    index = load_meta_index(root, layer=0)
+    assert [row["subset"] for row in index] == [names[int(i)] for i in dataset.tensors[1]]
+    stream = ActivationBatchDataset(root, layer=0, batch_size=7, drop_prefix=0,
+                                    shuffle_shards=False, shuffle_within_shard=False)
+    assert torch.equal(torch.cat(list(stream)), dataset.tensors[0])
+
+
+def test_ten_dimensional_noisy_and_noiseless_conditions_are_paired():
+    config = _tiny_config(n_samples=60, manifolds_per_type=1,
+                         manifold_types=("swiss_roll_10d", "cylinder_10d"), noise_ratio=None)
+    clean, clean_metadata = make_toy_manifold_dataset(config)
+    noisy, metadata = make_toy_manifold_dataset(replace(config, noise_ratio=10.0))
+    quieter, quiet_metadata = make_toy_manifold_dataset(replace(config, noise_ratio=20.0))
+    assert torch.equal(clean.tensors[1], noisy.tensors[1])
+    assert torch.equal(clean.tensors[1], quieter.tensors[1])
+    assert torch.equal(clean_metadata["calibration_scales"], metadata["calibration_scales"])
+    assert torch.equal(metadata["noise_stds"], 2 * quiet_metadata["noise_stds"])
+    assert torch.allclose(noisy.tensors[0] - clean.tensors[0],
+                          2 * (quieter.tensors[0] - clean.tensors[0]), atol=1e-6)
+
+
+@pytest.mark.parametrize("bounds", [(1.5 * math.pi, 4.5 * math.pi), (-3.0, 4.0)])
+def test_swiss_roll_12d_raw_geometry_and_affine_span(bounds):
+    config = _tiny_config(swiss_theta_min=bounds[0], swiss_theta_max=bounds[1],
+                         swiss_height_min=-2.0, swiss_height_max=3.0)
+    raw = _sample_swiss_roll_12d(512, _generator(17, 0), config)
+    assert raw.shape == (512, 12) and raw.dtype == torch.float64
+    theta, height = raw[:, 0], raw[:, 1]
+    assert torch.all((theta >= bounds[0]) & (theta <= bounds[1]))
+    assert torch.all((height >= -2.0) & (height <= 3.0))
+    for k in range(1, 6):
+        assert torch.allclose(raw[:, 2 * k], theta / k * (k * theta).cos())
+        assert torch.allclose(raw[:, 2 * k + 1], theta / k * (k * theta).sin())
+    assert torch.linalg.matrix_rank(raw - raw.mean(dim=0)) == 12
+
+
+def test_helix_12d_raw_geometry_and_affine_span():
+    raw = _sample_helix_12d(512, _generator(17, 0), _tiny_config())
+    assert raw.shape == (512, 12) and raw.dtype == torch.float64
+    theta = torch.atan2(raw[:, 1], raw[:, 0])
+    for k in range(1, 7):
+        assert torch.allclose(raw[:, 2 * k - 2], (k * theta).cos(), atol=1e-12)
+        assert torch.allclose(raw[:, 2 * k - 1], (k * theta).sin(), atol=1e-12)
+    assert torch.allclose(raw.square().sum(dim=1), torch.full((512,), 6.0).double())
+    assert torch.linalg.matrix_rank(raw - raw.mean(dim=0)) == 12
+
+
+@pytest.mark.parametrize("type_name,intrinsic_dim", [("swiss_roll_12d", 2), ("helix_12d", 1)])
+def test_twelve_coordinate_native_embedding_requirement(type_name, intrinsic_dim):
+    config = _tiny_config(manifold_types=(type_name,), manifolds_per_type=1)
+    with pytest.raises(ValueError, match=r"dimension \(12\)"):
+        make_toy_manifold_dataset(replace(config, ambient_dim=11))
+    data, metadata = make_toy_manifold_dataset(replace(config, ambient_dim=12))
+    assert data.tensors[0].shape == (120, 12)
+    assert metadata["intrinsic_dims"] == (intrinsic_dim,)
+    assert metadata["embedding_dims"] == (12,)
+
+
+@pytest.mark.parametrize("noise_ratio", [None, 1_000.0])
+def test_twelve_coordinate_mixture_shards_and_geometry_in_128d(tmp_path, noise_ratio):
+    from dalg.evaluation.toy_manifold_geometry import _project_mean_to_manifold
+
+    names = ("swiss_roll_12d", "helix_12d", "product_torus_12d")
+    config = _tiny_config(ambient_dim=128, n_samples=18, manifold_types=names,
+                         manifolds_per_type=1, noise_ratio=noise_ratio)
+    data, metadata = make_toy_manifold_dataset(config)
+    assert metadata["intrinsic_dims"] == (2, 1, 12)
+    assert metadata["embedding_dims"] == (12, 12, 24)
+    if noise_ratio is None:
+        assert torch.count_nonzero(metadata["noise_stds"]) == 0
+        for point, label in zip(*data.tensors):
+            manifold = metadata["manifolds"][int(label)]
+            projection = _project_mean_to_manifold(point, manifold, metadata)
+            assert projection.unique
+            assert projection.distance_squared < 1e-11
+            rank = manifold["intrinsic_dim"]
+            assert projection.tangent.shape == (128, rank)
+            assert torch.allclose(projection.tangent.T @ projection.tangent,
+                                  torch.eye(rank).double(), atol=1e-10)
+    else:
+        assert torch.allclose(metadata["noise_stds"],
+                              metadata["curvature_radii"] / noise_ratio)
+    root = save_toy_manifold_shards(tmp_path / "mixture", config, shard_size=7)
+    saved = torch.load(root / "manifold_metadata.pt", weights_only=True)
+    shard_config = json.loads((root / "config.json").read_text())
+    assert shard_config["d_model"] == 128
+    assert shard_config["generator_config"]["manifold_types"] == list(names)
+    assert saved["intrinsic_dims"] == (2, 1, 12)
+    assert saved["embedding_dims"] == (12, 12, 24)
+    assert torch.equal(saved["row_manifold_ids"], data.tensors[1])
+    index = load_meta_index(root, layer=0)
+    assert [row["subset"] for row in index] == [names[int(i)] for i in data.tensors[1]]
+    stream = ActivationBatchDataset(root, layer=0, batch_size=5, drop_prefix=0,
+                                    shuffle_shards=False, shuffle_within_shard=False)
+    assert torch.equal(torch.cat(list(stream)), data.tensors[0])
+
+
+def test_hypersphere_6d_samples_and_geometry() -> None:
+    from dalg.evaluation.toy_manifold_geometry import (
+        _project_mean_to_manifold,
+        _project_raw_point,
+    )
+
+    config = _tiny_config(
+        ambient_dim=7, n_samples=20, manifold_types=("hypersphere_6d",),
+        manifolds_per_type=1, noise_ratio=None,
+    )
+    with pytest.raises(ValueError, match=r"dimension \(7\)"):
+        make_toy_manifold_dataset(replace(config, ambient_dim=6))
+    dataset, metadata = make_toy_manifold_dataset(config)
+    assert dataset.tensors[0].shape == (20, 7)
+    assert metadata["intrinsic_dims"] == (6,)
+    assert metadata["embedding_dims"] == (7,)
+    assert metadata["raw_max_abs_curvatures"].tolist() == [1.0]
+    raw = (
+        (dataset.tensors[0].double() - metadata["offsets"][0])
+        @ metadata["embeddings"][0].T
+    ) * metadata["calibration_scales"][0] + metadata["calibration_means"][0]
+    assert torch.allclose(raw.norm(dim=1), torch.ones(20).double(), atol=1e-6)
+    for point in dataset.tensors[0]:
+        projection = _project_mean_to_manifold(point, metadata["manifolds"][0], metadata)
+        assert projection.unique
+        assert projection.distance_squared < 1e-11
+        assert projection.tangent.shape == (7, 6)
+    origin = _project_raw_point(torch.zeros(7).double(), "hypersphere_6d", {})
+    assert not origin.unique
+    assert origin.point.norm() == 1.0
+    assert torch.isfinite(origin.tangent).all()

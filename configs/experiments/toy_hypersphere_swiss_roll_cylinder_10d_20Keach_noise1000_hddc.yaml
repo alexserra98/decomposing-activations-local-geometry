@@ -1,0 +1,68 @@
+# Full HDDC pipeline: training, responsibility assignments, and toy evaluation.
+# One 10D hypersphere, Swiss roll, and cylinder: 20,000 points each in D=128; noise_ratio=1000.
+# Fit 16 local PCA directions on the 54,000 training rows; K is swept below.
+
+experiment:
+  name: toy_hypersphere_swiss_roll_cylinder_10d_20Keach_hddc
+  output_root: dalg-cache/toy_manifold_models_hypersphere_swiss_roll_cylinder_10d_20Keach_noise_sweep_seed0/noise_ratio_1000
+
+dataset:
+  id: toy_hypersphere_swiss_roll_cylinder_10d_D128_20Keach_noise1000
+  shard_dir: dalg-cache/assets/toy_manifolds_hypersphere_swiss_roll_cylinder_10d_D128_20Keach_noise_sweep_seed0/noise_ratio_1000
+  layer: 0
+
+model:
+  kind: hddc
+  K: 300
+  q_max: 16
+  shared_b: true
+  surgery_every_epochs: 0.5
+  surgery_threshold: 0.01
+  surgery_min_count: 20
+
+initialization:
+  pca_neighbors: 64
+
+training:
+  fit_method: adam
+  training_mode: single_process
+  epochs: 1000
+  lr: 0.001
+  early_stop_patience: 10
+  early_stop_min_delta: 0.001
+  early_stop_delta: 0.0
+  epoch_snapshot_every: 1
+  batch_size: 2048
+  num_workers: 2
+  val_frac: 0.1
+  split_seed: 42
+  seed: 42
+  device: cuda
+  wandb: false
+
+assignments:
+  enabled: true
+  batch_size: 4096
+  device: cuda
+
+evaluation:
+  enabled: true
+  kind: toy_manifold_tiling
+  batch_size: 4096
+  device: cuda
+
+resources:
+  partition: H100
+  account: LADE
+  nodes: 1
+  ntasks_per_node: 1
+  cpus_per_task: 8
+  gpus: 1
+  max_parallel: 1
+  gpu_type: H100
+  memory: 80G
+  time: "01:00:00"
+
+sweep:
+  model.surgery_threshold: [0.005, 0.05, 0.1, 0.25, 0.5, 1.0]
+  model.K: [50, 100, 300, 500]

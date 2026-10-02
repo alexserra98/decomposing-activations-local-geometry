@@ -9,6 +9,8 @@ from typing import Any, Callable
 import torch
 from scipy.optimize import minimize_scalar
 
+from dalg.data.manifold_dataset import _helix_12d_points, _swiss_roll_12d_points
+
 
 _PROJECTION_GRID_POINTS = 4_097
 _PROJECTION_XATOL = 1e-10
@@ -240,6 +242,39 @@ def _helix_4d_at(
     return _RawProjection(point, tangent, True)
 
 
+def _swiss_roll_12d_at(
+    theta: float,
+    target: torch.Tensor,
+    height_min: float,
+    height_max: float,
+) -> _RawProjection:
+    height = target[1].clamp(height_min, height_max)
+    point = _swiss_roll_12d_points(target.new_tensor(theta), height)
+    frequencies = torch.arange(1, 6, dtype=target.dtype)
+    angles = theta * frequencies
+    spiral_derivative = torch.stack(
+        (angles.cos() / frequencies - theta * angles.sin(),
+         angles.sin() / frequencies + theta * angles.cos()),
+        dim=1,
+    )
+    tangent = target.new_zeros((12, 2))
+    tangent[0, 0] = 1.0
+    tangent[1, 1] = 1.0
+    tangent[2:, 0] = spiral_derivative.flatten()
+    return _RawProjection(point, tangent, True)
+
+
+def _helix_12d_at(theta: float, target: torch.Tensor) -> _RawProjection:
+    theta %= 2.0 * math.pi
+    point = _helix_12d_points(target.new_tensor(theta))
+    frequencies = torch.arange(1, 7, dtype=target.dtype)
+    angles = theta * frequencies
+    tangent = torch.stack(
+        (-frequencies * angles.sin(), frequencies * angles.cos()), dim=1
+    ).reshape(12, 1)
+    return _RawProjection(point, tangent, True)
+
+
 def _project_raw_point(
     target: torch.Tensor,
     type_name: str,
@@ -279,6 +314,20 @@ def _project_raw_point(
         tangent[1, 1] = 1.0
         return _RawProjection(point, tangent, circle.unique)
 
+    if type_name == "cylinder_10d":
+        if target.numel() != 11:
+            raise ValueError("10D-cylinder projection expects eleven local coordinates")
+        radius = float(target[:10].norm())
+        radial_point = target[:10] / radius if radius > 0.0 else target.new_zeros(10)
+        if radius == 0.0:
+            radial_point[0] = 1.0
+        _, _, vh = torch.linalg.svd(radial_point[None, :], full_matrices=True)
+        point = torch.cat((radial_point, target[10:].clamp(-2.5, 2.5)))
+        tangent = target.new_zeros((11, 10))
+        tangent[:10, :9] = vh[1:].T
+        tangent[10, 9] = 1.0
+        return _RawProjection(point, tangent, radius > _GEOMETRY_EPS)
+
     if type_name == "flat_disk":
         if target.numel() != 2:
             raise ValueError("flat-disk projection expects two local coordinates")
@@ -295,14 +344,16 @@ def _project_raw_point(
         _, _, vh = torch.linalg.svd(point[None, :], full_matrices=True)
         return _RawProjection(point, vh[1:].T.contiguous(), unique)
 
-    if type_name == "hypersphere_10d":
-        if target.numel() != 11:
+    if type_name in ("hypersphere_6d", "hypersphere_10d"):
+        intrinsic_dim = 6 if type_name == "hypersphere_6d" else 10
+        if target.numel() != intrinsic_dim + 1:
             raise ValueError(
-                "10D-hypersphere projection expects eleven local coordinates"
+                f"{intrinsic_dim}D-hypersphere projection expects "
+                f"{intrinsic_dim + 1} local coordinates"
             )
         radius = float(target.norm())
         unique = radius > _GEOMETRY_EPS
-        point = target / radius if radius > 0.0 else target.new_zeros(11)
+        point = target / radius if radius > 0.0 else target.new_zeros(intrinsic_dim + 1)
         if radius == 0.0:
             point[0] = 1.0
         _, _, vh = torch.linalg.svd(point[None, :], full_matrices=True)
@@ -338,18 +389,23 @@ def _project_raw_point(
         tangent = torch.stack((tangent_theta, tangent_phi), dim=1)
         return _RawProjection(point, tangent, theta_unique and phi_unique)
 
-    if type_name == "product_torus_12d":
-        if target.numel() != 24:
+    if type_name in ("product_torus_4d", "product_torus_6d", "product_torus_12d"):
+        intrinsic_dim = {
+            "product_torus_4d": 4,
+            "product_torus_6d": 6,
+            "product_torus_12d": 12,
+        }[type_name]
+        if target.numel() != 2 * intrinsic_dim:
             raise ValueError(
-                "12D-product-torus projection expects twenty-four local coordinates"
+                f"{type_name} projection expects {2 * intrinsic_dim} local coordinates"
             )
-        target_pairs = target.reshape(12, 2)
+        target_pairs = target.reshape(intrinsic_dim, 2)
         pair_radii = target_pairs.norm(dim=1)
         nonzero_pairs = pair_radii > _GEOMETRY_EPS
         point_pairs = target_pairs / pair_radii.clamp_min(_GEOMETRY_EPS)[:, None]
         point_pairs[~nonzero_pairs] = target.new_tensor((1.0, 0.0))
 
-        tangent = target.new_zeros((24, 12))
+        tangent = target.new_zeros((2 * intrinsic_dim, intrinsic_dim))
         for circle_id, pair in enumerate(point_pairs):
             tangent[2 * circle_id : 2 * circle_id + 2, circle_id] = torch.stack(
                 (-pair[1], pair[0])
@@ -391,6 +447,64 @@ def _project_raw_point(
             projection = _mobius_at(phi, target, half_width)
             candidates.append((objective(phi), projection))
         return _select_raw_projection(candidates)
+
+    if type_name == "swiss_roll_12d":
+        if target.numel() != 12:
+            raise ValueError("12D-Swiss-roll projection expects twelve local coordinates")
+        theta_min = float(config["swiss_theta_min"])
+        theta_max = float(config["swiss_theta_max"])
+        height_min = float(config["swiss_height_min"])
+        height_max = float(config["swiss_height_max"])
+        grid = torch.linspace(
+            theta_min, theta_max, _PROJECTION_GRID_POINTS, dtype=torch.float64
+        )
+        height = target[1].clamp(height_min, height_max)
+        points = _swiss_roll_12d_points(grid, height.expand_as(grid))
+        values = (points - target).square().sum(dim=1)
+
+        def objective(theta: float) -> float:
+            point = _swiss_roll_12d_points(target.new_tensor(theta), height)
+            return float((point - target).square().sum())
+
+        parameters = _refined_grid_candidates(grid, values, objective, periodic=False)
+        return _select_raw_projection([
+            (objective(theta), _swiss_roll_12d_at(theta, target, height_min, height_max))
+            for theta in parameters
+        ])
+
+    if type_name == "helix_12d":
+        if target.numel() != 12:
+            raise ValueError("12D-helix projection expects twelve local coordinates")
+        if float(target.norm()) <= _GEOMETRY_EPS:
+            representative = _helix_12d_at(0.0, target)
+            return _RawProjection(representative.point, representative.tangent, False)
+        grid = torch.arange(_PROJECTION_GRID_POINTS, dtype=torch.float64)
+        grid *= 2.0 * math.pi / _PROJECTION_GRID_POINTS
+        points = _helix_12d_points(grid)
+        values = (points - target).square().sum(dim=1)
+
+        def objective(theta: float) -> float:
+            point = _helix_12d_points(target.new_tensor(theta))
+            return float((point - target).square().sum())
+
+        parameters = _refined_grid_candidates(grid, values, objective, periodic=True)
+        return _select_raw_projection([
+            (objective(theta), _helix_12d_at(theta, target)) for theta in parameters
+        ])
+
+    if type_name == "swiss_roll_10d":
+        if target.numel() != 11:
+            raise ValueError("10D-Swiss-roll projection expects eleven local coordinates")
+        height_min = float(config["swiss_height_min"])
+        height_max = float(config["swiss_height_max"])
+        # The flat factors separate from the spiral's one-dimensional search.
+        spiral_target = target.new_tensor((target[0], height_min, target[1]))
+        spiral = _project_raw_point(spiral_target, "swiss_roll", config)
+        point = torch.cat((spiral.point[[0, 2]], target[2:].clamp(height_min, height_max)))
+        tangent = target.new_zeros((11, 10))
+        tangent[:2, 0] = spiral.tangent[[0, 2], 0]
+        tangent[2:, 1:] = torch.eye(9, dtype=target.dtype)
+        return _RawProjection(point, tangent, spiral.unique)
 
     if type_name == "swiss_roll":
         if target.numel() != 3:

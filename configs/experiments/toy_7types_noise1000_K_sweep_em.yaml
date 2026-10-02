@@ -1,0 +1,71 @@
+# Full HDDC pipeline using the full-data KMeans fit at noise_ratio=1000.
+# Initialize directions from the 32 leading PCs of each hard KMeans cluster.
+
+experiment:
+  name: toy_7types_noise1000_sweepk_em
+  output_root: dalg-cache/toy_manifolds_7types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_1000/models
+
+dataset:
+  id: toy_manifolds_7types_1each_D128_30Keach_noise1000
+  shard_dir: dalg-cache/assets/toy_manifolds_7types_1each_D128_30Keach_noise_sweep_seed0/noise_ratio_1000
+  layer: 0
+
+model:
+  kind: hddc
+  K: 1000
+  q_max: 32
+  shared_b: true
+  surgery_threshold: 0.05
+  surgery_every_epochs: 0
+  surgery_min_count: 0
+  surgery_warmup_steps: 0
+
+training:
+  fit_method: em
+  training_mode: single_process
+  epochs: 1000
+
+  em_component_chunk_size: 32
+  em_eig_batch_size: 128
+  em_tol: 0.00001
+
+  early_stop_patience: 10
+  early_stop_min_delta: 0.001
+  epoch_snapshot_every: 1
+
+  batch_size: 2048
+  num_workers: 2
+  pool_size: 45000
+  refine_epochs: 0
+
+  val_frac: 0.1
+  split_seed: 42
+  seed: 42
+  device: cuda
+  wandb: false
+
+assignments:
+  enabled: true
+  batch_size: 4096
+  device: cuda
+
+evaluation:
+  enabled: true
+  kind: toy_manifold_tiling
+  batch_size: 4096
+  device: cuda
+
+resources:
+  partition: H100
+  account: LADE
+  nodes: 1
+  ntasks_per_node: 1
+  cpus_per_task: 8
+  gpus: 1
+  gpu_type: H100
+  memory: 80G
+  time: "01:00:00"
+
+sweep:
+  model.K: [100, 250, 500, 1000, 2000]
+  model.surgery_threshold: [0.00025, 0.005, 0.01, 0.05, 0.1, 0.15, 0.2, 0.5, 1.0]

@@ -120,14 +120,18 @@ def compute_cluster_pca_directions(
     assignments: torch.Tensor,
     centroids: torch.Tensor,
     *,
-    rank: int,
+    rank: int | None = None,
     chunk_elems: int = 1 << 23,
     eig_batch_size: int = 256,
-) -> torch.Tensor:
+    return_eigenvalues: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Compute exact top PCA directions around fixed hard-cluster centroids.
 
     The explicit ``(K, D, D)`` scatter is intended for the D=128 toy workflow.
-    Only the returned ``(K, D, rank)`` eigenvectors are retained by callers.
+    With ``rank=None``, return all D directions and require at least two points
+    per cluster, including when the covariance is rank deficient.
+    With ``return_eigenvalues=True``, also return the complete descending
+    ``(K, D)`` covariance spectrum in float64.
     """
     if points.ndim != 2 or centroids.ndim != 2:
         raise ValueError("points and centroids must both be rank-2 tensors")
@@ -140,21 +144,25 @@ def compute_cluster_pca_directions(
         raise ValueError("assignments must have one entry per point")
 
     K, D = map(int, centroids.shape)
+    min_count = 2 if rank is None else rank + 1
+    rank = D if rank is None else rank
     if not 1 <= rank <= D:
         raise ValueError(f"rank must be in [1, {D}], got {rank}")
     if eig_batch_size <= 0:
         raise ValueError("eig_batch_size must be positive")
+    if chunk_elems <= 0:
+        raise ValueError("chunk_elems must be positive")
 
     device = points.device
     labels = assignments.to(device=device, dtype=torch.long)
     if labels.numel() and (int(labels.min()) < 0 or int(labels.max()) >= K):
         raise ValueError(f"assignments must lie in [0, {K - 1}]")
     counts = torch.bincount(labels, minlength=K)
-    undersized = (counts <= rank).nonzero(as_tuple=True)[0]
+    undersized = (counts < min_count).nonzero(as_tuple=True)[0]
     if undersized.numel():
         preview = undersized[:10].tolist()
         raise ValueError(
-            f"every cluster needs at least rank+1={rank + 1} points; "
+            f"every cluster needs at least {min_count} points; "
             f"undersized cluster ids (first 10): {preview}"
         )
 
@@ -175,15 +183,17 @@ def compute_cluster_pca_directions(
         dtype=centroids.dtype,
         device=device,
     )
+    spectra = torch.empty(K, D, dtype=torch.float64, device=device)
     for start in range(0, K, eig_batch_size):
         stop = min(start + eig_batch_size, K)
         covariance = scatter[start:stop] / counts[start:stop, None, None]
         covariance = 0.5 * (covariance + covariance.transpose(-1, -2))
-        _eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
         directions[start:stop] = eigenvectors[:, :, -rank:].flip(-1).to(
             centroids.dtype
         )
-    return directions
+        spectra[start:stop] = eigenvalues.flip(-1).clamp_min(0)
+    return (directions, spectra) if return_eigenvalues else directions
 
 
 __all__ = [

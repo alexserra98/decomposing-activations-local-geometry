@@ -92,6 +92,7 @@ Preferred CLI entrypoints are defined in `pyproject.toml`:
 
 - `dalg-run-extraction`
 - `dalg-run-training`
+- `dalg-run-training-kmeans`
 - `dalg-run-training-ard`
 - `dalg-run-training-hddc`
 - `dalg-run-metrics`
@@ -193,6 +194,12 @@ identical to before. To remove the feature: delete `subset_spec.py`, revert the
 `positions=` argument added to `stratified_split`.
 
 ## Core Model and Training Code
+
+`src/dalg/models/kmeans.py` provides the pipeline KMeans+PCA model. Read
+[the model contract](docs/models/kmeans.md) for its one-hot responsibilities,
+full cluster PCA, Cattell rank masks, and checkpoint behavior. New pipeline
+initialization uses `kmeans_model.pt` directly; legacy centroid bundles and
+external centroid-based KMeans workflows are deprecated.
 
 `src/dalg/models/mfa.py` contains:
 
@@ -329,17 +336,8 @@ PYTHONPATH=src python -m torch.distributed.run --standalone --nproc_per_node=2 \
 ```
 
 ## Implementation Guidance
-
-- Preserve the research-first style.
 - Prefer direct code over abstractions unless the abstraction removes real
   complexity.
-- Do not reintroduce stale imports like `from modeling...` or
-  `from experiments...`.
-- Do not reintroduce the old monolithic training path as the primary path.
-  Current training expects activation shards through `--shard-dir`.
-- Do not reintroduce DDP data-parallel training into `dalg-run-training`.
-  Component sharding is model parallel over K.
-- Keep command paths and Slurm scripts aligned with package entrypoints.
 - Put reusable analysis logic under `src/dalg/analysis/`; expose a CLI only
   when it is useful as a standalone workflow.
 - Comments and docstrings should explain what the code does, not narrate recent

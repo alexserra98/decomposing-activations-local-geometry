@@ -6,13 +6,15 @@
 > points. **Related:**
 > [KMeans initialization evaluation](kmeans-initialization-evaluation.md).
 
-This page records the standalone workaround for one toy-manifold experiment.
-The same numerical functions now live in `src/dalg/init/neighborhood_pca.py`
-and are reused by both the temporary builder and automatic pipeline
-initialization. For new runs, select `initialization.pca_method: knn` and
-`initialization.pca_neighbors: 64`; see the
-[pipeline options](../reference/training-pipeline-config.md#initialization).
-Ordinary hard-assignment PCA remains the default.
+> **DEPRECATED KMEANS WORKFLOW:** The standalone centroid-bundle experiment
+> below is historical. The temporary builder has been removed. New work uses
+> [KMeans+PCA](../models/kmeans.md) through the training pipeline.
+
+The numerical functions in `src/dalg/init/neighborhood_pca.py` are reused by the
+model for MFA-family initialization only. Set `initialization.pca_neighbors`
+to control its KNN neighborhood size. KMeans evaluation always uses cluster
+members and excludes undersized clusters from geometry metrics.
+
 
 ## Why it exists
 

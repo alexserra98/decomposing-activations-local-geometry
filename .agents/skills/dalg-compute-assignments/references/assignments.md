@@ -37,6 +37,18 @@ Saved fields include:
 
 Relevant launchers are `scripts/slurm/sbatch_assignments.sh` and `scripts/slurm/sbatch_epoch_assignments.sh`.
 
+## KMeans model assignments
+
+Use `dalg-run-metrics assignments --model-type kmeans --data-dir /path/to/run`
+with the usual shard and layer arguments. The run contains `kmeans_model.pt`;
+the output is `kmeans_model_assignments.pt`. It uses the standard model bundle
+fields above plus model and stream provenance. Maximum responsibilities are
+one, and streaming computes cluster IDs directly without a dense one-hot
+matrix. No inference cache is needed.
+
+Legacy standalone centroid/medoid assignment workflows below remain available
+for historical artifacts; the maintained KMeans pipeline uses model checkpoints.
+
 ## Nearest-centroid assignments
 
 Use this criterion for KMeans clusters, KMedoids, MFA means, or any other compatible centroid matrix. The assignment implementation only uses Euclidean distance; it does not depend on the algorithm that produced the representatives.

@@ -28,13 +28,13 @@ import yaml
 
 from dalg.data.subset_spec import split_shard_dir_spec
 from dalg.init.activation_selection import resolve_initialization_rows
-from dalg.init.centroid_artifact import load_centroid_artifact, validate_centroid_artifact
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_VERSION = 1
 _TOP_LEVEL_KEYS = {
     "experiment",
+    "experimental",
     "dataset",
     "model",
     "training",
@@ -48,6 +48,7 @@ _MODEL_MODULES = {
     "mfa": "dalg.cli.run_training",
     "ard": "dalg.cli.adaptive_q.run_training_ard",
     "hddc": "dalg.cli.adaptive_q.run_training_hddc",
+    "kmeans": "dalg.cli.run_training_kmeans",
 }
 _RESOURCE_DEFAULTS = {
     "partition": "H100",
@@ -155,6 +156,8 @@ def _parser_and_validator(model_kind: str):
         from dalg.cli.adaptive_q.run_training_ard import build_parser, validate_args
     elif model_kind == "hddc":
         from dalg.cli.adaptive_q.run_training_hddc import build_parser, validate_args
+    elif model_kind == "kmeans":
+        from dalg.cli.run_training_kmeans import build_parser, validate_args
     else:
         raise PipelineConfigError(
             f"model.kind must be one of {sorted(_MODEL_MODULES)}, got {model_kind!r}"
@@ -220,7 +223,7 @@ def _parse_training_args(
     values: dict[str, Any],
     *,
     world_size: int,
-    generated_centroids: bool = False,
+    generated_kmeans: bool = False,
 ) -> dict[str, Any]:
     parser, validator = _parser_and_validator(model_kind)
     try:
@@ -231,15 +234,15 @@ def _parse_training_args(
     previous_world_size = os.environ.get("WORLD_SIZE")
     os.environ["WORLD_SIZE"] = str(world_size)
     # The pipeline will supply this artifact before invoking the unchanged CLI.
-    if generated_centroids:
-        args.centroids_path = "<pipeline-initialization>/centroids.pt"
+    if generated_kmeans:
+        args.kmeans_model_path = "<pipeline-initialization>/kmeans_model.pt"
     try:
         validator(args)
-    except SystemExit as exc:
+    except (SystemExit, ValueError) as exc:
         raise PipelineConfigError(str(exc)) from exc
     finally:
-        if generated_centroids:
-            args.centroids_path = None
+        if generated_kmeans:
+            args.kmeans_model_path = None
         if previous_world_size is None:
             os.environ.pop("WORLD_SIZE", None)
         else:
@@ -266,20 +269,14 @@ def _resolve_optional_path(value: Any) -> Any:
     return str(path.resolve() if path.is_absolute() else (REPO_ROOT / path).resolve())
 
 
-def _resolve_centroids_path(value: Any) -> str | None:
-    """Resolve a shared centroid artifact path and reject ambiguous inputs."""
+def _resolve_kmeans_model_path(value: Any) -> str | None:
+    """Resolve an explicit KMeans checkpoint used for initialization."""
     resolved = _resolve_optional_path(value)
     if not resolved:
         return None
     path = Path(resolved)
-    if path.suffix != ".pt":
-        raise PipelineConfigError(
-            "training.centroids_path must point directly to a .pt file"
-        )
-    if path.exists() and not path.is_file():
-        raise PipelineConfigError(
-            f"training.centroids_path must be a file, got: {path}"
-        )
+    if path.suffix != ".pt" or (path.exists() and not path.is_file()):
+        raise PipelineConfigError("training.kmeans_model_path must point directly to a .pt file")
     return str(path)
 
 
@@ -300,7 +297,7 @@ def _resolve_init_model_path(value: Any) -> str | None:
     return str(path)
 
 
-def _validate_centroids(
+def _validate_kmeans_model(
     path_value: str,
     *,
     expected_k: int,
@@ -308,64 +305,28 @@ def _validate_centroids(
     direction_init: str,
     shard_dir_arg: str,
 ) -> None:
-    """Fail at planning time when shared centroids cannot initialize the run."""
-    from dalg.init.centroid_artifact import unpack_centroid_artifact
+    """Check the actual model checkpoint, rather than a legacy centroid bundle."""
+    from dalg.models.kmeans import load_kmeans
 
     path = Path(path_value)
     if not path.is_file():
-        raise PipelineConfigError(f"centroids file not found: {path}")
+        raise PipelineConfigError(f"KMeans model file not found: {path}")
     try:
-        value = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
-        centroids, principal_components = unpack_centroid_artifact(value)
-    except Exception as exc:
-        raise PipelineConfigError(f"could not load centroid artifact: {path}: {exc}") from exc
-    if not isinstance(centroids, torch.Tensor) or centroids.ndim != 2:
-        raise PipelineConfigError(
-            f"centroids must be a rank-2 tensor, got {type(centroids).__name__} "
-            f"with shape {getattr(centroids, 'shape', None)}"
-        )
-    if centroids.shape[0] != expected_k:
-        raise PipelineConfigError(
-            f"centroids K={centroids.shape[0]} does not match model.K={expected_k}: {path}"
-        )
-
+        model = load_kmeans(path, map_location="cpu")
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+        raise PipelineConfigError(f"invalid KMeans model checkpoint: {path}: {exc}") from exc
     shard_dir, _ = split_shard_dir_spec(shard_dir_arg)
-    try:
-        shard_config = json.loads((shard_dir / "config.json").read_text())
-        expected_dim = int(shard_config["d_model"])
-    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    expected_d = int(json.loads((shard_dir / "config.json").read_text())["d_model"])
+    if model.K != expected_k or model.D != expected_d:
         raise PipelineConfigError(
-            f"could not read activation dimension from {shard_dir / 'config.json'}"
-        ) from exc
-    if centroids.shape[1] != expected_dim:
-        raise PipelineConfigError(
-            f"centroid dimension D={centroids.shape[1]} does not match activation "
-            f"d_model={expected_dim}: {path}"
+            f"KMeans checkpoint shape {(model.K, model.D)} does not match "
+            f"requested K,D={(expected_k, expected_d)}: {path}"
         )
-    if principal_components is not None:
-        if principal_components.ndim != 3:
-            raise PipelineConfigError(
-                "principal_components must have shape (K, D, Q), got "
-                f"{tuple(principal_components.shape)}: {path}"
-            )
-        if tuple(principal_components.shape[:2]) != tuple(centroids.shape):
-            raise PipelineConfigError(
-                "principal_components leading dimensions "
-                f"{tuple(principal_components.shape[:2])} do not match centroids "
-                f"{tuple(centroids.shape)}: {path}"
-            )
-    if direction_init == "cluster_pca":
-        if principal_components is None:
-            raise PipelineConfigError(
-                "training.direction_init=cluster_pca requires a centroid artifact "
-                f"containing principal_components: {path}"
-            )
-        stored_rank = int(principal_components.shape[-1])
-        if stored_rank < expected_rank:
-            raise PipelineConfigError(
-                f"centroid artifact stores {stored_rank} principal components per "
-                f"cluster, but model rank/q_max={expected_rank} was requested: {path}"
-            )
+    if direction_init == "cluster_pca" and model.q_init < expected_rank:
+        raise PipelineConfigError(
+            f"KMeans checkpoint stores {model.q_init} initialization principal components but "
+            f"model rank/q_max={expected_rank} was requested: {path}"
+        )
 
 
 def _validate_hddc_init_model(
@@ -474,15 +435,17 @@ def resolve_run(config: Mapping[str, Any], *, check_inputs: bool = True) -> dict
     dataset = _require_mapping(config.get("dataset"), "dataset")
     model = _require_mapping(config.get("model"), "model")
     training = _require_mapping(config.get("training"), "training")
+    experimental = _require_mapping(config.get("experimental"), "experimental")
+    unknown_experimental = sorted(set(experimental) - {"hard_assignment_covariance"})
+    if unknown_experimental:
+        raise PipelineConfigError(f"unknown experimental parameters: {unknown_experimental}")
+    hard_covariance = experimental.get("hard_assignment_covariance", False)
+    if not isinstance(hard_covariance, bool):
+        raise PipelineConfigError("experimental.hard_assignment_covariance must be true or false")
     initialization_raw = _require_mapping(config.get("initialization"), "initialization")
-    unknown_initialization = sorted(set(initialization_raw) - {"pca_method", "pca_neighbors"})
+    unknown_initialization = sorted(set(initialization_raw) - {"pca_neighbors"})
     if unknown_initialization:
         raise PipelineConfigError(f"unknown initialization parameters: {unknown_initialization}")
-    pca_method = initialization_raw.get("pca_method", "cluster")
-    if pca_method not in ("cluster", "knn"):
-        raise PipelineConfigError("initialization.pca_method must be 'cluster' or 'knn'")
-    if pca_method == "cluster" and "pca_neighbors" in initialization_raw:
-        raise PipelineConfigError("initialization.pca_neighbors requires pca_method: knn")
     pca_neighbors = initialization_raw.get("pca_neighbors", 64)
     if type(pca_neighbors) is not int or pca_neighbors <= 0:
         raise PipelineConfigError("initialization.pca_neighbors must be a positive integer")
@@ -532,12 +495,23 @@ def resolve_run(config: Mapping[str, Any], *, check_inputs: bool = True) -> dict
         **model_values,
         **training,
     }
+    if "hard_assignment_covariance" in values:
+        raise PipelineConfigError("hard_assignment_covariance belongs in experimental")
+    if hard_covariance and model_kind != "hddc":
+        raise PipelineConfigError("experimental.hard_assignment_covariance requires model.kind: hddc")
+    if model_kind == "hddc":
+        values["hard_assignment_covariance"] = hard_covariance
     if "centroids_path" in values:
-        values["centroids_path"] = _resolve_centroids_path(values["centroids_path"])
+        raise PipelineConfigError(
+            "training.centroids_path is deprecated in the pipeline; use "
+            "training.kmeans_model_path with a KMeans model checkpoint"
+        )
+    if "kmeans_model_path" in values:
+        values["kmeans_model_path"] = _resolve_kmeans_model_path(values["kmeans_model_path"])
     if "init_model_path" in values:
         values["init_model_path"] = _resolve_init_model_path(values["init_model_path"])
 
-    default_training_mode = "single_process" if model_kind == "hddc" else "vanilla"
+    default_training_mode = "single_process" if model_kind in {"hddc", "kmeans"} else "vanilla"
     training_mode = str(values.get("training_mode", default_training_mode))
     world_size = resources["gpus"] if training_mode == "component_shard" else 1
     if training_mode == "component_shard" and resources["gpus"] <= 1:
@@ -546,34 +520,54 @@ def resolve_run(config: Mapping[str, Any], *, check_inputs: bool = True) -> dict
         )
     if model_kind == "ard" and training_mode == "component_shard":
         raise PipelineConfigError("ARD training does not support component sharding")
-    generated_centroids = (
-        not values.get("centroids_path")
+    generated_kmeans = (
+        model_kind in {"mfa", "ard", "hddc"}
+        and not values.get("kmeans_model_path")
         and not values.get("init_model_path")
         and not (model_kind == "hddc" and values.get("fit_method") == "em")
     )
-    if initialization_raw and not generated_centroids:
+    if initialization_raw and not generated_kmeans:
         raise PipelineConfigError(
-            "initialization options require automatic KMeans/PCA; omit centroids_path "
+            "initialization options require automatic KMeans/PCA; omit kmeans_model_path "
             "and init_model_path, and use an MFA, ARD, or Adam-based HDDC run"
         )
-    if generated_centroids:
+    if generated_kmeans:
         values.setdefault("direction_init", "cluster_pca")
     training_args = _parse_training_args(
         model_kind, values, world_size=world_size,
-        generated_centroids=generated_centroids,
+        generated_kmeans=generated_kmeans,
     )
     training_args["out_dir"] = None
+    if model_kind == "kmeans":
+        if training_args["pca_purpose"] != "geometry":
+            raise PipelineConfigError("KMeans pipeline models require cluster geometry; initialization PCA belongs to MFA initialization")
+        if training_args["pca_only"]:
+            raise PipelineConfigError("pca_only is a standalone checkpoint operation; pipeline runs fit a new model")
+        if training_args["rank"] is not None:
+            raise PipelineConfigError("KMeans geometry learns rank with Cattell; omit model.rank")
+        if resources["gpus"] > 1 or resources["ntasks_per_node"] != 1 or resources["nodes"] != 1:
+            raise PipelineConfigError("KMeans supports one CPU or CUDA process")
+        if check_inputs:
+            _, source, _, selection = resolve_initialization_rows(
+                shard_dir, layer=layer, val_frac=training_args["val_frac"],
+                split_seed=training_args["split_seed"], drop_prefix=training_args["drop_prefix"],
+            )
+            n_fit = int(selection["train_activations"] * training_args["sample_fraction"])
+            if not 1 <= training_args["K"] < n_fit:
+                raise PipelineConfigError("KMeans requires 1 <= K < fitting activations")
     initialization = None
-    if generated_centroids:
+    if generated_kmeans:
         initialization = {
-            "method": "kmeans_pca",
-            "version": 1,
+            "method": "kmeans_model",
+            "version": 4,
+            "pca_purpose": "initialization",
+            "pca_neighbors": pca_neighbors,
             "max_iter": 100,
             "restarts": 10,
             "tol": 1e-6,
             "seed": training_args.get("seed") or 0,
             "device": training_args["device"],
-            "pca_rank": training_args["rank"],
+            "rank": training_args["rank"],
             "val_frac": training_args["val_frac"],
             "split_seed": training_args["split_seed"],
             "drop_prefix_default": 32,
@@ -585,10 +579,8 @@ def resolve_run(config: Mapping[str, Any], *, check_inputs: bool = True) -> dict
             "pca_chunk_elems": 1 << 23,
             "pca_eig_batch_size": 256,
         }
-        if pca_method == "knn":
-            if pca_neighbors <= training_args["rank"]:
-                raise PipelineConfigError("initialization.pca_neighbors must exceed rank/q_max")
-            initialization.update(pca_method="knn", pca_neighbors=pca_neighbors)
+        if pca_neighbors <= training_args["rank"]:
+            raise PipelineConfigError("initialization.pca_neighbors must exceed rank/q_max")
         if check_inputs:
             _, source, _, selection = resolve_initialization_rows(
                 shard_dir, layer=layer,
@@ -600,14 +592,14 @@ def resolve_run(config: Mapping[str, Any], *, check_inputs: bool = True) -> dict
                 raise PipelineConfigError("initialization PCA rank must be in [1, d_model]")
             if not 1 <= training_args["K"] < selection["train_activations"]:
                 raise PipelineConfigError("initialization requires 1 <= K < training activations")
-            if pca_method == "knn" and pca_neighbors > selection["train_activations"]:
+            if pca_neighbors > selection["train_activations"]:
                 raise PipelineConfigError("initialization.pca_neighbors exceeds training activations")
-    if check_inputs and training_args.get("centroids_path"):
-        _validate_centroids(
-            training_args["centroids_path"],
+    if check_inputs and training_args.get("kmeans_model_path"):
+        _validate_kmeans_model(
+            training_args["kmeans_model_path"],
             expected_k=int(training_args["K"]),
             expected_rank=int(training_args["rank"]),
-            direction_init=str(training_args["direction_init"]),
+            direction_init=str(training_args.get("direction_init", "random")),
             shard_dir_arg=shard_dir,
         )
     if check_inputs and training_args.get("init_model_path"):
@@ -638,7 +630,7 @@ def resolve_run(config: Mapping[str, Any], *, check_inputs: bool = True) -> dict
         raise PipelineConfigError(
             "the pipeline supports evaluation.kind: toy_manifold_tiling"
         )
-    if float(evaluation["rank_threshold"]) <= 0:
+    if model_kind not in {"hddc", "kmeans"} and float(evaluation["rank_threshold"]) <= 0:
         raise PipelineConfigError("evaluation.rank_threshold must be positive")
     max_mean_distance = evaluation["max_mean_to_manifold_distance"]
     if max_mean_distance is not None:
@@ -674,7 +666,7 @@ def resolve_run(config: Mapping[str, Any], *, check_inputs: bool = True) -> dict
             _slug(dataset_id),
             f"l{layer:02d}",
             f"k{int(training_args['K'])}",
-            f"q{int(rank)}",
+            "cattell" if model_kind == "kmeans" else f"q{int(rank)}",
             f"s{int(training_args.get('seed') or 0)}",
             digest[:8],
         ]
@@ -682,7 +674,7 @@ def resolve_run(config: Mapping[str, Any], *, check_inputs: bool = True) -> dict
     run_dir = output_root / _slug(name) / run_name
     training_args["out_dir"] = str(run_dir)
     if initialization is not None:
-        training_args["centroids_path"] = str(run_dir / "initialization" / "centroids.pt")
+        training_args["kmeans_model_path"] = str(run_dir / "initialization" / "kmeans_model.pt")
     run = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_name,
@@ -759,12 +751,57 @@ def _run_command(command: list[str]) -> None:
     subprocess.run(command, check=True, cwd=REPO_ROOT, env=env)
 
 
+def _model_stem(run: Mapping[str, Any]) -> str:
+    return "kmeans_model" if run["training"]["model_kind"] == "kmeans" else "mfa_model"
+
+
+def _assignments_path(run: Mapping[str, Any]) -> Path:
+    return Path(run["run_dir"]) / f"{_model_stem(run)}_assignments.pt"
+
+
 def _training_artifacts_valid(run: Mapping[str, Any]) -> bool:
     run_dir = Path(run["run_dir"])
     kind = run["training"]["model_kind"]
     if not (run_dir / "config.json").is_file() or not (run_dir / "val_indices.json").is_file():
         return False
-    model_path = run_dir / "mfa_model.pt"
+    model_path = run_dir / f"{_model_stem(run)}.pt"
+    if kind == "kmeans":
+        from dalg.models.kmeans import load_kmeans
+
+        try:
+            model = load_kmeans(model_path, map_location="cpu")
+            args = run["training"]["arguments"]
+            saved = json.loads((run_dir / "config.json").read_text())
+            split = json.loads((run_dir / "val_indices.json").read_text())
+            root, source, positions, selection = resolve_initialization_rows(
+                run["dataset"]["shard_dir"], layer=run["dataset"]["layer"],
+                val_frac=args["val_frac"], split_seed=args["split_seed"],
+                drop_prefix=args["drop_prefix"],
+            )
+            expected = {
+                "selection": selection, "source_shard_dir": str(root.resolve()),
+                "layer": run["dataset"]["layer"],
+                "sample_fraction_requested": args["sample_fraction"],
+                "sample_seed": args["sample_seed"],
+                **{key: args[key] for key in ("max_iter", "restarts", "tol", "seed")},
+            }
+            if saved != model.checkpoint_extra or any(saved.get(k) != v for k, v in expected.items()):
+                return False
+            if any(getattr(model, key) != args[key] for key in ("max_iter", "restarts", "tol", "seed", "block_x", "block_c")):
+                return False
+            return (
+                model.K == args["K"] and model.q == max(1, int(model.component_ranks.max()))
+                and model.surgery_threshold == args.get("surgery_threshold", args.get("cattell_threshold"))
+                and model.q_init == 0
+                and int(model.cluster_counts.sum()) == saved["rows_used"]
+                and model.cluster_counts.tolist() == saved["cluster_sizes"]
+                and saved.get("K") == model.K
+                and model.D == int(source["d_model"])
+                and split["train_rows"] == selection["train_rows"]
+                and split["val_rows"] == selection["selected_rows"] - selection["train_rows"]
+            )
+        except (EOFError, KeyError, OSError, TypeError, RuntimeError, ValueError):
+            return False
     if model_path.is_file() and model_path.stat().st_size > 0:
         return True
     manifest_name = "mfa_model_shards.json"
@@ -787,8 +824,8 @@ def _training_artifacts_valid(run: Mapping[str, Any]) -> bool:
 
 def _training_artifact_path(run: Mapping[str, Any]) -> Path:
     run_dir = Path(run["run_dir"])
-    model_path = run_dir / "mfa_model.pt"
-    if model_path.is_file():
+    model_path = run_dir / f"{_model_stem(run)}.pt"
+    if model_path.is_file() or run["training"]["model_kind"] == "kmeans":
         return model_path
     return run_dir / "mfa_model_shards.json"
 
@@ -839,6 +876,40 @@ def _validate_assignment_bundle(path: Path, expected_k: int) -> bool:
     )
 
 
+def _assignment_artifact_valid(run: Mapping[str, Any]) -> bool:
+    """Validate a complete model partition, including the KMeans source stream."""
+    path = _assignments_path(run)
+    k = int(run["training"]["arguments"]["K"])
+    if not _validate_assignment_bundle(path, k):
+        return False
+    if run["training"]["model_kind"] != "kmeans":
+        return True
+    try:
+        bundle = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+        root, _, _, selection = resolve_initialization_rows(
+            run["dataset"]["shard_dir"], layer=run["dataset"]["layer"],
+            val_frac=0.0, drop_prefix=run["training"]["arguments"].get("drop_prefix"),
+        )
+        source = bundle["source"]
+        expected = selection["selected_activations"]
+        return (
+            bundle["assignments"].dtype == torch.long
+            and bundle["cluster_sizes"].dtype == torch.long
+            and bundle["assignments"].numel() == expected
+            and bundle["max_responsibilities"].shape == (expected,)
+            and bool((bundle["max_responsibilities"] == 1).all())
+            and bundle["model_type"] == "kmeans"
+            and Path(bundle["model_path"]).resolve() == _training_artifact_path(run).resolve()
+            and bundle.get("subset_spec") == selection["subset_spec"]
+            and Path(source["shard_dir"]).resolve() == root.resolve()
+            and source["layer"] == run["dataset"]["layer"]
+            and source["drop_prefix"] == selection["drop_prefix"]
+            and source["num_items"] == expected
+        )
+    except (EOFError, KeyError, OSError, TypeError, RuntimeError, ValueError):
+        return False
+
+
 def _evaluation_artifact_valid(run: Mapping[str, Any]) -> bool:
     path = Path(run["run_dir"]) / "metrics.json"
     if not path.is_file():
@@ -847,6 +918,81 @@ def _evaluation_artifact_valid(run: Mapping[str, Any]) -> bool:
         metrics = json.loads(path.read_text())
     except (OSError, TypeError, json.JSONDecodeError):
         return False
+    return _evaluation_metrics_valid(run, metrics)
+
+
+def _evaluation_metrics_valid(run: Mapping[str, Any], metrics: Any) -> bool:
+    """Validate evaluation metrics before publishing them or reusing a report."""
+    if not isinstance(metrics, Mapping):
+        return False
+    alignment = metrics.get("tangent_alignment")
+    basis = "pca" if run["training"]["model_kind"] == "kmeans" else "covariance"
+    if not isinstance(alignment, Mapping) or alignment.get("definition") != (
+        f"leading_intrinsic_dim_{basis}_subspace_principal_angles"
+    ):
+        return False
+    for metric_name in ("tangent_alignment", "tangent_containment"):
+        metric = metrics.get(metric_name)
+        if not isinstance(metric, Mapping) or (
+            metric.get("rank_requirement") != "effective_rank_gte_intrinsic_dim"
+        ):
+            return False
+    if metrics["tangent_containment"].get("definition") != (
+        f"best_intrinsic_dim_subset_of_leading_rank_{basis}_principal_angles"
+    ):
+        return False
+    partial_containment = metrics.get("tangent_partial_containment")
+    if not isinstance(partial_containment, Mapping) or (
+        partial_containment.get("definition")
+        != f"leading_{basis}_subspace_within_tangent_principal_angles"
+        or partial_containment.get("rank_requirement")
+        != "effective_rank_gt_zero_lt_intrinsic_dim"
+        or partial_containment.get("normalization") != "effective_rank"
+    ):
+        return False
+    adjusted_alignment = metrics.get("tangent_adjusted_alignment")
+    if not isinstance(adjusted_alignment, Mapping) or (
+        adjusted_alignment.get("definition")
+        != f"leading_min_intrinsic_effective_rank_{basis}_subspace_overlap"
+        or adjusted_alignment.get("rank_requirement") != "effective_rank_gte_zero"
+        or adjusted_alignment.get("normalization") != "intrinsic_dim"
+        or adjusted_alignment.get("zero_rank") != "zero_if_tangent_defined"
+        or adjusted_alignment.get("aggregation") != "unweighted_component_mean"
+    ):
+        return False
+    if run["training"]["model_kind"] == "kmeans":
+        quantization = metrics.get("quantization")
+        if not isinstance(quantization, Mapping) or quantization.get("convention") != "lower_is_better":
+            return False
+        for name in ("train", "validation"):
+            values = quantization.get(name)
+            if not isinstance(values, Mapping) or type(values.get("n")) is not int or values["n"] < 0:
+                return False
+            if values["n"] == 0:
+                if name == "train":
+                    return False
+                continue
+            for key in ("sum_squared_distance", "mean_squared_distance"):
+                value = values.get(key)
+                if not isinstance(value, (float, int)) or not math.isfinite(value) or value < 0:
+                    return False
+        geometry = metrics.get("pca_geometry")
+        if not isinstance(geometry, Mapping) or geometry.get("version") != 1:
+            return False
+        counts = [geometry.get(name) for name in ("eligible_components", "excluded_components")]
+        if any(type(count) is not int or count < 0 for count in counts):
+            return False
+        return (
+            metrics.get("schema_version") == 2
+            and metrics.get("model_kind") == "kmeans"
+            and geometry.get("minimum_cluster_points") == 2
+            and sum(counts) == run["training"]["arguments"]["K"]
+            and metrics.get("evaluation") == run["evaluation"]["kind"]
+            and metrics.get("identity_hash") == run["identity_hash"]
+            and metrics.get("rank", {}).get("definition") == "kmeans_component_ranks"
+            and metrics.get("ambient_rank", {}).get("definition") == "kmeans_component_ranks"
+            and "nll" not in metrics and "bic" not in metrics
+        )
     if run["training"]["model_kind"] == "hddc":
         for rank_name in ("rank", "ambient_rank"):
             rank = metrics.get(rank_name)
@@ -890,12 +1036,15 @@ def _assignment_command(run: Mapping[str, Any], path: Path) -> list[str]:
         "--seed",
         str(cfg["seed"]),
         "--model-type",
-        "hddc" if run["training"]["model_kind"] == "hddc" else "mfa",
+        "mfa" if run["training"]["model_kind"] == "ard" else run["training"]["model_kind"],
         "--save-path",
         str(path),
     ]
     if not cfg["use_inference_cache"]:
         command.append("--no-inference-cache")
+    drop_prefix = run["training"]["arguments"].get("drop_prefix")
+    if drop_prefix is not None:
+        command.extend(["--drop-prefix", str(drop_prefix)])
     return command
 
 
@@ -940,6 +1089,7 @@ def _initialization_selection(run: Mapping[str, Any]) -> tuple[Path, dict, list[
 
 
 def _initialization_command(run: Mapping[str, Any]) -> list[str]:
+    _check_initialization_version(run)
     cfg = run["initialization"]
     _root, _source, _positions, selection = _initialization_selection(run)
     options = {
@@ -951,32 +1101,36 @@ def _initialization_command(run: Mapping[str, Any]) -> list[str]:
         **{key: value for key, value in cfg.items()
            if key not in {"method", "version", "drop_prefix_default"}},
     }
-    command = [sys.executable, str(REPO_ROOT / "scripts/temporary/build_toy_kmeans_centroids.py")]
+    command = [sys.executable, "-m", "dalg.cli.run_training_kmeans"]
     for key, value in options.items():
         command.extend(["--" + key.replace("_", "-"), str(value)])
     return command
 
 
+def _check_initialization_version(run: Mapping[str, Any]) -> None:
+    cfg = run["initialization"]
+    if cfg.get("version") != 4 or cfg.get("method") != "kmeans_model" or cfg.get("pca_purpose") != "initialization":
+        raise PipelineConfigError(
+            "legacy centroid initialization and older KMeans initialization manifests are incompatible; plan a new run "
+            "using the KMeans model checkpoint contract (initialization version 4)"
+        )
+
+
 def _validate_initialization(run: Mapping[str, Any]) -> None:
-    """Check the generated bundle and its training-split provenance."""
+    """Check the KMeans checkpoint and its exact training-split provenance."""
+    from dalg.models.kmeans import load_kmeans
+
+    _check_initialization_version(run)
     directory = Path(run["run_dir"]) / "initialization"
     cfg = run["initialization"]
     root, source, _positions, selection = _initialization_selection(run)
-    centroids, pcs = load_centroid_artifact(directory / "centroids.pt", mmap=True)
+    path = directory / "kmeans_model.pt"
+    model = load_kmeans(path, map_location="cpu")
     k = int(run["training"]["arguments"]["K"])
-    validate_centroid_artifact(
-        centroids, pcs, expected_k=k, expected_d=int(source["d_model"]),
-        required_pca_rank=cfg["pca_rank"],
-    )
-    if not torch.isfinite(centroids).all() or not torch.isfinite(pcs).all():
-        raise ValueError("initialization contains non-finite centroids or PCA directions")
-    if pcs.shape[-1] != cfg["pca_rank"]:
-        raise ValueError("initialization PCA rank does not match the manifest")
-    gram = pcs.transpose(1, 2) @ pcs
-    identity = torch.eye(pcs.shape[-1], dtype=pcs.dtype).expand_as(gram)
-    if not torch.allclose(gram, identity, atol=1e-5, rtol=0):
-        raise ValueError("initialization PCA directions are not orthonormal")
-    metadata = json.loads((directory / "config.json").read_text())
+    if (model.K, model.D, model.q_init) != (k, int(source["d_model"]), cfg["rank"]):
+        raise ValueError("initialization model dimensions do not match the manifest")
+    checkpoint = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+    metadata = checkpoint["meta"]["extra"]
     expected = {
         "method": "kmeans", "K": k, "layer": run["dataset"]["layer"],
         "source_shard_dir": str(root.resolve()), "selection": selection,
@@ -987,23 +1141,14 @@ def _validate_initialization(run: Mapping[str, Any]) -> None:
     }
     for key, value in expected.items():
         if metadata.get(key) != value:
-            raise ValueError(f"initialization metadata mismatch for {key}: {directory}")
+            raise ValueError(f"initialization metadata mismatch for {key}: {path}")
     sizes = metadata["cluster_sizes"]
-    pca_method = cfg.get("pca_method", "cluster")
-    minimum_size = cfg["pca_rank"] + 1 if pca_method == "cluster" else 0
-    if len(sizes) != k or sum(sizes) != selection["train_activations"] or min(sizes) < minimum_size:
-        raise ValueError("initialization cluster sizes violate the PCA training-split contract")
-    pcs_metadata = metadata["principal_components"]
-    expected_method = "cluster_covariance" if pca_method == "cluster" else "nearest_neighbor_covariance"
-    if pcs_metadata.get("method", "cluster_covariance") != expected_method:
-        raise ValueError("initialization PCA method does not match the manifest")
-    if pca_method == "knn":
-        if pcs_metadata.get("neighbors_per_centroid") != cfg["pca_neighbors"]:
-            raise ValueError("initialization PCA neighbor count does not match the manifest")
-        if not cfg["pca_rank"] < cfg["pca_neighbors"] <= selection["train_activations"]:
-            raise ValueError("initialization PCA neighbor count violates the training-split contract")
-    if pcs_metadata["rank"] != cfg["pca_rank"]:
-        raise ValueError("initialization PCA rank does not match the manifest")
+    if len(sizes) != k or sum(sizes) != selection["train_activations"] or min(sizes) < 0:
+        raise ValueError("initialization cluster sizes violate the training-split contract")
+    if model.q or model.surgery_threshold is not None:
+        raise ValueError("initialization checkpoint must contain initialization PCs only")
+    if model.init_pca_neighbors != cfg["pca_neighbors"] or model.init_pca_n_samples != selection["train_activations"]:
+        raise ValueError("initialization PCA neighborhood does not match the manifest")
 
 
 def _initialization_artifact_valid(run: Mapping[str, Any]) -> bool:
@@ -1017,6 +1162,7 @@ def _initialization_artifact_valid(run: Mapping[str, Any]) -> bool:
 
 
 def _ensure_initialization(run: Mapping[str, Any]) -> None:
+    _check_initialization_version(run)
     directory = Path(run["run_dir"]) / "initialization"
     if directory.exists() and (not directory.is_dir() or any(directory.iterdir())):
         if not _initialization_artifact_valid(run):
@@ -1026,29 +1172,37 @@ def _ensure_initialization(run: Mapping[str, Any]) -> None:
         print(f"[{run['run_id']}] initialization", flush=True)
         _run_command(_initialization_command(run))
         _validate_initialization(run)
-    _mark_stage(Path(run["run_dir"]), "initialization", directory / "centroids.pt")
+    _mark_stage(Path(run["run_dir"]), "initialization", directory / "kmeans_model.pt")
 
 
 def execute_run(run: Mapping[str, Any]) -> Path:
     """Execute one manifest row, resuming at the first incomplete stage."""
+    if "initialization" in run:
+        _check_initialization_version(run)
+    if run["training"]["model_kind"] == "kmeans":
+        arguments = run["training"]["arguments"]
+        if "pca_method" in arguments or arguments.get("pca_purpose") != "geometry":
+            raise PipelineConfigError("incompatible KMeans PCA manifest; plan a new run with cluster geometry")
     _ensure_run_spec(run)
     run_dir = Path(run["run_dir"])
-    expected_k = int(run["training"]["arguments"]["K"])
     if "initialization" in run:
         _ensure_initialization(run)
 
     if _training_artifacts_valid(run):
         print(f"[{run['run_id']}] training artifact is complete; skipping training")
     else:
+        model_path = _training_artifact_path(run)
+        if run["training"]["model_kind"] == "kmeans" and model_path.exists():
+            raise RuntimeError(f"refusing to overwrite invalid model artifact: {model_path}")
         print(f"[{run['run_id']}] training", flush=True)
         _run_command(_training_command(run))
         if not _training_artifacts_valid(run):
             raise RuntimeError("training command finished without valid final model artifacts")
     _mark_stage(run_dir, "training", _training_artifact_path(run))
 
-    assignments_path = run_dir / "mfa_model_assignments.pt"
+    assignments_path = _assignments_path(run)
     if run["assignments"]["enabled"]:
-        if _validate_assignment_bundle(assignments_path, expected_k):
+        if _assignment_artifact_valid(run):
             print(f"[{run['run_id']}] assignment artifact is complete; skipping assignments")
         else:
             if assignments_path.exists():
@@ -1057,7 +1211,7 @@ def execute_run(run: Mapping[str, Any]) -> Path:
                 )
             print(f"[{run['run_id']}] assignments", flush=True)
             _run_command(_assignment_command(run, assignments_path))
-            if not _validate_assignment_bundle(assignments_path, expected_k):
+            if not _assignment_artifact_valid(run):
                 raise RuntimeError("assignment command finished without a valid bundle")
         _mark_stage(run_dir, "assignments", assignments_path)
 
@@ -1071,34 +1225,9 @@ def execute_run(run: Mapping[str, Any]) -> Path:
                     f"refusing to overwrite invalid evaluation artifact: {metrics_path}"
                 )
             print(f"[{run['run_id']}] evaluation", flush=True)
-            if run["evaluation"]["kind"] == "toy_manifold_tiling":
-                from dalg.evaluation.toy_manifold_tiling import (
-                    evaluate_toy_manifold_tiling,
-                )
+            from dalg.evaluation.toy_manifold_tiling import evaluate_pipeline_run
 
-                metrics = evaluate_toy_manifold_tiling(
-                    run_dir,
-                    shard_dir=run["dataset"]["shard_dir"],
-                    layer=int(run["dataset"]["layer"]),
-                    model_kind=run["training"]["model_kind"],
-                    assignments_path=assignments_path,
-                    batch_size=int(run["evaluation"]["batch_size"]),
-                    device=str(run["evaluation"]["device"]),
-                    rank_threshold=float(run["evaluation"]["rank_threshold"]),
-                    max_mean_to_manifold_distance=(
-                        None
-                        if run["evaluation"]["max_mean_to_manifold_distance"] is None
-                        else float(
-                            run["evaluation"]["max_mean_to_manifold_distance"]
-                        )
-                    ),
-                )
-            else:
-                raise PipelineConfigError(
-                    f"unsupported evaluator: {run['evaluation']['kind']!r}"
-                )
-            metrics["run_id"] = run["run_id"]
-            metrics["identity_hash"] = run["identity_hash"]
+            metrics = evaluate_pipeline_run(run)
             _write_json_atomic(metrics_path, metrics)
         _mark_stage(run_dir, "evaluation", metrics_path)
 
@@ -1115,10 +1244,7 @@ def pipeline_status(runs: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
         training_complete = _training_artifacts_valid(run)
         assignments_complete = (
             not run["assignments"]["enabled"]
-            or _validate_assignment_bundle(
-                run_dir / "mfa_model_assignments.pt",
-                int(run["training"]["arguments"]["K"]),
-            )
+            or _assignment_artifact_valid(run)
         )
         evaluation_complete = (
             not run["evaluation"]["enabled"] or _evaluation_artifact_valid(run)
@@ -1156,13 +1282,16 @@ def sbatch_command(
     runs: list[dict[str, Any]],
     *,
     worker_path: Path,
+    log_dir: Path | None = None,
+    create_log_dir: bool = True,
 ) -> list[str]:
     resources = runs[0]["resources"]
     count = len(runs)
     array = f"0-{count - 1}%{resources['max_parallel']}"
     experiment = _slug(runs[0]["identity"]["experiment"])
-    log_dir = REPO_ROOT / "logs" / "experiments" / experiment
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = log_dir if log_dir is not None else REPO_ROOT / "logs" / "experiments" / experiment
+    if create_log_dir:
+        log_dir.mkdir(parents=True, exist_ok=True)
     command = [
         "sbatch",
         "--parsable",

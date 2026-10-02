@@ -14,6 +14,9 @@ diverge without touching the production model. Same arrangement as
   It is folded into the scale, so a masked column is exactly zero in W and both
   `dir_raw` and `scale_rho` receive exactly zero gradient through it — no
   stop-gradient machinery needed. `component_ranks` reads d_k off the mask.
+  An all-zero row gives signal rank zero: the component remains in the mixture
+  with covariance Psi (b I in shared-noise mode). Allocated q stays positive,
+  so later surgery can restore directions without changing tensor shapes.
 - the mask is part of the `state_dict`, so it round-trips through
   `save_mfa_hddc` / `load_mfa_hddc` and the component-shard path, and is sharded
   like the other per-component tensors.
@@ -115,7 +118,8 @@ class MFA_HDDC(nn.Module):
 
         # Per-component hard rank mask over the q loading columns. All ones
         # unless something (currently only hddc_surgery) narrows a component's
-        # rank; masked columns are exactly zero in W and receive zero gradient.
+        # rank, possibly to zero; masked columns are exactly zero in W and
+        # receive zero gradient. A zero mask preserves the mean and mixture weight.
         self.register_buffer("rank_mask", torch.ones(K, self.q, dtype=centroids.dtype))
 
         eye = torch.eye(self.q, dtype=centroids.dtype)
@@ -174,7 +178,7 @@ class MFA_HDDC(nn.Module):
 
     @property
     def component_ranks(self) -> torch.Tensor:
-        """(K,) current per-component rank d_k = number of unmasked columns."""
+        """(K,) signal ranks in [0, q]; zero denotes covariance Psi with no loadings."""
         return self.rank_mask.sum(-1).long()
 
     @torch.no_grad()

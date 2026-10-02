@@ -28,6 +28,7 @@ from dalg.models.adaptive_q.mfa_hddc import (
     save_mfa_hddc,
 )
 from dalg.models.mfa import load_mfa
+from dalg.models.kmeans import KMeans, save_kmeans
 from tests.synthetic_shards import LAYER, build_multi_shard
 
 
@@ -62,6 +63,12 @@ def _config(tmp_path: Path, shard_dir: Path) -> dict:
 
 
 def _write_yaml(path: Path, payload: dict) -> Path:
+    payload = copy.deepcopy(payload)
+    training = payload["training"]
+    if (not training.get("kmeans_model_path") and not training.get("init_model_path")
+            and not (payload["model"]["kind"] == "hddc" and training.get("fit_method") == "em")):
+        # Tiny shard fixtures need an explicit neighborhood smaller than 64.
+        payload.setdefault("initialization", {"pca_neighbors": 4})
     path.write_text(yaml.safe_dump(payload, sort_keys=False))
     return path
 
@@ -93,195 +100,122 @@ def test_unknown_training_parameter_is_rejected(tmp_path: Path) -> None:
         resolve_experiment(path)
 
 
-def test_shared_centroids_are_validated_resolved_and_forwarded(tmp_path: Path) -> None:
-    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
-    centroids_dir = tmp_path / "shared_centroids"
-    centroids_dir.mkdir()
-    centroids = torch.tensor([[-2.0, -1.0], [2.0, 1.0]])
-    centroids_path = centroids_dir / "centroids.pt"
-    torch.save(centroids, centroids_path)
-    config = _config(tmp_path, shard_dir)
-    config["training"]["centroids_path"] = str(centroids_path)
-    path = _write_yaml(tmp_path / "experiment.yaml", config)
+def _save_kmeans(path: Path, means: torch.Tensor, rank: int = 0) -> KMeans:
+    model = KMeans.from_centroids(means)
+    if rank:
+        generator = torch.Generator().manual_seed(11)
+        points = torch.randn(32, means.shape[1], generator=generator)
+        model.compute_init_pcs(points, rank=rank, neighbors=16)
+    save_kmeans(model, path)
+    return model
 
-    run = resolve_experiment(path)[0]
-    resolved = str(centroids_path.resolve())
 
-    assert run["training"]["arguments"]["centroids_path"] == resolved
+def test_shared_kmeans_is_validated_resolved_and_forwarded(tmp_path: Path) -> None:
+    shards = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    checkpoint = tmp_path / "kmeans_model.pt"
+    _save_kmeans(checkpoint, torch.zeros(2, 2))
+    config = _config(tmp_path, shards)
+    config["training"]["kmeans_model_path"] = str(checkpoint)
+    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
     assert "initialization" not in run
-    assert run["identity"]["training_args"]["centroids_path"] == resolved
+    assert run["identity"]["training_args"]["kmeans_model_path"] == str(checkpoint.resolve())
     command = _training_command(run)
-    assert command[command.index("--centroids-path") + 1] == resolved
+    assert command[command.index("--kmeans-model-path") + 1] == str(checkpoint.resolve())
 
 
-@pytest.mark.parametrize(
-    ("centroids", "message"),
-    [
-        (torch.zeros(3, 2), "centroids K=3 does not match model.K=2"),
-        (torch.zeros(2, 3), "centroid dimension D=3 does not match activation d_model=2"),
-    ],
-)
-def test_incompatible_shared_centroids_are_rejected(
-    tmp_path: Path,
-    centroids: torch.Tensor,
-    message: str,
-) -> None:
-    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
-    centroids_path = tmp_path / "centroids.pt"
-    torch.save(centroids, centroids_path)
-    config = _config(tmp_path, shard_dir)
-    config["training"]["centroids_path"] = str(centroids_path)
-    path = _write_yaml(tmp_path / "experiment.yaml", config)
-
-    with pytest.raises(PipelineConfigError, match=message):
-        resolve_experiment(path)
+@pytest.mark.parametrize("means", [torch.zeros(3, 2), torch.zeros(2, 3)])
+def test_incompatible_kmeans_dimensions_are_rejected(tmp_path: Path, means: torch.Tensor) -> None:
+    shards = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    checkpoint = tmp_path / "kmeans_model.pt"
+    _save_kmeans(checkpoint, means)
+    config = _config(tmp_path, shards)
+    config["training"]["kmeans_model_path"] = str(checkpoint)
+    with pytest.raises(PipelineConfigError, match="does not match"):
+        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
-def test_missing_shared_centroids_are_rejected(tmp_path: Path) -> None:
-    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
-    config = _config(tmp_path, shard_dir)
-    config["training"]["centroids_path"] = str(tmp_path / "missing.pt")
-    path = _write_yaml(tmp_path / "experiment.yaml", config)
-
-    with pytest.raises(PipelineConfigError, match="centroids file not found"):
-        resolve_experiment(path)
+def test_missing_kmeans_model_is_rejected(tmp_path: Path) -> None:
+    shards = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    config = _config(tmp_path, shards)
+    config["training"]["kmeans_model_path"] = str(tmp_path / "missing.pt")
+    with pytest.raises(PipelineConfigError, match="model file not found"):
+        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
-@pytest.mark.parametrize("invalid_name", ["centroids.pth", "centroids", "centroids.PT"])
-def test_shared_centroids_require_pt_extension(
-    tmp_path: Path,
-    invalid_name: str,
-) -> None:
-    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
-    invalid_path = tmp_path / invalid_name
-    torch.save(torch.zeros(2, 2), invalid_path)
-    config = _config(tmp_path, shard_dir)
-    config["training"]["centroids_path"] = str(invalid_path)
-    path = _write_yaml(tmp_path / "experiment.yaml", config)
-
-    with pytest.raises(PipelineConfigError, match="must point directly to a \\.pt file"):
-        resolve_experiment(path)
+@pytest.mark.parametrize("name", ["model.pth", "model", "model.PT", "directory.pt"])
+def test_kmeans_model_requires_direct_pt_file(tmp_path: Path, name: str) -> None:
+    shards = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    checkpoint = tmp_path / name
+    if name == "directory.pt":
+        checkpoint.mkdir()
+    else:
+        _save_kmeans(checkpoint, torch.zeros(2, 2))
+    config = _config(tmp_path, shards)
+    config["training"]["kmeans_model_path"] = str(checkpoint)
+    with pytest.raises(PipelineConfigError, match="must point directly"):
+        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
-def test_shared_centroids_reject_directory(tmp_path: Path) -> None:
-    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
-    centroids_dir = tmp_path / "centroids"
-    centroids_dir.mkdir()
-    torch.save(torch.zeros(2, 2), centroids_dir / "centroids.pt")
-    config = _config(tmp_path, shard_dir)
-    config["training"]["centroids_path"] = str(centroids_dir)
-    path = _write_yaml(tmp_path / "experiment.yaml", config)
-
-    with pytest.raises(PipelineConfigError, match="must point directly to a \\.pt file"):
-        resolve_experiment(path)
+@pytest.mark.parametrize("legacy_key", ["centroids_path", "kmeans_model_path"])
+def test_legacy_centroid_artifact_is_not_a_pipeline_model(tmp_path: Path, legacy_key: str) -> None:
+    shards = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    checkpoint = tmp_path / "centroids.pt"
+    torch.save(torch.zeros(2, 2), checkpoint)
+    config = _config(tmp_path, shards)
+    config["training"][legacy_key] = str(checkpoint)
+    with pytest.raises(PipelineConfigError, match="deprecated|invalid KMeans model"):
+        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
-@pytest.mark.parametrize(
-    "model",
-    [
-        {"kind": "mfa", "K": 2, "rank": 1},
-        {"kind": "ard", "K": 2, "rank": 1, "ard_lambda": 0.0},
-        {"kind": "hddc", "K": 2, "q_max": 1},
-    ],
-)
-def test_cluster_pca_direction_init_is_forwarded_for_every_trainer(
-    tmp_path: Path,
-    model: dict,
-) -> None:
-    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
-    centroids_path = tmp_path / "centroids.pt"
-    torch.save(
-        {
-            "centroids": torch.zeros(2, 2),
-            "principal_components": torch.eye(2).reshape(2, 2, 1),
-        },
-        centroids_path,
-    )
-    config = _config(tmp_path, shard_dir)
+@pytest.mark.parametrize("model", [
+    {"kind": "mfa", "K": 2, "rank": 1},
+    {"kind": "ard", "K": 2, "rank": 1, "ard_lambda": 0.0},
+    {"kind": "hddc", "K": 2, "q_max": 1},
+])
+def test_cluster_pca_direction_init_is_forwarded_for_every_trainer(tmp_path: Path, model: dict) -> None:
+    shards = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    checkpoint = tmp_path / "kmeans_model.pt"
+    _save_kmeans(checkpoint, torch.zeros(2, 2), rank=1)
+    config = _config(tmp_path, shards)
     config["model"] = model
-    config["training"].update(
-        {
-            "centroids_path": str(centroids_path),
-            "direction_init": "cluster_pca",
-        }
-    )
-
+    config["training"].update(kmeans_model_path=str(checkpoint), direction_init="cluster_pca")
     run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
     command = _training_command(run)
-
-    assert run["training"]["arguments"]["direction_init"] == "cluster_pca"
-    option = command.index("--direction-init")
-    assert command[option + 1] == "cluster_pca"
+    assert command[command.index("--direction-init") + 1] == "cluster_pca"
 
 
-def test_cluster_pca_requires_principal_components(tmp_path: Path) -> None:
-    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
-    centroids_path = tmp_path / "centroids.pt"
-    torch.save(torch.zeros(2, 2), centroids_path)
-    config = _config(tmp_path, shard_dir)
-    config["training"].update(
-        {
-            "centroids_path": str(centroids_path),
-            "direction_init": "cluster_pca",
-        }
-    )
-
-    with pytest.raises(PipelineConfigError, match="containing principal_components"):
+@pytest.mark.parametrize("stored_rank,requested_rank", [(0, 1), (1, 2)])
+def test_cluster_pca_requires_enough_stored_directions(tmp_path: Path, stored_rank: int, requested_rank: int) -> None:
+    shards = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    checkpoint = tmp_path / "kmeans_model.pt"
+    _save_kmeans(checkpoint, torch.zeros(2, 2), rank=stored_rank)
+    config = _config(tmp_path, shards)
+    config["model"]["rank"] = requested_rank
+    config["training"].update(kmeans_model_path=str(checkpoint), direction_init="cluster_pca")
+    with pytest.raises(PipelineConfigError, match="principal components"):
         resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
-def test_cluster_pca_plans_generated_centroids(tmp_path: Path) -> None:
-    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
-    config = _config(tmp_path, shard_dir)
-    config["training"]["direction_init"] = "cluster_pca"
-
+def test_cluster_pca_plans_generated_model_without_fitting(tmp_path: Path) -> None:
+    shards = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    config = _config(tmp_path, shards)
     run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
-    assert run["initialization"]["pca_rank"] == 1
-    assert not Path(run["training"]["arguments"]["centroids_path"]).exists()
+    assert run["initialization"]["rank"] == 1
+    assert run["initialization"]["version"] == 4
+    assert run["initialization"]["method"] == "kmeans_model"
+    assert not Path(run["training"]["arguments"]["kmeans_model_path"]).exists()
 
 
-def test_cluster_pca_rejects_insufficient_stored_rank(tmp_path: Path) -> None:
-    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
-    centroids_path = tmp_path / "centroids.pt"
-    torch.save(
-        {
-            "centroids": torch.zeros(2, 2),
-            "principal_components": torch.ones(2, 2, 1),
-        },
-        centroids_path,
-    )
-    config = _config(tmp_path, shard_dir)
-    config["model"]["rank"] = 2
-    config["training"].update(
-        {
-            "centroids_path": str(centroids_path),
-            "direction_init": "cluster_pca",
-        }
-    )
-
-    with pytest.raises(PipelineConfigError, match="stores 1 principal components"):
-        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
-
-
-def test_cluster_pca_rejects_malformed_direction_shape(tmp_path: Path) -> None:
-    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
-    centroids_path = tmp_path / "centroids.pt"
-    torch.save(
-        {
-            "centroids": torch.zeros(2, 2),
-            "principal_components": torch.ones(2, 1, 2),
-        },
-        centroids_path,
-    )
-    config = _config(tmp_path, shard_dir)
-    config["training"].update(
-        {
-            "centroids_path": str(centroids_path),
-            "direction_init": "cluster_pca",
-        }
-    )
-
-    with pytest.raises(PipelineConfigError, match="leading dimensions"):
+def test_cluster_pca_rejects_malformed_checkpoint(tmp_path: Path) -> None:
+    shards = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    checkpoint = tmp_path / "kmeans_model.pt"
+    _save_kmeans(checkpoint, torch.zeros(2, 2), rank=1)
+    payload = torch.load(checkpoint, weights_only=True)
+    payload["state_dict"]["_pcs"] = torch.ones(2, 1, 2)
+    torch.save(payload, checkpoint)
+    config = _config(tmp_path, shards)
+    config["training"].update(kmeans_model_path=str(checkpoint), direction_init="cluster_pca")
+    with pytest.raises(PipelineConfigError, match="invalid KMeans model"):
         resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
@@ -529,8 +463,8 @@ def test_execute_run_skips_valid_completed_stages(tmp_path: Path, monkeypatch) -
     shard_dir = build_multi_shard(tmp_path / "shards", n_shards=2, rows_per_shard=4)
     config = _config(tmp_path, shard_dir)
     centroids_path = tmp_path / "centroids.pt"
-    torch.save(torch.zeros(2, 2), centroids_path)
-    config["training"]["centroids_path"] = str(centroids_path)
+    _save_kmeans(centroids_path, torch.zeros(2, 2))
+    config["training"]["kmeans_model_path"] = str(centroids_path)
     path = _write_yaml(tmp_path / "experiment.yaml", config)
     run = resolve_experiment(path)[0]
     commands: list[list[str]] = []
@@ -586,19 +520,14 @@ def test_real_cpu_training_and_assignment_pipeline_smoke(tmp_path: Path) -> None
     config = _config(tmp_path, shard_dir)
     shared_centroids = torch.tensor([[10.0, 11.0], [1010.0, 1011.0]])
     centroids_path = tmp_path / "shared_centroids.pt"
-    torch.save(shared_centroids, centroids_path)
-    config["training"]["centroids_path"] = str(centroids_path)
+    _save_kmeans(centroids_path, shared_centroids)
+    config["training"]["kmeans_model_path"] = str(centroids_path)
     run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
 
     run_dir = execute_run(run)
 
     assert (run_dir / "mfa_model.pt").is_file()
-    copied_centroids = torch.load(
-        run_dir / "centroids.pt",
-        map_location="cpu",
-        weights_only=True,
-    )
-    assert torch.equal(copied_centroids, shared_centroids)
+    assert not (run_dir / "centroids.pt").exists()
     assert (run_dir / "mfa_model_assignments.pt").is_file()
     assert (run_dir / "PIPELINE_COMPLETED.json").is_file()
     assignments = torch.load(
@@ -617,17 +546,12 @@ def test_real_cpu_pipeline_preserves_cluster_pca_directions_at_zero_lr(
     centroids = torch.tensor([[10.0, 11.0], [1010.0, 1011.0]])
     directions = torch.tensor([[[1.0], [0.0]], [[0.0], [1.0]]])
     centroids_path = tmp_path / "shared_centroids.pt"
-    torch.save(
-        {
-            "centroids": centroids,
-            "principal_components": directions,
-        },
-        centroids_path,
-    )
+    initial = _save_kmeans(centroids_path, centroids, rank=1)
+    directions = initial.W_init.clone()
     config = _config(tmp_path, shard_dir)
     config["training"].update(
         {
-            "centroids_path": str(centroids_path),
+            "kmeans_model_path": str(centroids_path),
             "direction_init": "cluster_pca",
             "lr": 0.0,
             "max_steps": 1,
@@ -684,13 +608,11 @@ def test_real_hddc_initial_model_pipeline_smoke(tmp_path: Path) -> None:
     assert checkpoint["epoch"] == 1
     assert trained.q == 2
     assert torch.equal(trained.rank_mask[:, 1], torch.zeros(2))
-    assert torch.equal(
-        torch.load(run_dir / "centroids.pt", weights_only=True),
-        initial.mu.detach(),
-    )
+    assert not (run_dir / "centroids.pt").exists()
 
 
-def test_real_shared_b_pipeline_smoke(tmp_path: Path) -> None:
+@pytest.mark.parametrize("hard", [False, True])
+def test_real_shared_b_pipeline_smoke(tmp_path: Path, hard: bool) -> None:
     shard_dir = build_multi_shard(tmp_path / "shards", n_shards=2, rows_per_shard=4)
     config = _config(tmp_path, shard_dir)
     config["model"] = {
@@ -698,8 +620,9 @@ def test_real_shared_b_pipeline_smoke(tmp_path: Path) -> None:
         "K": 2,
         "q_max": 1,
         "shared_b": True,
-        "surgery_every_epochs": 0,
+        "surgery_every_epochs": 1 if hard else 0,
     }
+    config["experimental"] = {"hard_assignment_covariance": hard}
     config["assignments"]["enabled"] = False
     run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
 
@@ -710,6 +633,7 @@ def test_real_shared_b_pipeline_smoke(tmp_path: Path) -> None:
     assert trained.shared_b is True
     assert tuple(trained.psi_rho.shape) == (1,)
     assert saved_config["shared_b"] is True
+    assert saved_config["hard_assignment_covariance"] is hard
 
 
 def test_toy_manifold_tiling_evaluation_accepts_vanilla_mfa_config(
@@ -836,9 +760,9 @@ def test_real_toy_manifold_tiling_pipeline_runs_end_to_end(tmp_path: Path) -> No
     )
     containment = metrics["tangent_containment"]
     assert containment["definition"] == (
-        "leading_learned_rank_covariance_subspace_principal_angles"
+        "best_intrinsic_dim_subset_of_leading_rank_covariance_principal_angles"
     )
-    for metric in (alignment, containment):
+    for metric in (alignment, containment, metrics["tangent_partial_containment"]):
         for score_name in ("subspace_overlap", "worst_direction_cosine"):
             summary = metric[score_name]
             assert summary["valid_components"] + summary["undefined_components"] == (
@@ -849,6 +773,46 @@ def test_real_toy_manifold_tiling_pipeline_runs_end_to_end(tmp_path: Path) -> No
     assert (run_dir / "EVALUATION_COMPLETED.json").is_file()
     assert pipeline_status([run])[0]["pipeline"] is True
     assert _evaluation_artifact_valid(run)
+    containment_definition = metrics["tangent_containment"].pop("definition")
+    (run_dir / "metrics.json").write_text(json.dumps(metrics))
+    assert not _evaluation_artifact_valid(run)
+    for old_definition in ['leading_learned_rank_covariance_subspace_principal_angles', 'leading_effective_rank_covariance_subspace_principal_angles']:
+        metrics["tangent_containment"]["definition"] = old_definition
+        (run_dir / "metrics.json").write_text(json.dumps(metrics))
+        assert not _evaluation_artifact_valid(run)
+    metrics["tangent_containment"]["definition"] = containment_definition
+    (run_dir / "metrics.json").write_text(json.dumps(metrics))
+    assert _evaluation_artifact_valid(run)
+    for metric_name in ("tangent_alignment", "tangent_containment", "tangent_partial_containment"):
+        rank_requirement = metrics[metric_name].pop("rank_requirement")
+        (run_dir / "metrics.json").write_text(json.dumps(metrics))
+        assert not _evaluation_artifact_valid(run)
+        metrics[metric_name]["rank_requirement"] = rank_requirement
+    adjusted = metrics.pop("tangent_adjusted_alignment")
+    (run_dir / "metrics.json").write_text(json.dumps(metrics))
+    assert not _evaluation_artifact_valid(run)
+    metrics["tangent_adjusted_alignment"] = adjusted
+    for field in ("definition", "rank_requirement", "normalization", "zero_rank", "aggregation"):
+        original = adjusted[field]
+        adjusted[field] = "obsolete_contract"
+        (run_dir / "metrics.json").write_text(json.dumps(metrics))
+        assert not _evaluation_artifact_valid(run)
+        adjusted[field] = original
+    (run_dir / "metrics.json").write_text(json.dumps(metrics))
+    assert _evaluation_artifact_valid(run)
+    partial = metrics.pop("tangent_partial_containment")
+    (run_dir / "metrics.json").write_text(json.dumps(metrics))
+    assert not _evaluation_artifact_valid(run)
+    metrics["tangent_partial_containment"] = partial
+    partial["normalization"] = "intrinsic_dim"
+    (run_dir / "metrics.json").write_text(json.dumps(metrics))
+    assert not _evaluation_artifact_valid(run)
+    partial["normalization"] = "effective_rank"
+    current_definition = metrics["tangent_alignment"]["definition"]
+    metrics["tangent_alignment"]["definition"] = "leading_min_intrinsic_effective_rank_covariance_subspace_principal_angles"
+    (run_dir / "metrics.json").write_text(json.dumps(metrics))
+    assert not _evaluation_artifact_valid(run)
+    metrics["tangent_alignment"]["definition"] = current_definition
     for rank_name in ("rank", "ambient_rank"):
         metrics[rank_name].pop("definition")
         metrics[rank_name]["threshold"] = 1.0
@@ -887,9 +851,92 @@ def test_evaluation_artifact_requires_augmented_bic(
                 "schema_version": schema_version,
                 "evaluation": "toy_manifold_tiling",
                 "identity_hash": "test-run",
+                "tangent_alignment": {
+                    "definition": "leading_intrinsic_dim_covariance_subspace_principal_angles",
+                    "rank_requirement": "effective_rank_gte_intrinsic_dim",
+                },
+                "tangent_containment": {
+                    "definition": "best_intrinsic_dim_subset_of_leading_rank_covariance_principal_angles",
+                    "rank_requirement": "effective_rank_gte_intrinsic_dim",
+                },
+                "tangent_partial_containment": {
+                    "definition": "leading_covariance_subspace_within_tangent_principal_angles",
+                    "rank_requirement": "effective_rank_gt_zero_lt_intrinsic_dim",
+                    "normalization": "effective_rank",
+                },
+                "tangent_adjusted_alignment": {
+                    "definition": "leading_min_intrinsic_effective_rank_covariance_subspace_overlap",
+                    "rank_requirement": "effective_rank_gte_zero",
+                    "normalization": "intrinsic_dim",
+                    "zero_rank": "zero_if_tangent_defined",
+                    "aggregation": "unweighted_component_mean",
+                },
                 "bic": {"value": value, "formula": formula, "convention": convention},
             }
         )
     )
 
     assert _evaluation_artifact_valid(run) is expected
+
+
+def test_hard_covariance_sweep_reaches_cli_and_surgery(tmp_path):
+    from dalg.cli.adaptive_q.run_training_hddc import _surgery_config, build_parser
+
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    config = _config(tmp_path, shard_dir)
+    config["model"] = {
+        "kind": "hddc", "K": 2, "q_max": 1, "shared_b": True,
+        "surgery_every_epochs": 1,
+    }
+    config["experimental"] = {"hard_assignment_covariance": False}
+    config["sweep"] = {"experimental.hard_assignment_covariance": [False, True]}
+    soft, hard = resolve_experiment(_write_yaml(tmp_path / "sweep.yaml", config))
+    assert soft["run_id"] != hard["run_id"]
+    for run, enabled in [(soft, False), (hard, True)]:
+        assert run["identity"]["training_args"]["hard_assignment_covariance"] is enabled
+        command = _training_command(run)
+        assert ("--hard-assignment-covariance" in command) is enabled
+        cli_args = build_parser().parse_args(command[command.index("--shard-dir"):])
+        assert _surgery_config(cli_args).hard_assignment_covariance is enabled
+    del config["experimental"], config["sweep"]
+    default = resolve_experiment(_write_yaml(tmp_path / "default.yaml", config))[0]
+    assert default["run_id"] == soft["run_id"]
+
+
+@pytest.mark.parametrize("case, message", [
+    ("unknown", "unknown experimental parameters"),
+    ("string", "must be true or false"),
+    ("integer", "must be true or false"),
+    ("non_mapping", "experimental must be a mapping"),
+    ("mfa", "requires model.kind: hddc"),
+    ("ard", "requires model.kind: hddc"),
+    ("kmeans", "requires model.kind: hddc"),
+    ("em", "requires Adam with enabled periodic surgery"),
+    ("disabled", "requires Adam with enabled periodic surgery"),
+    ("misplaced", "belongs in experimental"),
+])
+def test_invalid_hard_covariance_configuration(tmp_path, case, message):
+    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    config = _config(tmp_path, shard_dir)
+    config["model"] = {
+        "kind": "hddc", "K": 2, "rank": 1, "shared_b": True,
+        "surgery_every_epochs": 1,
+    }
+    config["experimental"] = {"hard_assignment_covariance": True}
+    if case == "unknown":
+        config["experimental"]["typo"] = True
+    elif case in {"string", "integer"}:
+        config["experimental"]["hard_assignment_covariance"] = "true" if case == "string" else 1
+    elif case == "non_mapping":
+        config["experimental"] = True
+    elif case in {"mfa", "ard", "kmeans"}:
+        config["model"] = {"kind": case, "K": 2, "rank": 1}
+    elif case == "em":
+        config["training"]["fit_method"] = "em"
+        config["model"]["surgery_every_epochs"] = 0
+    elif case == "disabled":
+        config["model"]["surgery_every_epochs"] = 0
+    elif case == "misplaced":
+        config["training"]["hard_assignment_covariance"] = True
+    with pytest.raises(PipelineConfigError, match=message):
+        resolve_experiment(_write_yaml(tmp_path / "invalid.yaml", config))

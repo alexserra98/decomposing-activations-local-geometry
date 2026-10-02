@@ -63,7 +63,7 @@ def cmd_submit(args) -> None:
         args.manifest,
         check_inputs=not args.no_check_inputs,
     )
-    worker = REPO_ROOT / "scripts" / "slurm" / "temporary" / "sbatch_training_pipeline.sh"
+    worker = REPO_ROOT / "scripts" / "slurm" / "sbatch_training_pipeline.sh"
     if not worker.is_file():
         raise SystemExit(f"Slurm worker not found: {worker}")
 
@@ -90,6 +90,15 @@ def cmd_submit(args) -> None:
             f"submitted resource group {group_index + 1}/{len(groups)}: "
             f"job {completed.stdout.strip()}"
         )
+
+
+def cmd_evaluate(args) -> None:
+    from dalg.evaluation.saved_runs import command_evaluate
+    command_evaluate(args)
+
+
+def _distance_cutoff(value: str) -> float | None:
+    return None if value.lower() == "none" else float(value)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -120,6 +129,23 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--no-check-inputs", action="store_true")
     submit.add_argument("--dry-run", action="store_true")
     submit.set_defaults(func=cmd_submit)
+
+    evaluate = sub.add_parser("evaluate", help="recompute and overwrite saved-run metrics without training")
+    evaluate.add_argument("--manifest", nargs="+", required=True)
+    evaluate.add_argument(
+        "--indices", nargs="+",
+        help="row indices, or manifest-position:row-index for multiple manifests",
+    )
+    evaluate.add_argument("--device", default=argparse.SUPPRESS)
+    evaluate.add_argument("--batch-size", type=int, default=argparse.SUPPRESS)
+    evaluate.add_argument("--rank-threshold", type=float, default=argparse.SUPPRESS)
+    evaluate.add_argument(
+        "--max-mean-to-manifold-distance", type=_distance_cutoff, default=argparse.SUPPRESS,
+    )
+    evaluate.add_argument("--resources", help="YAML mapping of Slurm resource overrides")
+    evaluate.add_argument("--submit", action="store_true")
+    evaluate.add_argument("--dry-run", action="store_true")
+    evaluate.set_defaults(func=cmd_evaluate)
     return parser
 
 

@@ -1,0 +1,69 @@
+# Full HDDC pipeline using the full-data KMeans fit at noise_ratio=10.
+# Experimental direction initialization uses the 32 leading covariance PCs of
+# each centroid's 64 nearest points. Neighborhoods may overlap; centroids stay
+# fixed and directions are centered on the saved KMeans centroid.
+
+experiment:
+  name: toy_noiseless_k1000_mfa_vanilla_cluster_pca
+  output_root: dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noiseless/models
+
+dataset:
+  id: toy_manifolds_10types_1each_D128_30Keach_noiseless
+  shard_dir: /u/dssc/zenocosini/decomposing-activations-local-geometry/dalg-cache/assets/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noiseless
+  layer: 0
+
+model:
+  kind: mfa
+  K: 1000
+  q_max: 32
+  # shared_b: true
+  # surgery_every_epochs: 0.5
+  # surgery_threshold: 0.05
+  # surgery_min_count: 64
+
+initialization:
+  pca_neighbors: 64
+
+training:
+  # fit_method: adam
+  training_mode: vanilla
+  epochs: 1000
+  lr: 0.001
+  early_stop_patience: 10
+  early_stop_min_delta: 0.001
+  early_stop_delta: 0.0
+  epoch_snapshot_every: 1
+  batch_size: 2048
+  num_workers: 2
+  pool_size: 45000
+  refine_epochs: 0
+  val_frac: 0.1
+  split_seed: 42
+  seed: 42
+  device: cuda
+  wandb: false
+
+assignments:
+  enabled: true
+  batch_size: 4096
+  device: cuda
+
+evaluation:
+  enabled: true
+  kind: toy_manifold_tiling
+  batch_size: 4096
+  device: cuda
+
+resources:
+  partition: H100
+  account: LADE
+  nodes: 1
+  ntasks_per_node: 1
+  cpus_per_task: 8
+  gpus: 1
+  gpu_type: H100
+  memory: 80G
+  time: "01:00:00"
+
+sweep:
+  model.K: [100, 250, 500, 1000, 2000]

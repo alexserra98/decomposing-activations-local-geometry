@@ -173,6 +173,36 @@ def test_masked_columns_are_zero_and_receive_zero_gradient():
     assert float(model.dir_raw.grad[1, :, 0].abs().max()) > 0.0
 
 
+@pytest.mark.parametrize("all_spherical", [False, True])
+def test_spherical_components_match_dense_likelihoods_and_have_zero_loading_gradients(all_spherical):
+    torch.manual_seed(105)
+    model = MFA_HDDC(torch.randn(2, 4), rank=2, shared_b=True, psi_init=0.7)
+    model.rank_mask[0].zero_()
+    if all_spherical:
+        model.rank_mask.zero_()
+    x = torch.randn(12, 4)
+    W = model._W().detach().double()
+    covariance = W @ W.transpose(-1, -2) + torch.diag_embed(model._psi().detach().double())
+    reference = torch.distributions.MultivariateNormal(
+        model.mu.detach().double(), covariance_matrix=covariance,
+    ).log_prob(x.double()[:, None])
+
+    torch.testing.assert_close(model.log_prob_components(x).double(), reference, atol=2e-5, rtol=2e-5)
+    for dtype, chunk in [(None, None), (torch.float64, 1)]:
+        with torch.no_grad(), model.inference_cache(dtype=dtype, component_chunk_size=chunk):
+            torch.testing.assert_close(model.log_prob_components(x).double(), reference, atol=2e-5, rtol=2e-5)
+            assert torch.isfinite(model.responsibilities(x)).all()
+
+    spherical = model.component_ranks == 0
+    assert torch.count_nonzero(model._W()[spherical]) == 0
+    model.nll(x).backward()
+    assert torch.count_nonzero(model.dir_raw.grad[spherical]) == 0
+    assert torch.count_nonzero(model.scale_rho.grad[spherical]) == 0
+    assert torch.isfinite(model.mu.grad).all()
+    assert torch.isfinite(model.pi_logits.grad).all()
+    assert torch.isfinite(model.psi_rho.grad).all()
+
+
 def test_masking_a_column_equals_a_model_without_it():
     """A masked rank-q model must equal the rank-(q-1) model on the shared columns."""
     torch.manual_seed(4)
@@ -249,6 +279,7 @@ def test_shared_b_survives_single_file_save_load():
     torch.manual_seed(103)
     model = MFA_HDDC(torch.randn(6, 14), rank=4, shared_b=True)
     model.rank_mask[0, 3] = 0.0
+    model.rank_mask[1].zero_()
     x = torch.randn(16, 14)
 
     with tempfile.TemporaryDirectory() as d:
@@ -259,6 +290,8 @@ def test_shared_b_survives_single_file_save_load():
 
     assert blob["meta"]["shared_b"] is True
     assert loaded.shared_b is True
+    assert loaded.component_ranks.tolist() == model.component_ranks.tolist()
+    assert torch.count_nonzero(loaded._W()[1]) == 0
     assert loaded.isotropic_psi is False
     assert tuple(loaded.psi_rho.shape) == (1,)
     assert torch.equal(loaded.rank_mask, model.rank_mask)
@@ -637,9 +670,8 @@ def test_hddc_surgery_reports_shared_b_without_dropping_b_k_mean():
     assert summary["n_shared_b_pruned_directions"] == 0
 
 
-def test_shared_b_surgery_still_rejects_mandatory_first_direction_below_floor():
+def test_shared_b_surgery_keeps_component_with_first_direction_below_floor():
     model = MFA_HDDC(torch.zeros(2, 4), rank=3, shared_b=True)
-    before = {key: value.clone() for key, value in model.state_dict().items()}
     N = torch.tensor([100.0, 50.0], dtype=torch.float64)
     covariances = torch.stack(
         [
@@ -647,24 +679,97 @@ def test_shared_b_surgery_still_rejects_mandatory_first_direction_below_floor():
             torch.diag(torch.tensor([100.0, 50.0, 50.0, 50.0], dtype=torch.float64)),
         ]
     )
-    # Nonzero mean proposals and unequal counts would also change mu and pi
-    # if they were committed before the covariance feasibility check.
+    # Both means shift by one; covariance updates must still update the weights.
     A = N[:, None] * torch.ones(2, 4, dtype=torch.float64)
     S_acc = (covariances + 1.0) * N[:, None, None]
+    stats = reconstruct_components(
+        model, N, A, S_acc,
+        SurgeryConfig(enabled=True, every=1, threshold=0.1, min_count=1.0),
+    )
 
-    with pytest.raises(
-        RuntimeError,
-        match=r"component=0, direction=1, lambda=.* <= b=",
-    ):
-        reconstruct_components(
-            model,
-            N,
-            A,
-            S_acc,
-            SurgeryConfig(enabled=True, every=1, threshold=0.1, min_count=1.0),
-        )
-    for key, value in model.state_dict().items():
-        assert torch.equal(value, before[key])
+    assert model.K == 2 and model.q == 3
+    assert model.component_ranks.tolist() == [0, 1]
+    assert stats["n_updated"] == 2
+    assert stats["n_shared_b_pruned_components"] == 1
+    assert stats["n_shared_b_pruned_directions"] == 3
+    # The first component contributes its full trace and four noise dimensions.
+    assert float(stats["b_shared"]) == pytest.approx(178.0 / 11.0)
+    assert float(stats["b_shared"]) == float(model._psi()[0, 0].detach())
+    torch.testing.assert_close(model.mu, torch.ones(2, 4))
+    torch.testing.assert_close(model.pi_logits.softmax(0), (N / N.sum()).float())
+    assert torch.count_nonzero(model._W()[0]) == 0
+    W = model._W().detach().double()
+    covariance = W @ W.transpose(-1, -2) + torch.diag_embed(model._psi().detach().double())
+    b = float(stats["b_shared"])
+    torch.testing.assert_close(covariance[0], b * torch.eye(4, dtype=torch.float64))
+    torch.testing.assert_close(
+        covariance[1], torch.diag(torch.tensor([100., b, b, b], dtype=torch.float64)),
+        rtol=2e-6, atol=2e-6,
+    )
+
+
+def test_pooling_first_direction_preserves_another_components_signal():
+    model = MFA_HDDC(torch.zeros(3, 2), rank=1, shared_b=True)
+    N = torch.ones(3, dtype=torch.float64)
+    spectra = torch.tensor([[2., 1.], [9., 8.], [100., 21.]], dtype=torch.float64)
+    stats = reconstruct_components(
+        model, N, torch.zeros(3, 2, dtype=torch.float64),
+        torch.diag_embed(spectra), SurgeryConfig(),
+    )
+    # The pooled tail starts at 10. Adding lambda=2 lowers it to 8, saving 9.
+    assert float(stats["b_shared_at_cattell"]) == pytest.approx(10.0)
+    assert float(stats["b_shared"]) == pytest.approx(8.0)
+    assert model.component_ranks.tolist() == [0, 1, 1]
+    assert stats["n_shared_b_pruned_directions"] == 1
+
+
+@pytest.mark.parametrize("q", [1, 3])
+@pytest.mark.parametrize("variance, floor", [(2.0, 1e-6), (0.0, 0.1)])
+def test_shared_b_can_make_every_component_spherical(q, variance, floor):
+    model = MFA_HDDC(torch.zeros(2, 4), rank=q, shared_b=True)
+    N = torch.tensor([100., 50.], dtype=torch.float64)
+    stats = reconstruct_components(
+        model, N, torch.zeros(2, 4, dtype=torch.float64),
+        variance * torch.eye(4, dtype=torch.float64)[None] * N[:, None, None],
+        SurgeryConfig(psi_floor=floor),
+    )
+    assert model.component_ranks.tolist() == [0, 0]
+    assert torch.count_nonzero(model._W()) == 0
+    assert float(stats["b_shared"]) == pytest.approx(max(variance, floor))
+    assert float(stats["b_shared"]) == float(model._psi()[0, 0].detach())
+    assert stats["n_shared_b_pruned_directions"] == 2  # Cattell still proposes one each.
+    assert torch.isfinite(model.log_prob(torch.zeros(1, 4))).all()
+    assert all(torch.isfinite(p).all() for p in model.parameters())
+
+
+def test_shared_b_pools_directions_invalidated_by_float32_rounding():
+    model = MFA_HDDC(torch.zeros(2, 2), rank=1, shared_b=True)
+    N = torch.tensor([100., 50.], dtype=torch.float64)
+    tail = 1.0 - 2**-26
+    leading = 1.0 - 2**-27
+    covariance = torch.diag(torch.tensor([leading, tail], dtype=torch.float64))
+    stats = reconstruct_components(
+        model, N, torch.zeros(2, 2, dtype=torch.float64),
+        covariance[None] * N[:, None, None], SurgeryConfig(),
+    )
+    # Both directions clear the float64 pooled floor, but its encoding is 1.0.
+    assert float(stats["b_shared_at_cattell"]) < leading < float(model._psi()[0, 0].detach())
+    assert model.component_ranks.tolist() == [0, 0]
+    assert float(stats["b_shared"]) == 1.0
+    assert stats["n_shared_b_pruned_components"] == 2
+    assert stats["n_shared_b_pruned_directions"] == 2
+    assert torch.count_nonzero(model._W()) == 0
+
+
+def test_spherical_surgery_reports_zero_rank_and_parameter_count():
+    model = MFA_HDDC(torch.zeros(2, 4), rank=2, shared_b=True)
+    summary = hddc_surgery(model, [torch.zeros(10, 4)], SurgeryConfig())
+    assert summary["n_components"] == 2
+    assert summary["n_updated"] == 2
+    assert summary["d_k_hist"] == [2, 0, 0]
+    assert summary["d_k_min"] == summary["d_k_max"] == 0
+    assert summary["n_shared_b_pruned_directions"] == 2
+    assert parameter_count(model) == 2 * 4 + 1 + 1  # Means, weights, shared noise.
 
 
 def test_shared_b_surgery_with_no_eligible_components_is_a_no_op():
@@ -775,30 +880,44 @@ def test_surgery_requires_isotropic_psi():
 
 
 @pytest.mark.parametrize("shared_b", [False, True])
-def test_m_step_matches_frozen_responsibilities_and_dense_covariance(shared_b, tmp_path):
+@pytest.mark.parametrize("hard", [False, True])
+def test_m_step_matches_frozen_responsibilities_and_dense_covariance(shared_b, hard, tmp_path):
     torch.manual_seed(93)
     x = torch.randn(150, 4) * torch.tensor([3.0, 1.5, 0.3, 0.2]) + 2.0
     model = MFA_HDDC(
         torch.randn(3, 4), rank=1, shared_b=shared_b,
         isotropic_psi=not shared_b, psi_init=4.0,
     )
+    if hard:
+        # Give every component hard support; empty clusters have a separate test.
+        with torch.no_grad():
+            model.mu.fill_(2.0)
+            model.mu[:, 0].copy_(torch.tensor([-3.0, 2.0, 7.0]))
     batches = _batches(x, size=17)
     before = {key: value.clone() for key, value in model.state_dict().items()}
     with torch.no_grad():
         r = torch.cat([model.responsibilities(batch) for batch in batches]).double()
+    if hard:
+        r = torch.nn.functional.one_hot(r.argmax(1), model.K).double()
     counts = r.sum(0)
+    assert (counts > 0).all()
     means = r.T @ x.double() / counts[:, None]
     residual = x.double()[:, None, :] - means[None]
     covariance = torch.einsum("nk,nkd,nke->kde", r, residual, residual) / counts[:, None, None]
 
     N, A, B, rows = accumulate_statistics(
         model, batches, device=x.device, chunk_elems=3 * model.K * model.D,
+        hard_assignment_covariance=hard,
     )
     assert rows == len(x) and N.dtype == A.dtype == B.dtype == torch.float64
     for key, value in model.state_dict().items():
         assert torch.equal(value, before[key])
     torch.testing.assert_close(N, counts)
-    reconstruct_components(model, N, A, B, SurgeryConfig(threshold=0.01))
+    shifts = A / N[:, None]
+    torch.testing.assert_close(
+        B / N[:, None, None] - shifts[:, :, None] * shifts[:, None, :], covariance,
+    )
+    hddc_surgery(model, batches, SurgeryConfig(threshold=0.01, hard_assignment_covariance=hard))
     torch.testing.assert_close(model.mu.double(), means, atol=2e-6, rtol=2e-6)
     torch.testing.assert_close(model.pi_logits.softmax(0).double(), counts / counts.sum())
 
@@ -1069,3 +1188,93 @@ def test_all_skipped_surgery_preserves_optimizer_and_training_trajectory(tmp_pat
     for param_id, state in baseline["state"].items():
         for key, value in state.items():
             assert torch.equal(value, skipped["state"][param_id][key])
+
+
+@pytest.mark.parametrize("shared_b", [False, True])
+@pytest.mark.parametrize("min_count", [0.0, 20.0])
+def test_hard_surgery_skips_empty_and_small_clusters(shared_b, min_count):
+    torch.manual_seed(321)
+    centers = torch.zeros(3, 4)
+    centers[:, 0] = torch.tensor([0., 20., 40.])
+    model = MFA_HDDC(centers, rank=1, shared_b=shared_b, isotropic_psi=not shared_b)
+    x = torch.cat([
+        centers[k] + torch.randn(n, 4) * torch.tensor([1.5, .3, .2, .1])
+        for k, n in enumerate([80, 12])
+    ])
+    winners = model.responsibilities(x).argmax(1)
+    assert torch.bincount(winners, minlength=3).tolist() == [80, 12, 0]
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    old_pi = model.pi_logits.softmax(0).detach()
+    updated = 2 if min_count == 0 else 1
+    summary = hddc_surgery(
+        model, _batches(x, 13),
+        SurgeryConfig(min_count=min_count, hard_assignment_covariance=True),
+    )
+    assert summary["n_updated"] == updated
+    assert summary["n_skipped"] == 3 - updated
+    for name in ("mu", "pi_logits", "dir_raw", "scale_rho", "rank_mask"):
+        assert torch.equal(getattr(model, name)[updated:], before[name][updated:])
+    if not shared_b:
+        assert torch.equal(model.psi_rho[updated:], before["psi_rho"][updated:])
+    torch.testing.assert_close(model.pi_logits.softmax(0)[updated:], old_pi[updated:])
+
+
+def _hard_surgery_shard_worker(rank, rendezvous):
+    from datetime import timedelta
+    import torch.distributed as dist
+    from dalg.models.adaptive_q.mfa_hddc import component_shard_bounds
+
+    torch.set_num_threads(1)
+    torch.manual_seed(732)
+    centers = torch.zeros(5, 4)
+    centers[:, 0] = torch.tensor([-12., -4., 4., -12., 12.])
+    full = MFA_HDDC(centers, rank=1, isotropic_psi=True)
+    with torch.no_grad():
+        full.dir_raw[3].copy_(full.dir_raw[0])
+    x = torch.cat([centers[k] + torch.randn(17, 4) * .3 for k in [0, 1, 2, 4]])
+    winners = full.responsibilities(x).argmax(1)
+    assert torch.bincount(winners, minlength=5).tolist() == [17, 17, 17, 0, 17]
+    start, end = component_shard_bounds(full.K, rank, 2)
+    shard = ComponentShardedMFA_HDDC(
+        centers[start:end], rank=1, isotropic_psi=True,
+        global_K=full.K, component_start=start,
+    )
+    shard.load_state_dict({key: value[start:end] for key, value in full.state_dict().items()})
+    dist.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        for hard in [False, True]:
+            expected = accumulate_statistics(
+                full, _batches(x, 11), device="cpu", hard_assignment_covariance=hard,
+            )
+            actual = accumulate_statistics(
+                shard, _batches(x, 11), device="cpu", hard_assignment_covariance=hard,
+            )
+            for reference, local in zip(expected[:3], actual[:3]):
+                torch.testing.assert_close(local, reference[start:end], atol=2e-6, rtol=2e-6)
+            assert actual[3] == expected[3] == len(x)
+            if hard:
+                assert actual[0].tolist() == [17, 17, 17, 0, 17][start:end]
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="requires Gloo")
+def test_hard_surgery_global_argmax_matches_full_model_with_cross_shard_ties(tmp_path):
+    torch.multiprocessing.spawn(
+        _hard_surgery_shard_worker,
+        args=((tmp_path / "gloo_init").as_uri(),), nprocs=2, join=True,
+    )
+
+
+def test_explicit_soft_statistics_match_default():
+    torch.manual_seed(730)
+    model = MFA_HDDC(torch.randn(3, 4), rank=1, isotropic_psi=True)
+    batches = _batches(torch.randn(21, 4), 8)
+    default = accumulate_statistics(model, batches, device="cpu")
+    explicit = accumulate_statistics(model, batches, device="cpu", hard_assignment_covariance=False)
+    for left, right in zip(default[:3], explicit[:3]):
+        assert torch.equal(left, right)
+    assert default[3] == explicit[3]

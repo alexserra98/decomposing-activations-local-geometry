@@ -2,7 +2,7 @@
 
 > **Kind:** Data reference · **Status:** Current · **Use when:** Generating,
 > storing, or changing deterministic synthetic local-geometry datasets.
-> **Related:** [Toy-manifold tiling evaluation](../evaluation/toy-manifold-tiling.md)
+> **Related:** [Toy-manifold tiling evaluation](../experiments/evaluation/toy-manifold-tiling.md)
 
 The public API is exported from `dalg.data`:
 
@@ -19,7 +19,7 @@ CLI or workflow skill; import these functions directly.
 
 ## Dataset construction
 
-The generator defines twelve manifold types:
+The generator defines the following manifold types:
 
 | Type | Intrinsic dimension | Native embedding dimension |
 | --- | ---: | ---: |
@@ -35,13 +35,20 @@ The generator defines twelve manifold types:
 | `hypersphere_10d` | 10 | 11 |
 | `product_torus_12d` | 12 | 24 |
 | `cylinder` | 2 | 3 |
+| `swiss_roll_10d` | 10 | 11 |
+| `cylinder_10d` | 10 | 11 |
+| `swiss_roll_12d` | 2 | 12 |
+| `helix_12d` | 1 | 12 |
+| `product_torus_6d` | 6 | 12 |
+| `hypersphere_6d` | 6 | 7 |
+| `product_torus_4d` | 4 | 8 |
 
 `manifolds_per_type` independently embedded instances are created for every
 selected type. Each instance is normalized by a deterministic calibration
 sample, embedded in `ambient_dim` through an independently sampled orthonormal
 basis, and translated by its recorded ambient offset.
 
-The two high-dimensional types have fixed geometry. In raw local coordinates,
+The hypersphere and product torus have fixed geometry. In raw local coordinates,
 the hypersphere is
 
 \[
@@ -61,15 +68,39 @@ product torus is sampled from twelve independent uniform angles. Both have raw
 maximum absolute extrinsic curvature `1.0`. Their intrinsic dimensions and
 unit radii are fixed rather than configurable.
 
+`product_torus_6d` uses the same product construction with six independent
+uniform angles: `T^6 = (S^1)^6` in twelve native coordinates. Its six unit
+radii and raw maximum absolute extrinsic curvature `1.0` are fixed. Select it
+with `manifold_types=("product_torus_6d",)` and `ambient_dim >= 12`. It uses the
+same normalization, noise, metadata, and exact projection/tangent evaluation
+as `product_torus_12d`. It is appended to the registry, preserving existing
+type indices and random streams for explicit selections of earlier types.
+
+`product_torus_4d` is `T^4 = (S^1)^4`: four independent uniform angles give
+four unit circles in eight native coordinates. Select it with
+`manifold_types=("product_torus_4d",)` and `ambient_dim >= 8`. Its raw maximum
+absolute extrinsic curvature is `1.0`; normalization, noise, metadata, and
+exact projection/tangent evaluation follow the other product tori. It is
+appended to the registry and included in the default selection; explicit
+selections of earlier types retain their indices and random streams.
+
+`hypersphere_6d` is the unit sphere surface `S^6` in seven native coordinates,
+sampled by normalizing seven-dimensional isotropic Gaussian directions. Its
+intrinsic dimension is six and raw maximum absolute curvature is `1.0`. Select
+it with `manifold_types=("hypersphere_6d",)` and `ambient_dim >= 7`. It uses
+the same normalization, noise, metadata, and exact projection/tangent evaluation
+as `hypersphere_10d`. It is appended to the registry and included in the default
+selection; explicit selections of earlier types retain their random streams.
+
 The main configuration fields are:
 
 | Field | Default | Meaning |
 | --- | ---: | --- |
-| `ambient_dim` | `128` | Ambient dimension of every generated point; must be at least 3 and at least the largest selected native embedding dimension. The default twelve-type selection therefore requires at least 24. |
+| `ambient_dim` | `128` | Ambient dimension of every generated point; must be at least 3 and at least the largest selected native embedding dimension. The default selection therefore requires at least 24. |
 | `n_samples` | `400_000` | Total number of points across all manifold instances. |
 | `calibration_size` | `50_000` | Per-type sample count used to compute deterministic centering and RMS normalization. |
 | `manifolds_per_type` | `8` | Number of independently embedded instances of each selected type. |
-| `manifold_types` | all twelve types | Unique tuple of types to include. |
+| `manifold_types` | all registered types | Unique tuple of types to include. |
 | `offset_radius` | `4.0` | Radius of the sphere on which instance centers are placed; `0` centers every instance at the origin. |
 | `noise_ratio` | `10_000.0` | Ratio between normalized curvature radius and per-coordinate ambient Gaussian-noise standard deviation; `None` disables observation noise exactly. |
 | `seed` | `0` | Seed for calibration, embeddings, offsets, sampling, noise, and final row order. |
@@ -92,17 +123,92 @@ before changing those shapes.
 
 The Swiss roll uses `(theta * cos(theta), height, theta * sin(theta))`.
 Its default outer radius is `4.5 * pi`, and its default height range is
-`[0, 10 * 4.5 * pi]`, giving a height ten times the outer radius. Height and
-angle bounds are independent configuration fields; changing the angle bounds
-does not automatically adjust the height. RMS normalization divides all
-coordinates by one scalar, so it preserves this aspect ratio.
+`[0, 2 * 4.5 * pi]`, giving an axial length equal to the outer diameter
+(`9 * pi`, approximately `28.27`). Height and angle bounds are independent
+configuration fields; changing the angle bounds does not automatically adjust
+the height. RMS normalization divides all coordinates by one scalar, so it
+preserves this aspect ratio. Existing saved datasets retain their recorded
+bounds; reproducing the earlier elongated default requires explicitly setting
+`swiss_height_max=10 * 4.5 * pi`.
 
 The cylinder is the lateral surface `(cos(theta), height, sin(theta))`, with
 independent uniform `theta` in `[0, 2 * pi)` and `height` in `[0, 5]`. It has
 fixed unit radius and height five, with no end caps or filled interior. Its
 raw maximum absolute principal curvature is `1.0`. RMS normalization preserves
 its height-to-radius ratio of five. Select it with `manifold_types=("cylinder",)`
-or include it as part of the default twelve-type dataset.
+or include it as part of the default dataset.
+
+The 10D Swiss roll uses `(theta*cos(theta), theta*sin(theta), h1, ..., h9)`.
+Angle and all nine heights are sampled independently and uniformly from the
+`swiss_theta_min/max` and `swiss_height_min/max` bounds, so each straight
+dimension also defaults to one outer diameter in length. Its raw maximum
+absolute curvature equals the ordinary Swiss roll's: `(t² + 2)/(t² + 1)^(3/2)`,
+where `t` is the angle closest to zero in the configured interval.
+
+The 10D cylinder is `S^9 × [-2.5, 2.5]`: normalize a ten-dimensional isotropic
+Gaussian vector to sample its unit-radius sphere, then append an independent
+uniform height. It is a lateral surface, with no end caps or filled interior,
+and has raw maximum absolute curvature `1.0`.
+
+Both 10D types have eleven native coordinates and require `ambient_dim >= 11`
+when selected on their own. They use the same scalar RMS normalization,
+curvature-scaled noise, metadata, and shard layout as the other types.
+The default selection includes all registered types. Explicit selections of the
+original twelve types retain their registry indices and random streams;
+restoring these samplers does not promise byte-identical reproduction of
+historical 10D datasets from an unavailable generator implementation.
+
+### Swiss roll and helix with twelve native coordinates
+
+`swiss_roll_12d` is a custom harmonic extension with **intrinsic dimension 2**:
+
+\[
+x(t,h)=\left(t,h,
+  \left[\frac{t}{k}\cos(kt),\frac{t}{k}\sin(kt)\right]_{k=1}^{5}\right)
+  \in\mathbb{R}^{12}.
+\]
+
+Angle and height are independent uniform samples from `swiss_theta_min/max`
+and `swiss_height_min/max`. The five frequencies and their `1/k` amplitudes
+are fixed. Coordinates `(2, 1, 3)` recover the ordinary Swiss roll. The extra
+angle coordinate separates successive turns, so this extension changes the
+geometry rather than only rotating a three-dimensional surface.
+
+For its spiral curve, let `A = 1 + sum(1/k², k=1..5) + 5t²` be squared speed
+and `B = 20 + 55t²` be squared acceleration. Raw curvature is
+`sqrt(A*B - 25t²) / A^(3/2)`, with its maximum at the allowed angle closest
+to zero. The independent height direction has zero curvature.
+
+`helix_12d` is a closed curve with **intrinsic dimension 1**:
+
+\[
+x(t)=\left[\cos(kt),\sin(kt)\right]_{k=1}^{6},
+\qquad t\sim U[0,2\pi).
+\]
+
+It extends the rotating-plane construction of `helix_4d` to six unit-radius
+planes with fixed frequencies 1 through 6. It has no independent axial
+coordinate. Its raw curvature is constant:
+`sqrt(sum(k⁴, k=1..6)) / sum(k², k=1..6)`. The existing `helix_*` and
+`helix_4d_*` configuration fields do not alter this fixed curve.
+
+For these two names, `12d` means **native embedding dimension**. In
+`product_torus_12d`, it means **intrinsic dimension**: twelve independent
+circles use 24 native coordinates. All three can share a 128D dataset:
+
+```python
+config = ToyManifoldConfig(
+    ambient_dim=128,
+    manifold_types=("swiss_roll_12d", "helix_12d", "product_torus_12d"),
+)
+```
+
+The new Swiss roll and helix require `ambient_dim >= 12` when selected on
+their own. They use the existing scalar RMS normalization, curvature-scaled
+noise, random orthonormal embedding, offsets, and shard format. Both are
+included in the default selection. Explicit selections of earlier types
+preserve their registry indices and random streams; the expanded default
+selection changes sample allocation across types.
 
 Use the same seed and configuration except for `offset_radius` to generate a
 paired centered and separated condition. The point geometry, embeddings,
@@ -196,11 +302,11 @@ documentation, or script directories.
 
 ## Downstream evaluation
 
-The model-agnostic tiling evaluator supports vanilla MFA, ARD, and HDDC trained
+The model-agnostic tiling evaluator supports vanilla MFA, ARD, HDDC, and KMeans+PCA trained
 on these shards. It associates Gaussian means with exact planted manifolds and
 reports rank and tangent-subspace metrics; assignments are used for clustering
 and component-liveness diagnostics. Read the
-[Toy-Manifold Tiling Evaluation](../evaluation/toy-manifold-tiling.md) for the
+[Toy-Manifold Tiling Evaluation](../experiments/evaluation/toy-manifold-tiling.md) for the
 metric and artifact contract.
 
 ### Non-unique high-dimensional projections
@@ -212,13 +318,15 @@ noiseless samples emitted by these generators. Here, the hypersphere's
 calibration. They do not generally coincide with the ambient zero vector.
 
 - At the hypersphere origin, every point of the sphere is equally near.
+- At the `helix_12d` origin, every curve point is equally near (raw squared
+  distance six). Projection uses angle zero and marks its tangent non-unique.
 - If any two-coordinate product-torus pair is zero, every angle on that circle
   factor is equally near.
 
 The geometry evaluator returns a deterministic representative point so that
-the exact distance stays finite, but marks either case as non-unique because
+the exact distance stays finite, but marks these cases as non-unique because
 the projected point and its tangent are not identified. See
-[Exact proximity association](../evaluation/toy-manifold-tiling.md#exact-proximity-association)
+[Exact proximity association](../experiments/evaluation/toy-manifold-tiling.md#exact-proximity-association)
 for how this differs from a tie between separate planted manifolds and how it
 affects rank and tangent metrics.
 
