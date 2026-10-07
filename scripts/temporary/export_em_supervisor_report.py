@@ -7,7 +7,9 @@ aggregation execute the existing notebook cells; only figure layout is adapted.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import matplotlib
@@ -28,7 +30,8 @@ PLOTS.mkdir(parents=True, exist_ok=True)
 DATA.mkdir(parents=True, exist_ok=True)
 NOTEBOOK = REPO / "notebooks/toy_manifold_noise_sweep_results.ipynb"
 CELLS = json.loads(NOTEBOOK.read_text())["cells"]
-MAIN = REPO / "dalg-cache/deprecated_toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0"
+MAIN = REPO / "dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0"
+ORIGINAL = REPO / "dalg-cache/deprecated_toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0"
 DIAGNOSTIC = REPO / "dalg-cache/toy_manifold_models_hypersphere_swiss_roll_cylinder_10d_20Keach_noise_sweep_seed0"
 plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 7,
                      "axes.titlesize": 8, "axes.labelsize": 7,
@@ -176,31 +179,65 @@ def latex_rank_table(ns):
     adjusted = ns["manifolds"].groupby("run_id")["tangent_adjusted_alignment.subspace_overlap.mean"].mean()
     summary["adjusted_alignment"] = adjusted
     summary.to_csv(DATA / "main_selected_summary.csv")
-    lines = []
-    for panel, noises in enumerate([["noiseless", 1000], [100, 10]]):
-        if panel:
-            lines.append(r"\hfill%")
-        lines += [r"\begin{minipage}[t]{0.49\linewidth}\centering",
-                  r"\begin{tabular}{@{}llrrrrr@{}}", r"\toprule",
-                  r"Noise & Model & $\bar q$ & $q_k=r$ (\%) & $q_k=m$ (\%) & NLL & Live \\", r"\midrule"]
-        prev = None
-        for _, row in summary.loc[summary.noise_ratio.isin(noises)].iterrows():
-            noise = row["noise_ratio"]
-            if prev is not None and noise != prev:
-                lines.append(r"\addlinespace[1.5pt]")
-            label = "No noise" if noise == "noiseless" else str(noise)
-            model = {"kmeans": "KM", "hddc": "Adam", "em": "EM"}[row.model_kind]
-            nll = "---" if pd.isna(row["nll.validation"]) else f"{row['nll.validation']:.1f}"
-            lines.append(f"{label if noise != prev else ''} & {model} & {row['rank.mean_learned']:.2f} & {100*row['rank.exact_match']:.1f} & {100*row['ambient_rank.exact_match']:.1f} & {nll} & {int(row['components.live'])} " + r"\\")
-            prev = noise
-        lines += [r"\bottomrule", r"\end{tabular}", r"\end{minipage}%"]
+    table = summary.loc[summary.model_kind.isin(["kmeans", "em"])]
+    table.to_csv(DATA / "rank_table_km_em.csv")
+    lines = [r"\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}lrrrrrr@{}}",
+             r"\toprule",
+             r"Model & $\rho$ & Mean $\widehat q_k$ & $\widehat q_k=r$ (\%) & $\widehat q_k=m$ (\%) & Val. NLL & Live / total \\",
+             r"\midrule"]
+    previous_noise = None
+    for _, row in table.iterrows():
+        noise = row["noise_ratio"]
+        if previous_noise is not None and noise != previous_noise:
+            lines.append(r"\midrule")
+        label = "No noise" if noise == "noiseless" else str(noise)
+        model = {"kmeans": "K-means + PCA", "em": "HDDC (EM)"}[row.model_kind]
+        nll = "---" if pd.isna(row["nll.validation"]) else f"{row['nll.validation']:.2f}"
+        lines.append(f"{model} & {label} & {row['rank.mean_learned']:.2f} & "
+                     f"{100*row['rank.exact_match']:.1f} & {100*row['ambient_rank.exact_match']:.1f} & "
+                     f"{nll} & {int(row['components.live'])} / {int(row['K'])} " + r"\\")
+        previous_noise = noise
+    lines += [r"\bottomrule", r"\end{tabular*}"]
     (DATA / "rank_table.tex").write_text("\n".join(lines) + "\n")
+    standalone = [
+        f"% Corrected ten-manifold benchmark: K={FIXED_K}, tau={FIXED_TAU}.",
+        "% Rank statistics are unweighted means over the ten manifold types.",
+        "% rho is the curvature-radius / noise-standard-deviation ratio.",
+        r"\documentclass[10pt]{article}",
+        r"\usepackage[T1]{fontenc}",
+        r"\usepackage{lmodern,amsmath,booktabs}",
+        r"\usepackage[paperwidth=210mm,paperheight=72mm,margin=4mm]{geometry}",
+        r"\pagestyle{empty}", r"\setlength{\parindent}{0pt}",
+        r"\setlength{\tabcolsep}{0pt}", r"\renewcommand{\arraystretch}{1.18}",
+        r"\begin{document}", *lines, r"\end{document}",
+    ]
+    (DEST / "rank_table_km_em.tex").write_text("\n".join(standalone) + "\n")
     print(summary[["model_kind", "noise_ratio", "rank.mean_learned", "rank.exact_match", "ambient_rank.exact_match", "adjusted_alignment", "nll.validation", "components.live"]].to_string())
+
+
+def swiss_roll_comparison(ns):
+    """Keep the historical comparison separate from corrected benchmark plots."""
+    columns = ["run_id", "model_kind", "noise_ratio", "K", "surgery_threshold",
+               "type_name", "intrinsic_dim", "embedding_dim", "rank.mean_learned",
+               "rank.exact_match", "tangent_adjusted_alignment.subspace_overlap.mean"]
+    frames = []
+    for version, path, source in [("original", ORIGINAL, load_dataset(ORIGINAL)),
+                                  ("corrected", MAIN, ns)]:
+        rows = source["manifold_df"]
+        rows = rows.loc[rows.type_name.eq("swiss_roll") & rows.K.eq(FIXED_K)
+                        & rows.surgery_threshold.eq(FIXED_TAU)
+                        & rows.model_kind.isin(["kmeans", "hddc", "em"]), columns].copy()
+        assert len(rows) == 12
+        rows.insert(0, "source_csv", str((path / "manifold_metrics.csv").relative_to(REPO)))
+        rows.insert(0, "dataset_version", version)
+        frames.append(rows)
+    pd.concat(frames, ignore_index=True).to_csv(DATA / "swiss_roll_correction.csv", index=False)
 
 
 def main():
     ns = load_dataset(MAIN)
-    execute_cell(4, ns, {"SWEEP_NOISE_LEVELS": ["noiseless", 1000, 100, 10]})
+    execute_cell(4, ns, {"SWEEP_MODELS": ["em"], "SWEEP_NOISE_LEVELS": ["noiseless", 1000, 100, 10],
+                         "SWEEP_K_VALUES": None, "SWEEP_THRESHOLDS": None, "SWEEP_Q_CAPACITY": 32})
     execute_cell(5, ns, definitions=True)
     sweep_metrics = ["Avg adjusted alignment", "qₖ = r (%)"]
     sweep(ns, "main_sweep", sweep_metrics)
@@ -210,7 +247,8 @@ def main():
     execute_cell(9, ns, {"K": FIXED_K, "HDDC_THRESHOLD": FIXED_TAU,
                          "EM_THRESHOLD": FIXED_TAU, "KMEANS_THRESHOLD": FIXED_TAU})
     execute_cell(10, ns)
-    execute_cell(13, ns)
+    execute_cell(13, ns, {"NOISE_LEVELS": ["noiseless", 1000, 100, 10],
+                          "MODELS": ["kmeans", "hddc", "em"]})
     execute_cell(14, ns, definitions=True)
     ns["model_labels"]["hddc"] = "Ad"
     short_names = {"segment": "Segment", "circle": "Circle", "helix": "Helix",
@@ -238,8 +276,10 @@ def main():
         table.to_csv(DATA / ("main_" + key.lower().replace(" ", "_") + ".csv"))
     ns["tangent_df"].to_csv(DATA / "main_selected_manifolds.csv", index=False)
     latex_rank_table(ns)
+    swiss_roll_comparison(ns)
     high = load_dataset(DIAGNOSTIC)
-    execute_cell(4, high, {"SWEEP_NOISE_LEVELS": ["noiseless", 1000, 100, 10], "SWEEP_Q_CAPACITY": 32})
+    execute_cell(4, high, {"SWEEP_MODELS": ["em"], "SWEEP_NOISE_LEVELS": ["noiseless", 1000, 100, 10],
+                           "SWEEP_K_VALUES": None, "SWEEP_THRESHOLDS": None, "SWEEP_Q_CAPACITY": 32})
     execute_cell(5, high, definitions=True)
     high_metrics = ["Avg adjusted alignment", "qₖ = r (%)", "qₖ = m (%)"]
     sweep(high, "highdim_sweep", high_metrics)
@@ -247,6 +287,12 @@ def main():
         sweep(high, f"highdim_sweep_noise{noise}", high_metrics, noise)
     high["sweep_summary"].to_csv(DATA / "highdim_sweep_summary.csv", index=False)
     (DATA / "provenance.json").write_text(json.dumps({
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source_sha256": {str(path.relative_to(REPO)): hashlib.sha256(path.read_bytes()).hexdigest()
+                          for root in [MAIN, DIAGNOSTIC, ORIGINAL]
+                          for path in [root / "general_metrics.csv", root / "manifold_metrics.csv"]},
+        "notebook_sha256": hashlib.sha256(NOTEBOOK.read_bytes()).hexdigest(),
+        "swiss_roll_comparison_source": str(ORIGINAL.relative_to(REPO)),
         "notebook": str(NOTEBOOK.relative_to(REPO)),
         "notebook_cells_used": [2, 4, 5, 9, 10, 13, 14, 15, 16],
         "main_source": str(MAIN.relative_to(REPO)),
