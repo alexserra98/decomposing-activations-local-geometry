@@ -48,6 +48,9 @@ reorganize this documentation collection.
 - [Toy-manifold tiling evaluation](experiments/evaluation/toy-manifold-tiling.md) defines
   association, rank-recovery, tangent-alignment, tangent-containment, and
   output-schema contracts.
+- [Held-out distribution coverage](evaluation/heldout-distribution-coverage.md)
+  defines train/validation/test isolation and point-to-nearest-live-centroid
+  coverage when the continuous manifold is unavailable.
 
 ## I want context for an experiment
 
@@ -69,6 +72,9 @@ scope.
   synthetic sweep and related analysis.
 - [Wikipedia KMedoids slice](experiments/wikipedia-kmedoids.md) describes the
   temporary sliced-activation KMedoids workflow and verified artifacts.
+- [Toy held-out coverage](experiments/toy-heldout-coverage.md) defines the
+  strict D=128 noiseless pilot and its fixed train/validation/test artifacts,
+  with paired noisy spheres retained as a low-dimensional visual control.
 
 ## Document roles
 
