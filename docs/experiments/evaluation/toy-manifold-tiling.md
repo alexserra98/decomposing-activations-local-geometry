@@ -9,6 +9,8 @@ The toy-manifold tiling evaluator measures how local components cover planted
 manifold instances. It supports MFA, ARD, HDDC, and KMeans+PCA checkpoints and
 writes clustering, rank, and tangent geometry to `metrics.json`. MFA-family
 models also report NLL and augmented BIC; KMeans reports quantization error.
+All models include [held-out distribution coverage](../../evaluation/heldout-distribution-coverage.md)
+by default, evaluated on the independent `test/` population.
 
 The public entry point is:
 
@@ -30,6 +32,12 @@ This separation is important while assignment behavior is being investigated.
 An assignment-dead Gaussian can still be geometrically close to a planted
 manifold, and an assignment-live Gaussian is not assumed to represent the
 manifold that supplies most of its assigned points.
+
+Held-out coverage has its own population: every point in `<dataset>/test/`,
+measured against centroids with at least one **training** assignment. Validation
+assignments do not contribute to coverage liveness. KMeans PCA validity does
+not restrict those centroids. See the
+[coverage integration contract](../../evaluation/heldout-distribution-coverage.md#pipeline-integration).
 
 ## KMeans geometry and quantization
 
@@ -80,7 +88,11 @@ Each per-manifold `components` record adds `pca_eligible` and `pca_excluded`.
 Sparse exclusions are separate from the existing `undefined_components` count,
 which now describes eligible components lacking an identifiable tangent
 comparison. All-excluded geometry completes with null means and zero contributors.
-The stored full basis has capacity `D`; effective ranks determine comparisons.
+The stored geometry tensor has shape `(K, D, q)`, with
+`q = max(1, max(component_ranks))` and zero padding beyond each selected rank.
+The full eigenvalue spectrum is retained; discarded directions are not.
+Effective ranks determine comparisons. See [KMeans+PCA](../../models/kmeans.md)
+for storage and PCA recomputation.
 
 ## Augmented BIC
 
@@ -499,6 +511,7 @@ model_kind
 K
 q_capacity
 dataset
+heldout_distribution_coverage  # when enabled; full empirical CDF and distance summaries
 nll
 bic
   value
@@ -653,9 +666,11 @@ This is output `schema_version: 2`; MFA-family completed-artifact validation
 also requires this version, a finite `bic.value`, `convention: higher_is_better`, and
 `formula: -standard_bic / n + active_components`. Version 1 reports contain
 standard BIC in `bic.value` and are not accepted as current evaluations.
-For an existing run, archive its old `metrics.json` before resuming the manifest
-to regenerate evaluation; the pipeline refuses to overwrite an invalid existing
-report. Valid training and assignment artifacts can be reused.
+When coverage is enabled, completed-artifact validation also requires the
+`heldout_distribution_coverage` block, with training-only liveness and a valid
+full empirical curve. Use `dalg-run-pipeline evaluate --manifest <manifest>` to
+replace an obsolete report; normal pipeline resume refuses to overwrite an
+invalid existing report. Valid training and assignment artifacts are reused.
 
 `per_manifold` follows the metadata order and contains an entry for every
 planted instance, including instances with zero associated components. Global
@@ -677,6 +692,7 @@ evaluation:
   device: cuda
   rank_threshold: 1.0
   max_mean_to_manifold_distance: null
+  heldout_distribution_coverage: true
 ```
 
 `null` is the default and disables distance filtering, so every component with
@@ -697,6 +713,10 @@ The evaluator requires:
 - a complete assignment bundle aligned to the same selected shard stream; and
 - the saved `manifold_metadata.pt` referenced by the shard configuration.
 
+Coverage additionally requires a compatible `test/` dataset with at most
+100,000 points; disabling coverage removes this requirement. Missing `test/`
+raises an exception naming `scripts/temporary/add_toy_manifold_test_split.py`.
+
 ## Code organization
 
 - `toy_manifold_geometry.py` implements noiseless projections and orthonormal
@@ -706,6 +726,8 @@ The evaluator requires:
 - `toy_manifold_tiling.py` loads artifacts and models, reconstructs the
   train/validation split, computes NLL, augmented BIC, and clustering metrics, and
   assembles the report.
+- `toy_manifold_coverage.py` validates independent test splits, streams coverage,
+  and checks the coverage report contract; `coverage.py` owns distances and CDF summaries.
 - `analysis/bic.py` owns MFA-family parameter counting and the standard BIC formula.
 - `analysis/bic_improved.py` owns the active-BIC formula reused by the evaluator
   and standalone helpers for scoring a saved run.

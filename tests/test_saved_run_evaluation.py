@@ -43,7 +43,7 @@ def planning(monkeypatch, tmp_path):
     a, b = _run(tmp_path / "a"), _run(tmp_path / "b")
     ma = _manifest(tmp_path / "a.jsonl", [a, b])
     mb = _manifest(tmp_path / "b.jsonl", [b, a])
-    monkeypatch.setattr(saved, "_prerequisites", lambda run: ([], copy.deepcopy(run)))
+    monkeypatch.setattr(saved, "_prerequisites", lambda run, evaluation: ([], copy.deepcopy(run)))
     return a, b, ma, mb
 
 
@@ -100,11 +100,11 @@ def test_overrides_and_new_invocation(planning):
 
 def test_missing_runs_reported_and_no_eligible_fails(planning, monkeypatch):
     a, b, ma, _ = planning
-    monkeypatch.setattr(saved, "_prerequisites", lambda run: (["missing.pt"], None) if run == a else ([], run))
+    monkeypatch.setattr(saved, "_prerequisites", lambda run, evaluation: (["missing.pt"], None) if run == a else ([], run))
     plan = saved.plan_evaluation([ma])
     assert len(plan["runs"]) == len(plan["skipped"]) == 1
     assert plan["runs"][0]["run"] == b
-    monkeypatch.setattr(saved, "_prerequisites", lambda run: (["missing.pt"], None))
+    monkeypatch.setattr(saved, "_prerequisites", lambda run, evaluation: (["missing.pt"], None))
     args = build_parser().parse_args(["evaluate", "--manifest", str(ma)])
     with pytest.raises(ValueError, match="no eligible"):
         args.func(args)
@@ -164,7 +164,9 @@ def real_run(request, tmp_path):
     shards = save_toy_manifold_shards(tmp_path / "shards", ToyManifoldConfig(
         ambient_dim=3, n_samples=40, calibration_size=20,
         manifold_types=("segment",), manifolds_per_type=2, seed=3,
-    ), layer=0, shard_size=20)
+    ), layer=0, shard_size=20, test_fraction=0)
+    from tests.test_toy_manifold_test_split import add_test_split
+    add_test_split(shards, n_samples=8)
     run = _run(tmp_path / "run", kind=request.param)
     run["dataset"]["shard_dir"] = str(shards)
     directory = Path(run["run_dir"])
@@ -234,6 +236,9 @@ def test_real_saved_evaluation_overwrites_every_invocation(real_run, tmp_path, m
     table = pd.read_csv(source.parent / "general_metrics.csv")
     assert len(table) == 1 and table["evaluation_config.batch_size"].iloc[0] == 13
     assert table["config.training.model_kind"].iloc[0] == real_run["training"]["model_kind"]
+    assert table["heldout_distribution_coverage.reference_points"].iloc[0] > 0
+    curve = json.loads(table["heldout_distribution_coverage.coverage_curve"].iloc[0])
+    assert curve[-1]["fraction"] == 1.0
     args.func(args)
     second = json.loads((source / "metrics.json").read_text())
     assert len(calls) == 2
@@ -373,6 +378,7 @@ def test_shard_only_model_is_reported(tmp_path):
 @pytest.mark.parametrize("overrides", [
     {"batch_size": 0}, {"rank_threshold": -1}, {"max_mean_to_manifold_distance": 0},
     {"max_mean_to_manifold_distance": float("inf")}, {"kind": "unknown"},
+    {"heldout_distribution_coverage": "false"},
 ])
 def test_invalid_evaluation_settings(planning, overrides):
     _, _, ma, _ = planning
@@ -406,3 +412,46 @@ def test_modified_or_old_plan_rejected(planning):
     path.write_text(json.dumps(plan))
     with pytest.raises(ValueError, match="modified evaluation plan"):
         saved.read_evaluation_plan(path)
+
+
+@pytest.mark.parametrize("flag,expected", [
+    (None, True), ("--heldout-distribution-coverage", True),
+    ("--no-heldout-distribution-coverage", False),
+])
+def test_coverage_overrides_do_not_rewrite_old_manifests(planning, flag, expected):
+    _, _, manifest, _ = planning
+    original = manifest.read_bytes()
+    args = build_parser().parse_args([
+        "evaluate", "--manifest", str(manifest), "--dry-run", *([flag] if flag else []),
+    ])
+    overrides = ({"heldout_distribution_coverage": args.heldout_distribution_coverage}
+                 if hasattr(args, "heldout_distribution_coverage") else {})
+    plan = saved.plan_evaluation([manifest], overrides=overrides)
+    assert all(row["evaluation"]["heldout_distribution_coverage"] is expected for row in plan["runs"])
+    assert all("heldout_distribution_coverage" not in row["run"]["evaluation"] for row in plan["runs"])
+    args.func(args)
+    assert manifest.read_bytes() == original
+
+
+def test_missing_test_split_is_error_and_override_preserves_saved_artifacts(real_run, tmp_path):
+    manifest = _manifest(tmp_path / "manifest.jsonl", [real_run])
+    original_manifest = manifest.read_bytes()
+    source = Path(real_run["run_dir"])
+    enabled_plan = saved.plan_evaluation([manifest])
+    shutil.rmtree(Path(real_run["dataset"]["shard_dir"]) / "test")
+    before = _snapshot(source)
+    for action in (
+        lambda: saved.plan_evaluation([manifest]),
+        lambda: saved.evaluate_saved_run(enabled_plan, 0),
+    ):
+        with pytest.raises(FileNotFoundError, match="add_toy_manifold_test_split.py"):
+            action()
+        assert _snapshot(source) == before
+    args = build_parser().parse_args([
+        "evaluate", "--manifest", str(manifest), "--no-heldout-distribution-coverage",
+    ])
+    args.func(args)
+    metrics = json.loads((source / "metrics.json").read_text())
+    assert "heldout_distribution_coverage" not in metrics
+    assert metrics["evaluation_config"]["heldout_distribution_coverage"] is False
+    assert manifest.read_bytes() == original_manifest

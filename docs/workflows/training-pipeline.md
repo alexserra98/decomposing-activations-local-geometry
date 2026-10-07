@@ -92,6 +92,17 @@ continue to use saved ranks regardless of the rank-threshold option. Reports
 retain the source `run_id` and `identity_hash`, with effective settings in
 `evaluation_config` and manifest references in `evaluation_provenance`.
 
+Held-out coverage defaults to enabled, including for older manifests that omit
+the setting. It requires an independent `<dataset>/test/` population of at most
+100,000 points. Missing test data raises an error with a command using
+`scripts/temporary/add_toy_manifold_test_split.py`. Use
+`--no-heldout-distribution-coverage` to reevaluate without coverage, or
+`--heldout-distribution-coverage` to override a disabled source setting.
+These flags leave the original manifest unchanged. Coverage errors preserve
+the previous report. See the
+[coverage contract](../evaluation/heldout-distribution-coverage.md#pipeline-integration)
+for split isolation, the full empirical curve, and the size guard.
+
 **Every invocation reevaluates**, including runs with valid existing metrics.
 Obsolete or malformed metric reports and evaluation markers are replaced after
 the new metrics pass validation. If evaluation or validation fails, that run's
@@ -166,7 +177,8 @@ For every supported YAML field, default, and model-specific constraint, see the
   and layer. The pipeline never starts extraction implicitly.
 - `model` and `training`: arguments accepted by the selected trainer.
   `model.kind` selects `mfa`, `ard`, `hddc`, or `kmeans`. HDDC accepts `q_max`
-  as an alias for `rank`. KMeans requires an explicit PC capacity `rank`.
+  as an alias for `rank`. KMeans omits `rank` and selects geometry ranks
+  through `surgery_threshold`.
 - `assignments`: complete model responsibility assignments. KMeans uses hard
   one-hot memberships. Partial `max_batches` output is not a completed stage.
 - `evaluation`: `toy_manifold_tiling` requires toy-manifold shards and reports
@@ -358,6 +370,11 @@ clustering, the explicit liveness diagnostic, and augmented BIC's training-only
 activity reward. `bic.value` uses the
 [augmented BIC contract](../experiments/evaluation/toy-manifold-tiling.md#augmented-bic),
 with higher values preferred.
+
+The report also includes held-out distribution coverage by default. Training-only
+hard assignments define its live centroids; distances are measured on the
+separate `test/` stream. Set `evaluation.heldout_distribution_coverage: false`
+to omit this metric. Planning checks the test prerequisite before training.
 
 For a manifold of intrinsic dimension `r_i`, tangent alignment compares its
 ground-truth tangent basis with the covariance subspace spanned by exactly

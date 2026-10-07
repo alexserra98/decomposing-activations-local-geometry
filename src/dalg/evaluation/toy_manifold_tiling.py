@@ -21,6 +21,7 @@ from dalg.analysis.bic_improved import active_bic_from_standard
 from dalg.data.shard_activations import ActivationBatchDataset, load_meta_index
 from dalg.data.subset_spec import resolve_spec_positions, split_shard_dir_spec
 from dalg.evaluation.toy_manifold_metrics import evaluate_toy_manifold_metrics
+from dalg.evaluation.toy_manifold_coverage import evaluate_toy_test_coverage, validate_toy_test_split
 
 
 def _resolve_device(value: str) -> torch.device:
@@ -142,8 +143,11 @@ def evaluate_toy_manifold_tiling(
     device: str = "cuda",
     rank_threshold: float = 1.0,
     max_mean_to_manifold_distance: float | None = None,
+    heldout_distribution_coverage: bool = True,
 ) -> dict[str, Any]:
     """Evaluate one model run against planted toy-manifold structure."""
+    if type(heldout_distribution_coverage) is not bool:
+        raise ValueError("heldout_distribution_coverage must be true or false")
     if model_kind not in {"hddc", "kmeans"} and rank_threshold <= 0.0:
         raise ValueError("rank_threshold must be positive")
     if max_mean_to_manifold_distance is not None and (
@@ -153,6 +157,7 @@ def evaluate_toy_manifold_tiling(
         raise ValueError("max_mean_to_manifold_distance must be finite and positive")
 
     run_dir = Path(run_dir)
+    test_source = validate_toy_test_split(shard_dir, layer=layer) if heldout_distribution_coverage else None
     model_stem = "kmeans_model" if model_kind == "kmeans" else "mfa_model"
     assignments_path = (
         Path(assignments_path)
@@ -276,6 +281,10 @@ def evaluate_toy_manifold_tiling(
         raise ValueError("reconstructed training split does not match val_indices.json")
     if len(val_positions) != int(split_info["val_rows"]):
         raise ValueError("reconstructed validation split does not match val_indices.json")
+    train_mask = torch.tensor(
+        [position not in val_position_set for position in positions], dtype=torch.bool,
+    )
+    train_cluster_sizes = torch.bincount(assignments[train_mask], minlength=model.K)
 
     resolved_device = _resolve_device(device)
     model = model.to(resolved_device).eval()
@@ -326,11 +335,6 @@ def evaluate_toy_manifold_tiling(
             mean_nll=train_nll,
             n=n_train,
         )
-        train_mask = torch.tensor(
-            [position not in val_position_set for position in positions],
-            dtype=torch.bool,
-        )
-        train_cluster_sizes = torch.bincount(assignments[train_mask], minlength=model.K)
         active_components = int((train_cluster_sizes > 0).sum())
         bic = active_bic_from_standard(
             standard_bic,
@@ -378,6 +382,12 @@ def evaluate_toy_manifold_tiling(
         max_mean_to_manifold_distance=max_mean_to_manifold_distance,
     )
 
+    coverage_metrics = {}
+    if test_source is not None:
+        coverage_metrics["heldout_distribution_coverage"] = evaluate_toy_test_coverage(
+            test_source, model.mu, train_cluster_sizes > 0, batch_size=batch_size,
+        )
+
     return {
         "schema_version": 2,
         "evaluation": "toy_manifold_tiling",
@@ -399,6 +409,7 @@ def evaluate_toy_manifold_tiling(
             "dead": int((~assignment_live).sum()),
         },
         **manifold_metrics,
+        **coverage_metrics,
     }
 
 
@@ -419,6 +430,7 @@ def evaluate_pipeline_run(run: Mapping[str, Any], *, evaluation: Mapping[str, An
         rank_threshold=float(cfg["rank_threshold"]),
         max_mean_to_manifold_distance=(None if cfg["max_mean_to_manifold_distance"] is None
                                       else float(cfg["max_mean_to_manifold_distance"])),
+        heldout_distribution_coverage=cfg.get("heldout_distribution_coverage", True),
     )
     metrics.update(run_id=run["run_id"], identity_hash=run["identity_hash"])
     return metrics

@@ -28,6 +28,7 @@ import yaml
 
 from dalg.data.subset_spec import split_shard_dir_spec
 from dalg.init.activation_selection import resolve_initialization_rows
+from dalg.evaluation.toy_manifold_coverage import coverage_report_valid, validate_toy_test_split
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -77,6 +78,7 @@ _EVALUATION_DEFAULTS = {
     "device": "cuda",
     "rank_threshold": 1.0,
     "max_mean_to_manifold_distance": None,
+    "heldout_distribution_coverage": True,
 }
 
 
@@ -641,6 +643,10 @@ def resolve_run(config: Mapping[str, Any], *, check_inputs: bool = True) -> dict
             )
     if assignments["seed"] is None:
         assignments["seed"] = training_args.get("seed") or 0
+    if type(evaluation["heldout_distribution_coverage"]) is not bool:
+        raise PipelineConfigError("evaluation.heldout_distribution_coverage must be true or false")
+    if check_inputs and evaluation["enabled"] and evaluation["heldout_distribution_coverage"]:
+        validate_toy_test_split(shard_dir, layer=layer)
 
     dataset_spec = {
         "id": dataset_id,
@@ -925,6 +931,17 @@ def _evaluation_metrics_valid(run: Mapping[str, Any], metrics: Any) -> bool:
     """Validate evaluation metrics before publishing them or reusing a report."""
     if not isinstance(metrics, Mapping):
         return False
+    if run["evaluation"].get("heldout_distribution_coverage", True):
+        if not coverage_report_valid(
+            metrics.get("heldout_distribution_coverage"),
+            components=run["training"]["arguments"]["K"],
+        ):
+            return False
+        source = metrics["heldout_distribution_coverage"]["source"]
+        root, _ = split_shard_dir_spec(run["dataset"]["shard_dir"])
+        if (Path(source["shard_dir"]).resolve() != (root / "test").resolve()
+                or source["layer"] != run["dataset"]["layer"]):
+            return False
     alignment = metrics.get("tangent_alignment")
     basis = "pca" if run["training"]["model_kind"] == "kmeans" else "covariance"
     if not isinstance(alignment, Mapping) or alignment.get("definition") != (
@@ -1177,6 +1194,8 @@ def _ensure_initialization(run: Mapping[str, Any]) -> None:
 
 def execute_run(run: Mapping[str, Any]) -> Path:
     """Execute one manifest row, resuming at the first incomplete stage."""
+    if run["evaluation"]["enabled"] and run["evaluation"].get("heldout_distribution_coverage", True):
+        validate_toy_test_split(run["dataset"]["shard_dir"], layer=run["dataset"]["layer"])
     if "initialization" in run:
         _check_initialization_version(run)
     if run["training"]["model_kind"] == "kmeans":
@@ -1222,12 +1241,16 @@ def execute_run(run: Mapping[str, Any]) -> Path:
         else:
             if metrics_path.exists():
                 raise RuntimeError(
-                    f"refusing to overwrite invalid evaluation artifact: {metrics_path}"
+                    f"refusing to overwrite invalid evaluation artifact: {metrics_path}; "
+                    "use dalg-run-pipeline evaluate --manifest <manifest> to reevaluate"
                 )
             print(f"[{run['run_id']}] evaluation", flush=True)
             from dalg.evaluation.toy_manifold_tiling import evaluate_pipeline_run
 
             metrics = evaluate_pipeline_run(run)
+            if not _evaluation_metrics_valid(run, metrics):
+                raise ValueError(f"evaluator produced invalid metrics for {run_dir}")
+            json.dumps(metrics, allow_nan=False)
             _write_json_atomic(metrics_path, metrics)
         _mark_stage(run_dir, "evaluation", metrics_path)
 

@@ -74,8 +74,8 @@ def test_local_pca_matches_direct_centroid_centered_covariance(method):
         basis = model.W_init
         assert model.q == 0
         with pytest.raises(RuntimeError, match="compute_pcs"):
-            model.select_ranks(0.1)
-    assert basis.shape == (2, 4, 4 if method == "cluster" else 2)
+            _ = model.W
+    assert basis.shape == (2, 4, 1 if method == "cluster" else 2)
     if method == "cluster":
         assert model.eigenvalues.shape == (2, 4)
         assert model.eigenvalues.dtype == torch.float64
@@ -116,45 +116,66 @@ def test_pca_helpers_keep_legacy_return_contract():
     torch.testing.assert_close(direct, with_spectrum[0].float(), rtol=1e-5, atol=1e-6)
 
 
+def spectral_points_and_centers():
+    centers = torch.tensor([[-20., 0., 0., 0.], [20., 0., 0., 0.]], dtype=torch.float64)
+    spectra = torch.tensor([[10., 8., 5., 1.], [10., 6., 5., 4.]], dtype=torch.float64)
+    axes = torch.diag_embed((4 * spectra).sqrt())
+    points = torch.cat((axes, -axes), dim=1) + centers[:, None, :]
+    return points.reshape(-1, 4), centers
+
+
 def spectral_model():
-    X, centers = points_and_centers()
-    model = KMeans.from_centroids(centers).compute_pcs(X)
-    model._eigenvalues = torch.tensor([[10.0, 8.0, 5.0, 1.0], [10.0, 6.0, 5.0, 4.0]], dtype=torch.float64)
-    return model
+    points, centers = spectral_points_and_centers()
+    return KMeans.from_centroids(centers).compute_pcs(points, threshold=0.3)
 
 
-def test_cattell_masks_W_and_can_restore_directions_after_loading(tmp_path):
-    model = spectral_model()
-    original = model._pcs.clone()
-    assert model.select_ranks(0.3) is model
-    torch.testing.assert_close(model.component_ranks, torch.tensor([3, 1]))
+def test_cattell_compact_storage_and_recomputation_after_loading(tmp_path):
+    points, centers = spectral_points_and_centers()
+    model = KMeans.from_centroids(centers)
+    assert model.compute_pcs(points, threshold=0.3) is model
+    assert model.component_ranks.tolist() == [3, 1]
+    assert model.q == 3
+    assert model.W.shape == (2, 4, 3)
+    assert model.rank_mask.tolist() == [[True, True, True], [True, False, False]]
+    assert not model.W[1, :, 1:].any()
     for k, rank in enumerate((3, 1)):
-        torch.testing.assert_close(model.W[k, :, :rank], original[k, :, :rank], rtol=0, atol=0)
-        assert not model.W[k, :, rank:].any()
+        expected = torch.diag(torch.tensor([1.] * rank + [0.] * (4 - rank), dtype=torch.float64))
+        torch.testing.assert_close(model.W[k] @ model.W[k].T, expected)
     torch.testing.assert_close(model.W.transpose(1, 2) @ model.W, torch.diag_embed(model.rank_mask.double()))
-    model.select_ranks(0.4)
-    torch.testing.assert_close(model.component_ranks, torch.tensor([1, 1]))
-    assert not model.W[:, :, 1:].any()
+    # Slicing must release the full basis rather than retain its backing storage.
+    assert model.W.untyped_storage().nbytes() == model.W.numel() * model.W.element_size()
+    original = model.W.clone()
+    spectrum = model.eigenvalues.clone()
     path = tmp_path / "kmeans.pt"
     save_kmeans(model, path)
     restored = load_kmeans(path)
-    torch.testing.assert_close(restored.W, model.W, rtol=0, atol=0)
-    restored.select_ranks(0.3)
-    torch.testing.assert_close(restored.component_ranks, torch.tensor([3, 1]))
-    torch.testing.assert_close(restored.W[0, :, :3], original[0, :, :3], rtol=0, atol=0)
-    torch.testing.assert_close(restored._pcs, original, rtol=0, atol=0)
+    assert restored.q == 3
+    torch.testing.assert_close(restored.W, original, rtol=0, atol=0)
+    torch.testing.assert_close(restored.eigenvalues, spectrum, rtol=0, atol=0)
+    restored.compute_pcs(points, threshold=0.5)
+    assert restored.component_ranks.tolist() == [1, 1]
+    assert restored.W.shape == (2, 4, 1)
+    save_kmeans(restored, path)
+    restored = load_kmeans(path)
+    assert restored.q == 1
+    # Recovering discarded directions requires the original training points.
+    restored.compute_pcs(points, threshold=0.3)
+    torch.testing.assert_close(restored.W, original, rtol=0, atol=0)
+    torch.testing.assert_close(restored.mu, centers, rtol=0, atol=0)
 
 
 def test_cattell_ranks_are_monotone_and_zero_covariance_selects_one():
-    model = spectral_model()
+    points, centers = spectral_points_and_centers()
+    model = KMeans.from_centroids(centers)
     previous = torch.full((model.K,), model.D)
     for threshold in (0.0, 0.1, 0.2, 0.3, 0.4, 1.0):
-        model.select_ranks(threshold)
+        model.compute_pcs(points, threshold=threshold)
         assert torch.all(model.component_ranks <= previous)
+        assert model.q == int(model.component_ranks.max())
         previous = model.component_ranks.clone()
-    model._eigenvalues.zero_()
-    model.select_ranks(0)
+    model.compute_pcs(centers.repeat_interleave(2, dim=0), threshold=0)
     torch.testing.assert_close(model.component_ranks, torch.ones(2, dtype=torch.long))
+    assert not model.eigenvalues.any()
 
 
 def test_full_pca_selects_rank_from_all_gaps_without_a_configured_capacity():
@@ -163,7 +184,8 @@ def test_full_pca_selects_rank_from_all_gaps_without_a_configured_capacity():
     points = torch.cat((axes, -axes))
     model = KMeans.from_centroids(torch.zeros(1, 4, dtype=torch.float64))
     model.compute_pcs(points, threshold=0.3)
-    assert model.q == model.D == 4
+    assert model.D == 4
+    assert model.q == 3
     assert model.component_ranks.tolist() == [3]
     torch.testing.assert_close(model.eigenvalues[0], values)
     torch.testing.assert_close(model.W[0] @ model.W[0].T, torch.diag(torch.tensor([1., 1., 1., 0.], dtype=torch.float64)))
@@ -172,12 +194,14 @@ def test_full_pca_selects_rank_from_all_gaps_without_a_configured_capacity():
 @pytest.mark.parametrize("threshold", [None, -0.01, 1.01, float("nan"), float("inf")])
 def test_invalid_surgery_threshold(threshold):
     with pytest.raises(ValueError, match="threshold"):
-        spectral_model().select_ranks(threshold)
+        points, centers = spectral_points_and_centers()
+        KMeans.from_centroids(centers).compute_pcs(points, threshold=threshold)
 
 
 def test_one_dimensional_pca_and_rank_selection():
-    model = KMeans.from_centroids(torch.zeros(1, 1)).compute_pcs(torch.tensor([[-1.0], [1.0]]))
-    model.select_ranks(0)
+    model = KMeans.from_centroids(torch.zeros(1, 1)).compute_pcs(
+        torch.tensor([[-1.0], [1.0]]), threshold=0,
+    )
     torch.testing.assert_close(model.component_ranks, torch.tensor([1]))
 
 
@@ -195,7 +219,7 @@ def test_undersized_clusters_and_invalid_neighborhoods_fail():
         model.compute_pcs(X, rank=1)
     with pytest.raises(TypeError, match="method"):
         model.compute_pcs(X, method="unknown")
-    assert model.q == 2
+    assert model.q == 1
     assert model.q_init == 0
 
 
@@ -205,7 +229,7 @@ def test_refitting_invalidates_all_pca_state():
     for attr in ("W", "component_ranks", "eigenvalues"):
         with pytest.raises(RuntimeError, match="compute_pcs"):
             getattr(model, attr)
-    model.compute_pcs(X).select_ranks(1)
+    model.compute_pcs(X, threshold=1)
     model.compute_init_pcs(X, rank=3, neighbors=12)
     model.fit(X)
     assert model.q == 0
@@ -224,7 +248,7 @@ def test_checkpoint_round_trip_and_dtype(tmp_path, method):
     model = KMeans.from_centroids(centers, block_x=13, seed=11)
     model.fit_metadata = {"n_samples": 80, "inertia": 18.0}
     if method in ("cluster", "both"):
-        model.compute_pcs(X).select_ranks(1)
+        model.compute_pcs(X, threshold=1)
     if method in ("knn", "both"):
         model.compute_init_pcs(X, rank=3, neighbors=12)
     path = tmp_path / "kmeans_model.pt"
@@ -379,7 +403,7 @@ def test_sparse_boundaries_and_independent_states(tmp_path):
     assert not model.W[~model.pca_valid].any()
     assert not model.eigenvalues[~model.pca_valid].any()
     torch.testing.assert_close(model.W_init, initialization, rtol=0, atol=0)
-    model.select_ranks(.9)
+    model.compute_pcs(points, threshold=.9)
     assert model.component_ranks.tolist() == [1, 1, 0]
     assert not model.W[:, :, 1:].any()
     geometry = model.W.clone()
@@ -392,19 +416,28 @@ def test_sparse_boundaries_and_independent_states(tmp_path):
     restored = load_kmeans(path)
     for name, value in model.state_dict().items():
         torch.testing.assert_close(restored.state_dict()[name], value, rtol=0, atol=0)
-    model.select_ranks()
+    model.compute_pcs(points)
     assert model.component_ranks.tolist() == [1, 2, 0]
 
 
-def test_all_sparse_skips_eigendecomposition(monkeypatch):
+def test_all_sparse_skips_eigendecomposition(tmp_path, monkeypatch):
     points = torch.eye(3)
     model = KMeans.from_centroids(points)
     monkeypatch.setattr(torch.linalg, 'eigh', lambda *a, **kw: pytest.fail('sparse clusters need no PCA'))
-    model.compute_pcs(points).select_ranks(0)
+    model.compute_pcs(points, threshold=0)
+    assert model.q == 1
+    assert model.W.shape == (3, 3, 1)
+    assert not model.rank_mask.any()
     assert not model.pca_valid.any()
     assert not model.component_ranks.any()
     assert not model.W.any()
     assert not model.eigenvalues.any()
+    path = tmp_path / "all_sparse.pt"
+    save_kmeans(model, path)
+    restored = load_kmeans(path)
+    assert restored.q == 1
+    assert not restored.pca_valid.any()
+    torch.testing.assert_close(restored.W, model.W, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize('field', ['_pca_valid', '_cluster_counts', '_init_pcs'])

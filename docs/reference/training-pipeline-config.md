@@ -443,12 +443,20 @@ assignment count before the stage is marked complete.
 | --- | --- | --- | --- |
 | `enabled` | boolean | `false` | Run evaluation after assignments. |
 | `kind` | string or `null` | `null` | The only current evaluator is `toy_manifold_tiling`. |
-| `batch_size` | integer | `4096` | Batch size used for evaluation NLL or quantization error. |
+| `batch_size` | integer | `4096` | Batch size used for evaluation NLL, quantization error, and test coverage. |
 | `device` | string | `cuda` | Evaluation device. |
 | `rank_threshold` | float | `1.0` | For vanilla MFA and ARD, a loading column is effectively active when its variance exceeds this multiple of its component's mean unique variance. Ignored for HDDC and KMeans, which use saved component ranks. |
 | `max_mean_to_manifold_distance` | float or `null` | `null` | Optional maximum ambient Euclidean distance between a Gaussian mean and its unique nearest exact manifold projection. `null` associates each Gaussian with its unique nearest manifold without distance filtering. |
+| `heldout_distribution_coverage` | boolean | `true` | Compute distance summaries and the full empirical coverage curve on `<dataset>/test/`, using training-live centroids. Set `false` to omit coverage and its test-data requirement. |
 
 `evaluation.enabled: true` requires `assignments.enabled: true`.
+When coverage is enabled, planning and execution require a compatible reserved
+or supplemental test population with at most 100,000 points. A missing `test/`
+raises an exception directing the user to
+`scripts/temporary/add_toy_manifold_test_split.py`; an oversized population
+raises an exception requesting a scalable coverage implementation. See the
+[coverage contract](../evaluation/heldout-distribution-coverage.md#pipeline-integration).
+
 `toy_manifold_tiling` accepts `model.kind: mfa`, `ard`, `hddc`, or `kmeans` and requires
 shards created by the toy-manifold shard writer. For MFA-family models it produces NLL, training-set
 augmented BIC, clustering-recovery, live/dead-component, effective-rank,
@@ -465,7 +473,7 @@ geometry, without constructing a Gaussian covariance. It omits `nll` and `bic`
 and records `quantization.train` and `.validation` with `n`,
 `sum_squared_distance`, and `mean_squared_distance` (`null` for an empty split).
 KMeans completion checks validate stream and checkpoint provenance and the
-`pca_geometry.version: 1` report contract. Sparse clusters (`count < rank + 1`)
+`pca_geometry.version: 1` report contract. Sparse clusters (`count < 2`)
 are excluded only from rank and tangent metrics; association, clustering, and
 quantization retain all components. All-excluded geometry has null summaries.
 
@@ -588,6 +596,7 @@ for local and Slurm examples, result layout, and retry behavior.
 | `--batch-size N` | Positive evaluation batch size. |
 | `--rank-threshold FLOAT` | Override the MFA/ARD effective-rank threshold; ignored for HDDC/KMeans. |
 | `--max-mean-to-manifold-distance FLOAT_OR_NONE` | Positive finite association cutoff, or `none` to remove it. |
+| `--heldout-distribution-coverage` / `--no-heldout-distribution-coverage` | Enable or disable test coverage for this evaluation invocation. Missing settings in older manifests default to enabled. |
 | `--resources PATH` | Flat YAML mapping of resource overrides using the existing `resources` keys. |
 | `--submit` | Submit evaluation arrays followed by a dependent CPU collection job. |
 | `--dry-run` | Inspect without writing outputs, evaluating, or submitting. |

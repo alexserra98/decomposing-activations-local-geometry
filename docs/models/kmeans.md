@@ -18,7 +18,7 @@ from dalg.models.kmeans import KMeans, save_kmeans, load_kmeans
 model = KMeans(K=100, seed=0, device="cuda").fit(training_points)
 model.compute_init_pcs(training_points, rank=32, neighbors=64)  # MFA initialization
 model.compute_pcs(training_points, threshold=0.1)              # Cattell geometry
-model.select_ranks(threshold=0.2)  # optionally change the geometry threshold
+model.compute_pcs(training_points, threshold=0.2)  # recompute at a new threshold
 save_kmeans(model, "kmeans_model.pt")
 model = load_kmeans("kmeans_model.pt", map_location="cpu")
 ```
@@ -29,10 +29,11 @@ model = load_kmeans("kmeans_model.pt", map_location="cpu")
   Positive finite temperature leaves assignments unchanged.
 - `W_init`: `(K, D, q_init)` ordered unit KNN PCs for MFA initialization.
   There is no initialization rank selection.
-- `W`: `(K, D, D)` ordered unit cluster PCs, hard-masked to each selected rank.
-  Columns beyond that rank and invalid components are exactly zero. There is
-  no variance scaling. The full orthonormal basis is stored internally.
-- `rank_mask`: `(K, D)` boolean mask derived from `component_ranks`.
+- `W`: `(K, D, q)` selected ordered unit cluster PCs, with zero padding to the
+  largest selected component rank. Columns beyond a component's rank and all
+  columns of invalid components are exactly zero. There is no variance scaling.
+  Discarded directions are not retained.
+- `rank_mask`: `(K, q)` boolean mask derived from `component_ranks`.
 - `eigenvalues`: full descending cluster covariance spectra `(K, D)`;
   invalid components are zero-filled.
 - `cluster_counts`: `(K,)` training membership counts used by cluster PCA.
@@ -44,7 +45,11 @@ model = load_kmeans("kmeans_model.pt", map_location="cpu")
 constructs a fitted model without estimating new means. Each PCA state is
 optional: accessing an unavailable state raises explicitly. `q` and `q_init`
 report their respective capacities, or zero when absent. Geometry capacity
-`q` is always `D`; effective ranks come from `component_ranks`.
+`q = max(1, max(component_ranks))` after PCA; individual effective ranks come
+from `component_ranks`. For ranks `[2, 5, 3]`, `W` has shape `(3, D, 5)`,
+with three zero columns for the first component and two for the third.
+When every cluster is invalid, `q=1` with one zero column per component
+distinguishes computed-but-empty geometry from a centroid-only model (`q=0`).
 
 ## PCA populations and sparse clusters
 
@@ -54,9 +59,11 @@ and include points assigned to other centroids. Even an empty hard cluster
 receives all requested initialization directions.
 
 `compute_pcs(X, threshold=0.1)` computes all PCs using only hard-assigned
-training points and immediately selects Cattell ranks. A cluster with fewer
-than two members is skipped. Its centroid and component ID
-remain in the model and continue participating in prediction and assignments.
+training points, selects Cattell ranks, and stores only the selected directions
+in the padded tensor. The full basis exists only during computation; all `D`
+eigenvalues remain stored. A cluster with fewer than two members is skipped.
+Its centroid and component ID remain in the model and continue participating
+in prediction and assignments.
 All clusters may be skipped; this is a valid checkpoint.
 
 Both methods reuse the existing PCA helpers, accumulate covariance in float64,
@@ -66,7 +73,7 @@ canonical subset selection and prefix dropping.
 
 ## Cluster rank selection
 
-`select_ranks(threshold=0.1)` tests every consecutive gap in each full cluster
+`compute_pcs(X, threshold=0.1)` tests every consecutive gap in each full cluster
 spectrum. The threshold must be in `[0, 1]`; fixed-rank geometry is not supported:
 
 ```text
@@ -75,10 +82,12 @@ rank_k = max { j : (lambda_kj - lambda_k,j+1) / lambda_k1 > threshold }
 
 No passing gap gives rank one, including D=1 or a zero spectrum. Selected ranks
 are capped at `cluster_counts - 1`, the sample-supported centered PCA rank.
-Invalid clusters keep rank zero. `W` uses a hard column mask, as in HDDC; raising
-the threshold removes directions and lowering it can restore them from the
-stored full basis without recomputing PCA. `W_init` is independent. HDDC's own
-rank proposal and noise fitting are unchanged.
+Invalid clusters keep rank zero. To change the threshold, call `compute_pcs`
+again with the same training points (or use the CLI's `--pca-only` path).
+This recomputes PCA while preserving the centroids and `W_init`. Raising the
+threshold can reduce the stored capacity; lowering it can recover additional
+directions only through this recomputation. There is no `select_ranks` method.
+HDDC's own rank proposal and noise fitting are unchanged.
 
 ## Pipeline artifacts and evaluation
 
@@ -104,7 +113,10 @@ Standalone `--pca-only` can add or recompute either state while preserving the o
 population and fitting settings.
 
 Checkpoints use **`dalg_kmeans_v3`**, recording both independently optional PCA
-states and provenance, including the full geometry basis and selected ranks.
+states and provenance, including the compact zero-padded geometry PCs, full
+eigenvalue spectra, and selected ranks. The loader requires geometry capacity
+`q = max(1, max(component_ranks))` when PCA is present; checkpoints retaining
+a larger full basis fail this check and require regeneration.
 Automatic initialization uses manifest **version 4**.
 Older checkpoints, including v2, require regeneration. Older initialization
 manifest versions also require a new plan; they are not silently reinterpreted.

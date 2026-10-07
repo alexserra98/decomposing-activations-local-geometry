@@ -140,6 +140,11 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--batch-size", type=int, default=argparse.SUPPRESS)
     evaluate.add_argument("--rank-threshold", type=float, default=argparse.SUPPRESS)
     evaluate.add_argument(
+        "--heldout-distribution-coverage", action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help="include independent test-set coverage (defaults to enabled)",
+    )
+    evaluate.add_argument(
         "--max-mean-to-manifold-distance", type=_distance_cutoff, default=argparse.SUPPRESS,
     )
     evaluate.add_argument("--resources", help="YAML mapping of Slurm resource overrides")

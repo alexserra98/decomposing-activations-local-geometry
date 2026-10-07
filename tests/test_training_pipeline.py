@@ -14,6 +14,7 @@ from dalg.data.manifold_dataset import (
     ToyManifoldConfig,
     save_toy_manifold_shards,
 )
+from dalg.data.shard_activations import load_meta_index
 from dalg.pipeline import (
     PipelineConfigError,
     _evaluation_artifact_valid,
@@ -639,7 +640,10 @@ def test_real_shared_b_pipeline_smoke(tmp_path: Path, hard: bool) -> None:
 def test_toy_manifold_tiling_evaluation_accepts_vanilla_mfa_config(
     tmp_path: Path,
 ) -> None:
-    shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
+    shard_dir = save_toy_manifold_shards(tmp_path / "shards", ToyManifoldConfig(
+        ambient_dim=3, n_samples=40, calibration_size=20,
+        manifold_types=("segment",), manifolds_per_type=1,
+    ), layer=LAYER)
     config = _config(tmp_path, shard_dir)
     config["evaluation"] = {
         "enabled": True,
@@ -653,6 +657,7 @@ def test_toy_manifold_tiling_evaluation_accepts_vanilla_mfa_config(
     assert run["evaluation"]["kind"] == "toy_manifold_tiling"
     assert run["evaluation"]["rank_threshold"] == 1.0
     assert run["evaluation"]["max_mean_to_manifold_distance"] is None
+    assert run["evaluation"]["heldout_distribution_coverage"] is True
 
 
 @pytest.mark.parametrize("distance", [0.0, -0.1, float("inf"), float("nan")])
@@ -731,7 +736,9 @@ def test_real_toy_manifold_tiling_pipeline_runs_end_to_end(tmp_path: Path) -> No
         "ambiguous_components": 0,
     }
     assert metrics["identity_hash"] == run["identity_hash"]
-    assert metrics["dataset"]["selected_rows"] == 96
+    # 96 generated rows across 19 instances reserve 20 test rows (per-instance ceil).
+    assert metrics["dataset"]["selected_rows"] == 76
+    assert len(load_meta_index(shard_dir / "test", layer=0)) == 20
     assert metrics["bic"]["n"] == metrics["dataset"]["train_rows"]
     assert metrics["bic"]["parameters"] > 0
     assert metrics["bic"]["convention"] == "higher_is_better"
@@ -842,7 +849,7 @@ def test_evaluation_artifact_requires_augmented_bic(
     run = {
         "run_dir": str(tmp_path),
         "training": {"model_kind": "mfa"},
-        "evaluation": {"kind": "toy_manifold_tiling"},
+        "evaluation": {"kind": "toy_manifold_tiling", "heldout_distribution_coverage": False},
         "identity_hash": "test-run",
     }
     (tmp_path / "metrics.json").write_text(

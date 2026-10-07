@@ -232,9 +232,9 @@ embedding dimensions, calibration statistics, curvature and noise scales,
 orthonormal embeddings, offset directions and offsets, and one record per
 manifold instance.
 
-The generator returns a single dataset. Activation-shard training creates its
-own deterministic train/validation split; do not introduce a second split in
-the generator.
+The in-memory generator returns all configured points in a single dataset.
+The shard writer reserves a test partition before training creates its own
+deterministic train/validation split over the remaining root rows.
 
 ## Observation noise
 
@@ -273,6 +273,8 @@ save_toy_manifold_shards(
     config,
     shard_size=50_000,
     layer=0,
+    test_fraction=0.2,
+    test_split_seed=42,
 )
 ```
 
@@ -290,6 +292,13 @@ saved configuration sets `window: 1` and `drop_prefix: 0`:
   meta/
     shard_00000.json
     ...
+  test/
+    config.json
+    manifold_metadata.pt
+    layer00/shard_00000.pt
+    ...
+    meta/shard_00000.json
+    ...
 ```
 
 Row metadata stores the manifold instance, type, and intrinsic dimension. The
@@ -299,6 +308,77 @@ token identity.
 
 Store large generated datasets under `dalg-cache/assets/`, not in source,
 documentation, or script directories.
+
+### Reserved test partition
+
+`save_toy_manifold_shards` defaults to `test_fraction=0.2` and
+`test_split_seed=42`. It randomly reserves `ceil(test_fraction * count)` rows
+from **each manifold instance**, with reproducible membership across paired
+noise and offset conditions. Every instance must retain at least one row in
+both partitions; insufficient populations are rejected before writing. Use
+`test_fraction=0` to save all points at the root without a test directory.
+
+The root contains only development points (training plus validation), and
+`test/` is a separate activation-compatible dataset. Existing loaders do not
+recurse into it. Training still applies `val_frac` to the root population:
+300,000 generated points with the default test fraction and `val_frac=0.1`
+give 216,000 training, 24,000 validation, and 60,000 test points when per-instance
+counts divide evenly.
+
+Both directories use contiguous local row IDs and aligned `row_manifold_ids`.
+Their `config.json` records the directory's actual `num_rows`, while
+`generator_config.n_samples` retains the original generation budget.
+`manifold_metadata.pt` stores `original_row_indices`, mapping each local row
+back to the original in-memory population. The root and test indices are
+disjoint and together cover that population; their canonical order is
+`generated_subset`.
+
+Both configuration and metadata contain a `partition` record with version 1,
+`kind: reserved`, `role: development` or `test`, the fraction, split seed,
+manifold-instance stratification, and source row count. The test record also
+contains `source_dir: ..`, `source_config_sha256`, and `source_metadata_sha256`,
+fingerprinting its parent's configuration and saved geometry/row metadata.
+The same geometry is stored in both populations.
+
+### Supplemental test points for existing runs
+
+Datasets and runs created before test partitions were introduced have no
+independent test population. The temporary migration script adds fresh points
+from their saved manifolds without changing their training/validation data:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/temporary/add_toy_manifold_test_split.py \
+  dalg-cache/assets/<existing-dataset> --n-samples 30000
+```
+
+It accepts a single-layer toy dataset with saved configuration and
+`manifold_metadata.pt`. Existing test destinations or declared partitions are
+rejected. The default is 30,000 **additional** points, balanced across manifold
+instances; this count is independent of the 20% reservation for new datasets.
+Original shard files, metadata, configuration, and model artifacts remain
+unchanged.
+
+The script reuses saved calibration, embeddings, offsets, and noise scales.
+It samples with the original seed and a separate stream block starting at
+`10000 + 3 * num_manifolds`, beyond the original sampling streams. Using the
+same sample count across paired conditions preserves sample and noise pairing.
+It neither recalibrates the manifolds nor regenerates the original points.
+
+The resulting `test/` uses the same layout and source fingerprints as a
+reserved test directory. Its `partition` record has `kind: supplemental`,
+`role: test`, `n_samples`, `sampling_seed`, `sampling_stream`, manifold-instance
+balancing, and the original source row count. There are no
+`original_row_indices`, since these are new samples. `generator_config` retains
+the source generator configuration; `num_rows` describes the supplemental
+population.
+
+These artifacts provide an independent population for
+[held-out coverage](../evaluation/heldout-distribution-coverage.md).
+The pipeline evaluator consumes `test/` automatically when
+`evaluation.heldout_distribution_coverage` is enabled (the default). Missing
+test data is an error with instructions to run the migration script above.
+Coverage accepts at most 100,000 test points; see the
+[pipeline coverage contract](../evaluation/heldout-distribution-coverage.md#pipeline-integration).
 
 ## Downstream evaluation
 
@@ -330,6 +410,7 @@ the projected point and its tangent are not identified. See
 for how this differs from a tie between separate planted manifolds and how it
 affects rank and tangent metrics.
 
-The generator contract is covered by `tests/test_manifold_dataset.py`; exact
+The generator and test-partition contracts are covered by
+`tests/test_manifold_dataset.py` and `tests/test_toy_manifold_test_split.py`; exact
 geometry and pipeline consumption are covered by
 `tests/test_toy_manifold_geometry.py` and `tests/test_training_pipeline.py`.

@@ -10,6 +10,19 @@ from typing import Any
 import torch
 
 
+MAX_EMPIRICAL_COVERAGE_POINTS = 100_000
+
+
+def check_empirical_coverage_size(count: int) -> None:
+    """Keep the exact curve bounded until a larger-scale implementation exists."""
+    if count > MAX_EMPIRICAL_COVERAGE_POINTS:
+        raise ValueError(
+            f"heldout_distribution_coverage has {count:,} test points; the full "
+            f"empirical curve limit is {MAX_EMPIRICAL_COVERAGE_POINTS:,}. "
+            "Implement scalable coverage before evaluating a larger test population."
+        )
+
+
 def stratified_three_way_split(
     labels: torch.Tensor,
     *,
@@ -110,16 +123,18 @@ def nearest_live_centroid_distances(
 def summarize_coverage_distances(
     distances: torch.Tensor,
     *,
-    thresholds: Sequence[float] = (),
+    thresholds: Sequence[float] | None = (),
 ) -> dict[str, Any]:
-    """Summarize a held-out nearest-centroid distance distribution."""
+    """Summarize distances; ``thresholds=None`` returns the full empirical CDF."""
+    if thresholds is None:
+        check_empirical_coverage_size(distances.numel())
     values = distances.detach().cpu().double().reshape(-1)
     if values.numel() == 0:
         raise ValueError("coverage requires at least one distance")
     if not torch.isfinite(values).all() or bool((values < 0).any()):
         raise ValueError("coverage distances must be finite and non-negative")
 
-    resolved_thresholds = [float(value) for value in thresholds]
+    resolved_thresholds = [] if thresholds is None else [float(value) for value in thresholds]
     if any(not math.isfinite(value) or value < 0.0 for value in resolved_thresholds):
         raise ValueError("coverage thresholds must be finite and non-negative")
     if resolved_thresholds != sorted(set(resolved_thresholds)):
@@ -130,6 +145,18 @@ def summarize_coverage_distances(
     ordered = values.sort().values
     tail_indices = (tail_levels * values.numel()).ceil().long().sub(1).clamp_min(0)
     tail_quantiles = ordered[tail_indices]
+    if thresholds is None:
+        radii, counts = torch.unique_consecutive(ordered, return_counts=True)
+        fractions = counts.cumsum(0).double() / values.numel()
+        curve = [
+            {"radius": radius, "fraction": fraction}
+            for radius, fraction in zip(radii.tolist(), fractions.tolist())
+        ]
+    else:
+        curve = [
+            {"radius": radius, "fraction": float((values <= radius).double().mean())}
+            for radius in resolved_thresholds
+        ]
     return {
         "definition": "heldout_point_to_nearest_live_centroid_euclidean_distance",
         "reference_points": int(values.numel()),
@@ -140,13 +167,7 @@ def summarize_coverage_distances(
         "r95": float(tail_quantiles[1]),
         "r99": float(tail_quantiles[2]),
         "maximum": float(values.max()),
-        "coverage_curve": [
-            {
-                "radius": radius,
-                "fraction": float((values <= radius).double().mean()),
-            }
-            for radius in resolved_thresholds
-        ],
+        "coverage_curve": curve,
         "convention": "lower_distances_and_higher_coverage_fractions_are_better",
     }
 
@@ -157,10 +178,12 @@ def evaluate_heldout_distribution_coverage(
     centroids: torch.Tensor,
     *,
     live_components: torch.Tensor | None = None,
-    thresholds: Sequence[float] = (),
+    thresholds: Sequence[float] | None = (),
     batch_size: int = 8192,
 ) -> tuple[dict[str, Any], torch.Tensor]:
     """Evaluate held-out distribution coverage and return its pointwise distances."""
+    if thresholds is None:
+        check_empirical_coverage_size(reference_points.shape[0])
     distances = nearest_live_centroid_distances(
         reference_points,
         centroids,

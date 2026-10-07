@@ -16,7 +16,7 @@ from dalg.pipeline import (
 )
 
 
-def _config(tmp_path: Path) -> dict:
+def _config(tmp_path: Path, *, test_fraction: float = 0) -> dict:
     shards = save_toy_manifold_shards(
         tmp_path / "shards",
         ToyManifoldConfig(
@@ -24,8 +24,11 @@ def _config(tmp_path: Path) -> dict:
             manifold_types=("segment", "circle"), manifolds_per_type=1,
             offset_radius=4.0, seed=5,
         ),
-        layer=0, shard_size=40,
+        layer=0, shard_size=40, test_fraction=test_fraction,
     )
+    if test_fraction == 0:
+        from tests.test_toy_manifold_test_split import add_test_split
+        add_test_split(shards, n_samples=24)
     return {
         "experiment": {"name": "kmeans-test", "output_root": str(tmp_path / "runs")},
         "dataset": {"shard_dir": str(shards), "layer": 0},
@@ -185,6 +188,22 @@ def test_kmeans_pipeline_without_validation(tmp_path: Path) -> None:
     assert pipeline_status([run])[0]["pipeline"]
 
 
+def test_kmeans_pipeline_excludes_reserved_test_points(tmp_path: Path) -> None:
+    config = _config(tmp_path, test_fraction=0.2)
+    run = resolve_run(config)
+    directory = execute_run(run)
+    metrics = json.loads((directory / "metrics.json").read_text())
+    assert metrics["quantization"]["train"]["n"] == 76
+    assert metrics["quantization"]["validation"]["n"] == 20
+    assignments = torch.load(directory / "kmeans_model_assignments.pt", weights_only=True)
+    assert assignments["assignments"].numel() == 96
+    test_config = json.loads((Path(config["dataset"]["shard_dir"]) / "test/config.json").read_text())
+    assert test_config["num_rows"] == 24
+    assert metrics["heldout_distribution_coverage"]["reference_points"] == 24
+    assert metrics["heldout_distribution_coverage"]["source"]["partition"]["kind"] == "reserved"
+    assert pipeline_status([run])[0]["pipeline"]
+
+
 def test_legacy_initialization_manifest_rejected_without_writes(tmp_path: Path) -> None:
     config = _config(tmp_path)
     config["model"] = {"kind": "mfa", "K": 2, "rank": 1}
@@ -214,6 +233,7 @@ def test_sparse_pipeline_keeps_partition_and_resumes(tmp_path, monkeypatch, K, t
     assert metrics['rank']['components'] == eligible
     assert metrics['quantization']['train']['n'] == 96
     assert metrics['quantization']['validation']['n'] == 24
+    assert metrics['heldout_distribution_coverage']['components_live'] == K
     assignments = torch.load(directory / 'kmeans_model_assignments.pt', weights_only=True)
     assert assignments['assignments'].numel() == 120
     assert assignments['cluster_sizes'].numel() == K

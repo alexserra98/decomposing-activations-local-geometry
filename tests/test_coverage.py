@@ -137,3 +137,33 @@ def test_three_way_split_is_fixed_disjoint_and_stratified() -> None:
     for rows in first.values():
         assert torch.bincount(labels[rows], minlength=3).unique().numel() == 1
     assert split_fingerprint(first) == split_fingerprint(second)
+
+
+@pytest.mark.parametrize("distances,curve", [
+    ([2., 0., 2., 1.], [
+        {"radius": 0., "fraction": .25}, {"radius": 1., "fraction": .5},
+        {"radius": 2., "fraction": 1.},
+    ]),
+    ([3.], [{"radius": 3., "fraction": 1.}]),
+    ([0., 0., 0.], [{"radius": 0., "fraction": 1.}]),
+])
+def test_full_empirical_curve_combines_ties(distances, curve):
+    summary = summarize_coverage_distances(torch.tensor(distances), thresholds=None)
+    assert summary["coverage_curve"] == curve
+
+
+def test_full_empirical_size_limit_precedes_distance_computation(monkeypatch):
+    from dalg.evaluation import coverage
+
+    count = coverage.MAX_EMPIRICAL_COVERAGE_POINTS
+    assert count == 100_000
+    summary = summarize_coverage_distances(torch.zeros(count), thresholds=None)
+    assert summary["coverage_curve"] == [{"radius": 0., "fraction": 1.}]
+    monkeypatch.setattr(coverage, "nearest_live_centroid_distances",
+                        lambda *a, **kw: pytest.fail("must reject before computing distances"))
+    with pytest.raises(ValueError, match="100,001.*100,000.*scalable"):
+        coverage.evaluate_heldout_distribution_coverage(
+            torch.zeros(count + 1, 1), torch.zeros(1, 1), thresholds=None,
+        )
+    # Existing explicit-threshold callers keep their previous behavior.
+    assert summarize_coverage_distances(torch.zeros(count + 1))["coverage_curve"] == []

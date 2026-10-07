@@ -423,6 +423,7 @@ def test_shard_writer_matches_activation_training_protocol(tmp_path) -> None:
         config,
         shard_size=25,
         layer=0,
+        test_fraction=0,
     )
 
     shard_config = json.loads((root / "config.json").read_text())
@@ -605,7 +606,7 @@ def test_mixed_ten_dimensional_shards_and_evaluation_geometry(tmp_path):
         assert projection.tangent.shape == (32, 10)
         assert torch.allclose(projection.tangent.T @ projection.tangent,
                               torch.eye(10).double(), atol=1e-10)
-    root = save_toy_manifold_shards(tmp_path / "mixed_10d", config, shard_size=11)
+    root = save_toy_manifold_shards(tmp_path / "mixed_10d", config, shard_size=11, test_fraction=0)
     saved = torch.load(root / "manifold_metadata.pt", weights_only=True)
     shard_config = json.loads((root / "config.json").read_text())
     assert shard_config["generator_config"]["manifold_types"] == list(names)
@@ -692,7 +693,7 @@ def test_twelve_coordinate_mixture_shards_and_geometry_in_128d(tmp_path, noise_r
     else:
         assert torch.allclose(metadata["noise_stds"],
                               metadata["curvature_radii"] / noise_ratio)
-    root = save_toy_manifold_shards(tmp_path / "mixture", config, shard_size=7)
+    root = save_toy_manifold_shards(tmp_path / "mixture", config, shard_size=7, test_fraction=0)
     saved = torch.load(root / "manifold_metadata.pt", weights_only=True)
     shard_config = json.loads((root / "config.json").read_text())
     assert shard_config["d_model"] == 128

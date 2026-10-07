@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import asdict, dataclass
@@ -10,6 +11,8 @@ from typing import Callable
 
 import torch
 from torch.utils.data import TensorDataset
+
+from dalg.data.shard_activations import stratified_split
 
 
 MANIFOLD_NAMES = (
@@ -696,7 +699,8 @@ def make_toy_manifold_dataset(
     The first tensor is the ambient observation and the second is its
     manifold-instance ID. Observation noise is isotropic in the ambient space,
     with a type-specific standard deviation set by ``config.noise_ratio``.
-    The activation-shard training path creates the train/validation split.
+    The shard writer reserves test points; training splits its remaining rows
+    into training and validation. This in-memory sampler returns all points.
     """
 
     config = ToyManifoldConfig() if config is None else config
@@ -827,13 +831,17 @@ def save_toy_manifold_shards(
     *,
     shard_size: int = 50_000,
     layer: int = 0,
+    test_fraction: float = 0.2,
+    test_split_seed: int = 42,
 ) -> Path:
     """Write toy points in the activation-shard layout used by MFA training.
 
     Every point is represented as a one-position activation window, so layer
     shards have shape ``(rows, 1, ambient_dim)`` and ``drop_prefix`` is zero.
-    Downstream training creates the train/validation split with the standard
-    ``val_frac`` and ``split_seed`` arguments.
+    Reserve ``test_fraction`` of each manifold instance under ``test/``.
+    Downstream training splits only the remaining root rows using its standard
+    ``val_frac`` and ``split_seed`` arguments. Set ``test_fraction=0`` to save
+    the complete population at the root without a test partition.
 
     Per-row JSON metadata records the manifold instance and type. The larger
     tensors describing embeddings, offsets, and point labels are stored in
@@ -851,6 +859,12 @@ def save_toy_manifold_shards(
         raise TypeError("layer must be an integer")
     if layer < 0:
         raise ValueError("layer must be non-negative")
+    if isinstance(test_fraction, bool) or not isinstance(test_fraction, (int, float)):
+        raise TypeError("test_fraction must be a number")
+    if not math.isfinite(test_fraction) or not 0 <= test_fraction < 1:
+        raise ValueError("test_fraction must be finite and in [0, 1)")
+    if not isinstance(test_split_seed, int) or isinstance(test_split_seed, bool):
+        raise TypeError("test_split_seed must be an integer")
 
     root = Path(output_dir)
     if root.exists():
@@ -861,6 +875,63 @@ def save_toy_manifold_shards(
 
     config = ToyManifoldConfig() if config is None else config
     dataset, metadata = make_toy_manifold_dataset(config)
+    if test_fraction == 0:
+        return _save_toy_manifold_partition(
+            root, dataset, metadata, shard_size=shard_size, layer=layer,
+        )
+
+    counts = torch.bincount(dataset.tensors[1], minlength=metadata["num_manifolds"])
+    test_counts = (counts.double() * test_fraction).ceil().long()
+    if bool(((test_counts == 0) | (test_counts >= counts)).any()):
+        raise ValueError("every manifold instance needs nonempty development and test partitions")
+    development_rows, test_rows = stratified_split(
+        [{"subset": int(label)} for label in dataset.tensors[1]],
+        val_frac=test_fraction,
+        seed=test_split_seed,
+    )
+    partition = {
+        "version": 1,
+        "kind": "reserved",
+        "test_fraction": float(test_fraction),
+        "split_seed": test_split_seed,
+        "stratification": "manifold_instance",
+        "source_num_rows": len(dataset),
+    }
+    for destination, role, rows in (
+        (root, "development", development_rows),
+        (root / "test", "test", test_rows),
+    ):
+        indices = torch.tensor(rows, dtype=torch.long)
+        selected = TensorDataset(*(tensor[indices] for tensor in dataset.tensors))
+        provenance = {**partition, "role": role}
+        if role == "test":
+            provenance["source_dir"] = ".."
+            for key, name in (("config", "config.json"), ("metadata", "manifold_metadata.pt")):
+                with (root / name).open("rb") as handle:
+                    provenance[f"source_{key}_sha256"] = hashlib.file_digest(handle, "sha256").hexdigest()
+        selected_metadata = {
+            **metadata,
+            "original_row_indices": indices,
+            "partition": provenance,
+        }
+        _save_toy_manifold_partition(
+            destination, selected, selected_metadata, shard_size=shard_size, layer=layer,
+        )
+    return root
+
+
+def _save_toy_manifold_partition(
+    root: Path,
+    dataset: TensorDataset,
+    metadata: dict[str, object],
+    *,
+    shard_size: int,
+    layer: int,
+) -> Path:
+    """Serialize one toy population with local row IDs and its saved geometry."""
+    if root.exists() and (not root.is_dir() or any(root.iterdir())):
+        raise FileExistsError(f"output directory must be absent or empty: {root}")
+    config = metadata["config"]
     manifold_type_ids = metadata["manifold_type_ids"]
     manifold_types = metadata["manifold_types"]
     intrinsic_dims = metadata["intrinsic_dims"]
@@ -918,7 +989,7 @@ def save_toy_manifold_shards(
     saved_metadata.update(
         {
             "row_manifold_ids": manifold_ids,
-            "canonical_order": "generated",
+            "canonical_order": "generated_subset" if "original_row_indices" in metadata else "generated",
             "layer": layer,
         }
     )
@@ -933,16 +1004,18 @@ def save_toy_manifold_shards(
         "source_kind": "toy_manifolds",
         "layers": [layer],
         "window": 1,
-        "d_model": config.ambient_dim,
+        "d_model": config["ambient_dim"],
         "dtype": "float32",
         "prepend_bos": False,
         "shard_size": shard_size,
         "drop_prefix": 0,
         "num_rows": global_row,
         "num_shards": shard_id,
-        "generator_config": asdict(config),
+        "generator_config": config,
         "manifold_metadata": metadata_path.name,
     }
+    if "partition" in metadata:
+        shard_config["partition"] = metadata["partition"]
     config_path = root / "config.json"
     config_tmp = config_path.with_suffix(".json.tmp")
     config_tmp.write_text(json.dumps(shard_config, indent=2) + "\n")

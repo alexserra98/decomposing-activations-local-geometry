@@ -87,7 +87,9 @@ def test_pca_only_preserves_means_and_rejects_a_different_split(tmp_path):
     run_training_kmeans.cmd_train(args)
     after = load_kmeans(output / "kmeans_model.pt")
     torch.testing.assert_close(after.mu, before.mu, rtol=0, atol=0)
-    assert after.q == 3
+    assert after.q == 1
+    assert after.W.shape == (1, 3, 1)
+    assert after.eigenvalues.shape == (1, 3)
     assert after.component_ranks.tolist() == [1]
     args.split_seed = 43
     with pytest.raises(ValueError, match="training split|original training population"):

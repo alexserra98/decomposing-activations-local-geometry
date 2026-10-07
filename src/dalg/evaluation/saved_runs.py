@@ -16,6 +16,7 @@ import yaml
 
 from dalg.data.shard_activations import load_meta_index
 from dalg.data.subset_spec import resolve_spec_positions, split_shard_dir_spec
+from dalg.evaluation.toy_manifold_coverage import validate_toy_test_split
 from dalg.pipeline import (
     REPO_ROOT, _EVALUATION_DEFAULTS,
     _assignment_artifact_valid, _assignments_path, _canonical_json,
@@ -38,6 +39,8 @@ def _read_object(path: Path) -> dict:
 def _settings(run: dict, overrides: dict) -> dict:
     cfg = {**_EVALUATION_DEFAULTS, **run.get("evaluation", {}), **overrides}
     cfg["enabled"] = True
+    if type(cfg["heldout_distribution_coverage"]) is not bool:
+        raise ValueError("evaluation.heldout_distribution_coverage must be true or false")
     cfg["kind"] = cfg["kind"] or "toy_manifold_tiling"
     if cfg["kind"] != "toy_manifold_tiling":
         raise ValueError(f"unsupported evaluation: {cfg['kind']}")
@@ -67,7 +70,7 @@ def _resources(run: dict, cfg: dict, overrides: dict) -> dict:
     return resources
 
 
-def _prerequisites(run: dict) -> tuple[list[str], dict | None]:
+def _prerequisites(run: dict, evaluation: dict) -> tuple[list[str], dict | None]:
     """Report absent run artifacts; reject existing invalid artifacts."""
     directory = Path(run["run_dir"])
     spec_path = directory / "run_spec.json"
@@ -89,6 +92,8 @@ def _prerequisites(run: dict) -> tuple[list[str], dict | None]:
     dataset = _read_object(root / "config.json")
     if dataset.get("source_kind") != "toy_manifolds" or dataset.get("window") != 1 or dataset.get("drop_prefix", 0) != 0:
         raise ValueError(f"incompatible toy-manifold dataset: {root}")
+    if evaluation.get("heldout_distribution_coverage", True):
+        validate_toy_test_split(root, layer=run["dataset"]["layer"])
     metadata = torch.load(root / dataset["manifold_metadata"], map_location="cpu", weights_only=True)
     meta = load_meta_index(root, layer=run["dataset"]["layer"])
     if metadata["row_manifold_ids"].numel() != len(meta):
@@ -147,7 +152,7 @@ def plan_evaluation(manifests, *, indices=None, overrides=None, resources=None) 
             }
     eligible, skipped = [], []
     for entry in unique.values():
-        missing, spec = _prerequisites(entry["run"])
+        missing, spec = _prerequisites(entry["run"], entry["evaluation"])
         if missing:
             skipped.append({"run_dir": entry["run"]["run_dir"], "sources": entry["sources"], "reasons": missing})
             continue
@@ -227,7 +232,7 @@ def evaluate_saved_run(plan: dict, index: int) -> None:
         raise ValueError(f"evaluation index out of range: {index}")
     entry = plan["runs"][index]
     directory = Path(entry["run"]["run_dir"])
-    missing, spec = _prerequisites(entry["run"])
+    missing, spec = _prerequisites(entry["run"], entry["evaluation"])
     if missing or spec != entry["source_spec"]:
         raise ValueError(f"source artifacts changed or are missing: {directory}; {missing}")
     from dalg.evaluation.toy_manifold_tiling import evaluate_pipeline_run
@@ -303,7 +308,8 @@ def submit_evaluations(plan: dict, *, dry_run: bool = False) -> None:
 
 def command_evaluate(args) -> None:
     overrides = {key: getattr(args, key) for key in (
-        "device", "batch_size", "rank_threshold", "max_mean_to_manifold_distance"
+        "device", "batch_size", "rank_threshold", "max_mean_to_manifold_distance",
+        "heldout_distribution_coverage",
     ) if hasattr(args, key)}
     resources = {}
     if args.resources:
