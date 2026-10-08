@@ -34,9 +34,12 @@ covariance at an adaptive rank and rewrites it in MFA parameters. Three phases:
 - **A** — one E-pass accumulating, in float64, the responsibility-weighted second
   moment of each component about its *current* `mu_k`.
 - **B** — per component: `eigh(S_k)`, a scale-free Cattell scree test on
-  consecutive eigenvalue differences to propose a rank cap `r_k`, the noise
-  level `b_k = (Tr(S_k) - sum_{j<=r_k} lam_j) / (D - r_k)`, then the
-  reconstruction of `Sigma_k = W_k W_k^T + b_k I` with
+  consecutive eigenvalue differences to propose a rank cap `r_k`: select the
+  last index with `(lam_j - lam_{j+1}) / lam_1 > threshold`; if none qualifies,
+  propose `q_max`, limited to `D - 1`. Increasing the threshold can therefore
+  make the proposal jump to `q_max` when the last qualifying gap disappears.
+  Then estimate `b_k = (Tr(S_k) - sum_{j<=r_k} lam_j) / (D - r_k)` and
+  reconstruct `Sigma_k = W_k W_k^T + b_k I` with
   `scale_j = sqrt(lam_j - b_k)`. With `--shared-b`, eligible components instead
   estimate one pooled floor:
 
@@ -46,14 +49,14 @@ covariance at an adaptive rank and rewrites it in MFA parameters. Three phases:
   ```
 
   Shared-b surgery then reconciles the independent Cattell proposals with the
-  common floor. Directions `2..r_k` are considered globally from smallest to
-  largest eigenvalue; any candidate with `lam_kj <= b` enters the pooled noise
+  common floor, including for no-gap `q_max` proposals. Directions `1..r_k`
+  are considered globally from smallest to largest eigenvalue; any candidate with `lam_kj <= b` enters the pooled noise
   estimate before `b` is updated and the next candidate is considered. The
-  remaining prefix defines `d_k`. Direction one stays mandatory, so an eligible
-  component with `lam_k1 <= b` still raises instead of silently becoming rank
-  zero. The implementation docstring in `_solve_shared_b_active_set` contains
-  the full derivation, stopping rule, numerical-floor handling, scope, and
-  rank-one policy. Reconstruction round-trips `b` through the model dtype before
+  remaining prefix defines `d_k`. The first direction can enter the noise pool
+  too, giving `d_k = 0` and a spherical covariance `b I`. The implementation
+  docstring in `_solve_shared_b_active_set` contains the full derivation,
+  stopping rule, numerical-floor handling, and spherical-component policy.
+  Reconstruction round-trips `b` through the model dtype before
   validating retained directions, so the check and loading scales use the floor
   that is actually written rather than only its float64 target.
 - **C** — Adam state for the rewritten tensors is dropped, optionally followed by
@@ -97,11 +100,11 @@ For the single-process shared-noise model, replace `--isotropic-psi` with
 components below `surgery_min_count`, although their covariance floor still
 changes because the scalar is global. A value of zero disables the cutoff and
 includes every component with positive soft responsibility mass; exact-zero
-membership raises because `S_k / N_k` is undefined. The active set lowers
-Cattell rank caps when optional signal eigenvalues do not clear the common
-floor. Surgery stops explicitly only when even a mandatory first eigenvalue is
-not above `b`. The Slurm launcher makes the same selection with `SHARED_B=1`;
-its default remains component-specific `b_k`.
+membership is skipped because `S_k / N_k` is undefined. The active set lowers
+Cattell rank caps when signal eigenvalues do not clear the common floor,
+including the first direction when necessary. A no-gap `q_max` proposal can
+therefore end with any rank from zero through `q_max`. The Slurm launcher makes
+the same selection with `SHARED_B=1`; its default remains component-specific `b_k`.
 
 To warm-start from a saved HDDC model, pass `--init-model-path mfa_model.pt` in
 `single_process` mode. The source must exactly match `K`, `D`, `q_max`, and the
@@ -147,13 +150,14 @@ tiling. Reading `d_k` against the planted per-manifold dimensions still works.
   dimension where a component covers a curved patch: the patch is thick in the
   curvature direction, and that thickness is real variance, not an error. Score
   with a within-one band as well as exact match.
-- **Saturation at `q_max`** is the "raise `q_max`" warning. Count it over
-  components surgery actually touched — components below `n_min` are skipped and
-  keep their initial full mask, so including them reports false saturation.
+- **Saturation at `q_max`** can come from a qualifying gap at the cap or the
+  no-gap fallback. Inspect the gaps before deciding to raise `q_max`. Count
+  saturation over components surgery actually touched: components below `n_min`
+  are skipped and keep their initial full mask.
 - **Live component count** matters as much as NLL. A mixture that collapses onto
   far fewer components than `K` is reporting the dimension of whatever each
   survivor covers, which may be a whole manifold rather than a local patch.
 - **Augmented BIC** is not computed in the training loop. The toy-manifold
-  evaluator reports the [active-BIC score](../evaluation/toy-manifold-tiling.md#augmented-bic)
+  evaluator reports the [active-BIC score](evaluation/toy-manifold-tiling.md#augmented-bic)
   in `metrics.json`; compare its `bic.value` across runs on the same dataset,
   split, and nominal `K`, with higher values preferred.

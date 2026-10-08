@@ -72,3 +72,20 @@ At this point the goal is to create a good benchmark where MFA can outperform.
 > Establishing the current research direction, findings, and immediate goals.
 
 Ok apparently I have found a solution. I created 5 copies dataset with 10 manifolds varying noise ratio in this window [10000, 1000, 100, 10]. The lower the noisier. For 10000,1000,100 both kmeans and MFA are able to recover tangent space and tile the manifold. For 10 instead kmeans fails on very simple manifold, such a line, or the sphere, while MFA works decently. So I have a reason to justify MFA: it works better with noisy dataset. The best would be to have an other dataset where kmeas fails and MFA works.
+
+# Research State (updated 2026-09-29)
+
+> **Kind:** Research state · **Status:** Current as of 2026-09-29 · **Use when:**
+> Establishing the current research direction, findings, and immediate goals.
+
+I have assessed that MFA actually beat kmeans on noisy datasets especially for low-dimensional manifolds. Unfortunately the metric I used - tangent containment - is not very informative and it indicate more a necessary rather than sufficient condition for good tiling. 
+I have updated tangent containment which now measure the maximum tangent alignement for each subset of dimension r and of the first q_k PCs of the covariance matrix and the r-dimensiona base of the manifold tangent space. I also created a new  adjusted tangent alignment that penalise when q_k < r. 
+Under these new set metric it was clear that MFA is better only in the noisy setting but fail to beat kmeans in basically any other setting and metric. 
+I have update MFA to use EM instead of Adam (sgd) and now I have finally something the is comparable to kmeans in low-noise regime and better in high-noise regime.
+The only problems left to solve are:
+1. [x] Both Kmeans and MFA-em fail to learn the tangent dimension of the swiss roll and learn the ambient dim instead (although the tangent alignment is good)
+2. [ ] Both Kmeans and MFA-em fail to tile of the 12d torus and 10d hypersphere because it learn the ambient dim instead insted of tangent dim and becuase tangent alignment is not high 
+
+Solution:
+1. For the swiss roll I just needed to make the axial lenght equal to diameter, apparently the very elongated swiss roll was hard to learn for both methods
+2. For the 12torus I don't have a solution yet.

@@ -1,4 +1,4 @@
-"""Full-data EM for [a_ij, b, Q_i, d_i], streamed over activation batches.
+"""Full-data EM with shared or component-specific isotropic noise.
 
 Responsibilities are frozen for a complete pass. Float64 residual moments
 feed the existing HDDC M-step; no optimizer or stochastic averaging is used.
@@ -46,8 +46,10 @@ class EMStatistics:
 
 
 def _validate_model(model):
-    if isinstance(model, ComponentShardedMFA_HDDC) or not model.shared_b:
-        raise ValueError("EM requires a single-process shared-b HDDC model")
+    if isinstance(model, ComponentShardedMFA_HDDC):
+        raise ValueError("EM requires a single-process HDDC model")
+    if not (model.shared_b or model.isotropic_psi):
+        raise ValueError("EM requires shared-b or component-specific isotropic noise")
     if not 1 <= model.q < model.D:
         raise ValueError("EM requires 1 <= q_max < D")
     if model._rotation_on:
@@ -164,6 +166,7 @@ def train_em_hddc(
     model_config = {
         "K": model.K, "D": model.D, "q": model.q,
         "eps_floor": model._eps, "dtype": str(model.mu.dtype),
+        "shared_b": model.shared_b, "isotropic_psi": model.isotropic_psi,
     }
     directory = Path(out_dir) if out_dir is not None else None
     if directory is not None:
@@ -181,8 +184,12 @@ def train_em_hddc(
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         if checkpoint.get("fit_method") != "em":
             raise ValueError("Cannot resume an Adam checkpoint as EM; use init_model_path with mfa_model.pt")
-        if checkpoint["model_config"] != model_config:
-            raise ValueError("Cannot resume EM with different model dimensions, dtype or numerical floor")
+        saved_model_config = dict(checkpoint["model_config"])
+        # EM checkpoints predating noise-mode metadata only supported shared b.
+        saved_model_config.setdefault("shared_b", True)
+        saved_model_config.setdefault("isotropic_psi", False)
+        if saved_model_config != model_config:
+            raise ValueError("Cannot resume EM with different model dimensions, dtype, numerical floor or noise mode")
         for key in ("threshold", "tol"):
             if checkpoint["em_config"][key] != getattr(cfg, key):
                 raise ValueError(f"Cannot change EM {key} when resuming")
@@ -238,9 +245,12 @@ def train_em_hddc(
                 progress_metric, without_improvement = metric, 0
             else:
                 without_improvement += 1
+            noise = model._psi()[:, 0].double()
             record = {
                 "iteration": epoch, "train_nll": statistics.nll, "val_nll": val_nll,
-                "b": float(model._psi()[0, 0]), "rank_min": int(ranks.min()),
+                "b": float(noise[0]) if model.shared_b else None,
+                "b_min": float(noise.min()), "b_mean": float(noise.mean()),
+                "b_max": float(noise.max()), "rank_min": int(ranks.min()),
                 "rank_max": int(ranks.max()), "rank_mean": float(ranks.double().mean()),
                 "rank_histogram": torch.bincount(ranks, minlength=model.q + 1).tolist(),
                 "dead_components": int(torch.isneginf(model.pi_logits).sum()),
@@ -250,11 +260,13 @@ def train_em_hddc(
                 "iteration_seconds": time.perf_counter() - started + m_step_seconds,
                 "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(model.mu.device)
                     if model.mu.device.type == "cuda" else 0,
-                "pruned_directions": int(update_summary.get("n_shared_b_pruned_directions", 0)),
+                "pruned_directions": int(update_summary.get("n_pruned_directions", 0)),
             }
             history.append(record)
+            noise_log = (f"b={record['b']:.6g}" if model.shared_b else
+                         f"b_k={record['b_min']:.6g}..{record['b_max']:.6g} mean={record['b_mean']:.6g}")
             log(f"[em] iteration={epoch} train_nll={statistics.nll:.8g} val_nll={val_nll} "
-                f"b={record['b']:.6g} ranks={record['rank_min']}..{record['rank_max']} "
+                f"{noise_log} ranks={record['rank_min']}..{record['rank_max']} "
                 f"changed={rank_changes} dead={record['dead_components']} seconds={record['iteration_seconds']:.2f}")
             if _wandb_active():
                 import wandb

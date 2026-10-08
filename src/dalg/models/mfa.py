@@ -206,8 +206,6 @@ class MFA(nn.Module):
         WT_Pinv_x = torch.matmul(x, cache["pinvw_flat"]).reshape(B, K, q)
         v = WT_Pinv_x - cache["wt_pinv_mu"][None, :, :]
 
-        v = v.float()
-        quad_Psi = quad_Psi.float()
         low_rank = (torch.einsum("bkq,kqr->bkr", v, cache["Minv"]) * v).sum(dim=-1)
         quad = quad_Psi - low_rank
         return -0.5 * (self._two_pi_logD + cache["logdet_c"][None, :] + quad)

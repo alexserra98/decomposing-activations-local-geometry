@@ -5,7 +5,7 @@ applies the closed-form mean, mixture-weight, and covariance updates of the HDDC
 `[a_ij b_i Q_i d_i]` or its single-process shared-noise variant
 `[a_ij b Q_i d_i]` (Bouveyron, Girard & Schmid, arXiv:math/0604064). It
 re-estimates each component's covariance with an adaptive rank
-`0 <= d_k <= q_max` in shared-noise mode, and rewrites the result in MFA
+`0 <= d_k <= q_max` in either isotropic-noise mode, and rewrites the result in MFA
 parameters. Between surgeries the columns beyond `d_k` are hard-masked by
 `MFA.rank_mask`, so they contribute nothing to the likelihood and receive no
 gradient.
@@ -30,7 +30,10 @@ B. Per component: `eigh(S_k)`, a scale-free Cattell scree test on consecutive
    common floor can overtake a weak retained eigenvalue from another component,
    shared-b surgery treats the Cattell ranks as caps and solves a small active-
    set problem that retains exactly the optional directions compatible with
-   `lam_j > b`. The MFA reconstruction then uses
+   `lam_j > b`. Component-specific noise similarly reduces each rank until
+   retained eigenvalues exceed its stored `b_k`, recomputing the tail mean
+   after each removal. This also handles numerical floors and rounding.
+   The MFA reconstruction then uses
    `scale_j = sqrt(lam_j - b)` (or `b_k`). All `q_max` columns are written from
    the eigendecomposition and only the mask records `d_k`, so a later surgery
    can raise a component's rank with no revival logic.
@@ -465,6 +468,7 @@ def _component_proposal(model, N, residual_sum, S_acc, cfg: SurgeryConfig):
             "b_shared_at_cattell": None,
             "n_shared_b_pruned_components": 0,
             "n_shared_b_pruned_directions": 0,
+            "n_pruned_directions": 0,
             "n_updated": 0, "n_skipped": int(K), "N_k": N,
         }, {}
 
@@ -498,8 +502,9 @@ def _component_proposal(model, N, residual_sum, S_acc, cfg: SurgeryConfig):
     above = delta > float(cfg.threshold)
     j = torch.arange(1, q + 1, device=device, dtype=torch.int64)[None, :]
     d_sel = torch.where(above, j, torch.zeros_like(j)).max(dim=1).values
-    # Empty selection -> 1; never exceed q_max, and never leave zero noise dims.
-    d_sel = d_sel.clamp(min=1, max=min(q, D - 1))
+    # No detected boundary -> q_max proposal, before noise feasibility checks.
+    # Always leave at least one noise dimension.
+    d_sel = torch.where(d_sel > 0, d_sel, q).clamp(max=min(q, D - 1))
 
     # HDDC eq. 4: a component-specific noise level is the mean of its discarded
     # eigenvalues. Equation 5 pools the same residual variance across components
@@ -522,12 +527,6 @@ def _component_proposal(model, N, residual_sum, S_acc, cfg: SurgeryConfig):
         b = b_shared.expand(idx.numel())
     else:
         b_shared = None
-        head = torch.cumsum(lam[:, :q].clamp_min(0.0), dim=1)
-        kept = head.gather(1, (d_sel - 1)[:, None]).squeeze(1)
-        residual = trace - kept
-        b = (residual / (D - d_sel).to(trace.dtype)).clamp_min(
-            effective_psi_floor
-        )
 
     # Encode b exactly as the model writer will, then use the round-tripped value
     # for validation, scale reconstruction, and reporting. This closes the small
@@ -559,14 +558,28 @@ def _component_proposal(model, N, residual_sum, S_acc, cfg: SurgeryConfig):
         n_shared_b_pruned_components = int((pruned > 0).sum().item())
         n_shared_b_pruned_directions = int(pruned.sum().item())
     else:
-        psi_target = (b - model._eps).clamp_min(1e-12)
-        psi_rho_new = _softplus_inverse(psi_target).to(dtype)
-        b = F.softplus(psi_rho_new).to(b.dtype) + model._eps
+        while True:
+            retained = j <= d_sel[:, None]
+            kept = torch.where(retained, lam[:, :q].clamp_min(0.0), 0.0).sum(dim=1)
+            b = ((trace - kept) / (D - d_sel).to(trace.dtype)).clamp_min(
+                effective_psi_floor
+            )
+            psi_target = (b - model._eps).clamp_min(1e-12)
+            psi_rho_new = _softplus_inverse(psi_target).to(model.psi_rho.dtype)
+            stored_b = (F.softplus(psi_rho_new) + model._eps).to(lam.dtype)
+            # Downward rounding must not turn an exact noise tie into signal;
+            # upward rounding must not leave a nonpositive loading variance.
+            rank_floor = torch.maximum(b, stored_b)
+            b = stored_b
+            invalid = retained & (lam[:, :q] <= rank_floor[:, None])
+            if not invalid.any():
+                break
+            # Remove the weakest direction per affected component, then
+            # recompute its tail mean. The stored floor can also force rank zero.
+            d_sel -= invalid.any(dim=1).to(d_sel.dtype)
 
     # Retained directions must be strictly above the floor that is actually
-    # written. The shared active set and rounding correction guarantee this.
-    # Component-specific tail means normally guarantee it algebraically; an
-    # imposed floor can still make that model infeasible, so both modes check it.
+    # written. Both noise modes correct ranks against that stored value.
     retained = j <= d_sel[:, None]
     invalid = retained & (lam[:, :q] <= b[:, None])
     if invalid.any():
@@ -604,6 +617,7 @@ def _component_proposal(model, N, residual_sum, S_acc, cfg: SurgeryConfig):
         "b_shared_at_cattell": b_shared_at_cattell,
         "n_shared_b_pruned_components": n_shared_b_pruned_components,
         "n_shared_b_pruned_directions": n_shared_b_pruned_directions,
+        "n_pruned_directions": int((d_cattell - d_sel).sum().item()),
         "eligible": eligible,
         "n_updated": int(idx.numel()),
         "n_skipped": int(K - idx.numel()),

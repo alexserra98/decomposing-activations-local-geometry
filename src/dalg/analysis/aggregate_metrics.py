@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -118,18 +119,30 @@ def _dataframe(rows: list[dict], identifiers: list[str]) -> pd.DataFrame:
     return pd.DataFrame({name: pd.array([row.get(name) for row in rows]) for name in ordered})
 
 
-def aggregate_metrics(folder: str | Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def aggregate_metrics(
+    folder: str | Path, *, skip_regex: str | None = None,
+    skip_paths: list[str | Path] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Read reports without writing files; return general and manifold DataFrames.
 
     Each report contributes one general row and one row per saved manifold.
     Nested fields use dotted columns and run specifications use ``config.*``.
     ``evaluation_id`` (the relative report path) joins the tables. Deprecated
     centroid reports, history directories, and nested directory symlinks are
-    excluded. Invalid inputs raise ValueError with the offending source path.
+    excluded. ``skip_regex`` additionally skips subdirectories whose names
+    match via ``re.search``. ``skip_paths`` skips specific subdirectories using
+    absolute paths or paths relative to ``folder``. Both filters exclude entire
+    subtrees; the root folder is never filtered. Invalid reports raise
+    ValueError with the source path.
     """
     root = Path(folder).resolve()
     if not root.is_dir():
         raise ValueError(f"directory does not exist: {root}")
+    try:
+        skip_pattern = re.compile(skip_regex) if skip_regex is not None else None
+    except re.error as exc:
+        raise ValueError(f"invalid skip_regex {skip_regex!r}: {exc}") from exc
+    excluded_paths = {(root / path).resolve() for path in (skip_paths or [])}
 
     def walk_error(exc: OSError) -> None:
         raise exc
@@ -139,6 +152,8 @@ def aggregate_metrics(folder: str | Path) -> tuple[pd.DataFrame, pd.DataFrame]:
         dirs[:] = [
             name for name in dirs
             if name not in _EXCLUDED_DIRS and not (Path(directory) / name).is_symlink()
+            and Path(directory) / name not in excluded_paths
+            and (skip_pattern is None or skip_pattern.search(name) is None)
         ]
         if "metrics.json" in files:
             paths.append(Path(directory) / "metrics.json")
@@ -159,9 +174,19 @@ def aggregate_metrics(folder: str | Path) -> tuple[pd.DataFrame, pd.DataFrame]:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("folder", type=Path, help="Experiment folder to read and save CSVs inside")
+    parser.add_argument(
+        "--skip-regex",
+        help="Skip subfolders whose names match this regex (re.search), including all descendants",
+    )
+    parser.add_argument(
+        "--skip-paths", nargs="+", type=Path,
+        help="Subfolder paths to skip, including descendants (absolute or relative to folder)",
+    )
     args = parser.parse_args(argv)
     try:
-        general, manifolds = aggregate_metrics(args.folder)
+        general, manifolds = aggregate_metrics(
+            args.folder, skip_regex=args.skip_regex, skip_paths=args.skip_paths,
+        )
         paths = [args.folder / "general_metrics.csv", args.folder / "manifold_metrics.csv"]
         for frame, path in zip((general, manifolds), paths):
             frame.to_csv(path, index=False)

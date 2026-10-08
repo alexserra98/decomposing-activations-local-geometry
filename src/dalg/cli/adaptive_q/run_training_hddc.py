@@ -994,8 +994,10 @@ def validate_args(args) -> None:
     if args.fit_method == "em":
         from dalg.models.adaptive_q.train_em_hddc import EMConfig
 
-        if mode != "single_process" or not args.shared_b:
-            raise SystemExit("EM requires --training-mode single_process --shared-b")
+        if mode != "single_process":
+            raise SystemExit("EM requires --training-mode single_process")
+        if not (args.shared_b or args.isotropic_psi):
+            raise SystemExit("EM requires --shared-b or --isotropic-psi")
         if torch.device(args.device).type not in {"cpu", "cuda"}:
             raise SystemExit("EM float64 computations require --device cpu or cuda")
         if args.epochs <= 0:

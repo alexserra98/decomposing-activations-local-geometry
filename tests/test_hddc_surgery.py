@@ -619,37 +619,48 @@ def test_surgery_floor_respects_model_psi_parameterization_floor():
     assert written_b == pytest.approx(float(stats["b_shared"]), abs=1e-6)
 
 
-def test_component_specific_surgery_rejects_floor_above_retained_eigenvalue():
-    model = MFA_HDDC(
-        torch.zeros(1, 2),
-        rank=1,
-        isotropic_psi=True,
-        psi_init=0.5,
-        eps_floor=0.1,
+@pytest.mark.parametrize("spectrum, expected_rank", [
+    ([0.05, 0., 0., 0.], 0),
+    ([2., 0.05, 0.02, 0.], 1),
+    ([2., 0.5, 0.2, 0.15], 3),
+    ([0., 0., 0., 0.], 0),
+    ([0.5, 0.5, 0.5, 0.5], 0),
+])
+def test_component_specific_surgery_corrects_rank_against_stored_noise(spectrum, expected_rank):
+    model = MFA_HDDC(torch.zeros(1, 4), rank=3, isotropic_psi=True, eps_floor=0.1)
+    N = torch.tensor([100.], dtype=torch.float64)
+    covariance = torch.diag(torch.tensor(spectrum, dtype=torch.float64))[None]
+    stats = reconstruct_components(
+        model, N, torch.zeros_like(model.mu, dtype=torch.float64),
+        covariance * N[:, None, None], SurgeryConfig(threshold=1.0),
     )
-    before = {key: value.clone() for key, value in model.state_dict().items()}
-    N = torch.tensor([100.0], dtype=torch.float64)
-    covariance = torch.diag(torch.tensor([0.05, 0.0], dtype=torch.float64))[None, :, :]
+    assert model.component_ranks.tolist() == [expected_rank]
+    assert stats["n_pruned_directions"] == 3 - expected_rank
+    expected_b = max(sum(spectrum[expected_rank:]) / (4 - expected_rank), 0.1)
+    stored_b = model._psi()[0, 0].detach().double()
+    assert float(stored_b) == pytest.approx(expected_b)
+    torch.testing.assert_close(stats["b_k"][0], stored_b, rtol=0, atol=0)
+    expected_spectrum = torch.tensor(spectrum, dtype=torch.float64)
+    expected_spectrum[expected_rank:] = stored_b
+    W = model._W()[0].detach().double()
+    actual = W @ W.T + stored_b * torch.eye(4)
+    torch.testing.assert_close(actual, torch.diag(expected_spectrum), rtol=1e-6, atol=1e-7)
+    assert torch.isfinite(model.log_prob(torch.zeros(1, 4))).all()
 
-    with pytest.raises(
-        RuntimeError,
-        match=r"component-b surgery.*component=0, direction=1, lambda=.* <= b=",
-    ):
-        reconstruct_components(
-            model,
-            N,
-            torch.zeros_like(model.mu, dtype=torch.float64),
-            covariance * N[:, None, None],
-            SurgeryConfig(
-                enabled=True,
-                every=1,
-                threshold=0.01,
-                min_count=1.0,
-                psi_floor=1e-6,
-            ),
-        )
-    for key, value in model.state_dict().items():
-        assert torch.equal(value, before[key])
+
+def test_component_specific_noise_rounding_and_components_are_independent():
+    model = MFA_HDDC(torch.zeros(2, 2), rank=1, isotropic_psi=True)
+    N = torch.tensor([100., 50.], dtype=torch.float64)
+    spectra = torch.tensor([[1.0 - 2**-27, 1.0 - 2**-26], [4., 0.2]], dtype=torch.float64)
+    stats = reconstruct_components(
+        model, N, torch.zeros(2, 2, dtype=torch.float64),
+        torch.diag_embed(spectra) * N[:, None, None], SurgeryConfig(),
+    )
+    assert model.component_ranks.tolist() == [0, 1]
+    torch.testing.assert_close(model._psi()[:, 0].detach(), torch.tensor([1., 0.2]))
+    torch.testing.assert_close(stats["b_k"], model._psi()[:, 0].detach().double(), rtol=0, atol=0)
+    assert stats["n_pruned_directions"] == 1
+
 
 
 def test_hddc_surgery_reports_shared_b_without_dropping_b_k_mean():
@@ -737,7 +748,7 @@ def test_shared_b_can_make_every_component_spherical(q, variance, floor):
     assert torch.count_nonzero(model._W()) == 0
     assert float(stats["b_shared"]) == pytest.approx(max(variance, floor))
     assert float(stats["b_shared"]) == float(model._psi()[0, 0].detach())
-    assert stats["n_shared_b_pruned_directions"] == 2  # Cattell still proposes one each.
+    assert stats["n_shared_b_pruned_directions"] == 2 * q  # Both no-gap proposals start at q_max.
     assert torch.isfinite(model.log_prob(torch.zeros(1, 4))).all()
     assert all(torch.isfinite(p).all() for p in model.parameters())
 
@@ -768,7 +779,7 @@ def test_spherical_surgery_reports_zero_rank_and_parameter_count():
     assert summary["n_updated"] == 2
     assert summary["d_k_hist"] == [2, 0, 0]
     assert summary["d_k_min"] == summary["d_k_max"] == 0
-    assert summary["n_shared_b_pruned_directions"] == 2
+    assert summary["n_shared_b_pruned_directions"] == 4
     assert parameter_count(model) == 2 * 4 + 1 + 1  # Means, weights, shared noise.
 
 
@@ -792,10 +803,71 @@ def test_shared_b_surgery_with_no_eligible_components_is_a_no_op():
         assert torch.equal(value, before[key])
 
 
-def test_higher_threshold_selects_a_smaller_rank():
+@pytest.mark.parametrize("shared_b", [False, True])
+@pytest.mark.parametrize("eig_batch_size", [None, 1])
+@pytest.mark.parametrize(
+    "eigenvalues, threshold, expected_rank",
+    [
+        ([8., 4., 2., 1.], 0.6, 3),  # No gap passes: retain q_max when feasible.
+        ([8., 4., 2., 1.], 0.5, 3),  # Equality does not pass either.
+        ([8., 4., 2., 1.], 0.25, 1),
+        ([8., 4., 2., 1.], 0.125, 2),
+        ([8., 4., 3., 1.], 0.2, 3),  # Last passing gap, despite an earlier small gap.
+    ],
+)
+def test_cattell_rank_proposal_and_no_gap_fallback(
+    shared_b, eig_batch_size, eigenvalues, threshold, expected_rank,
+):
+    model = MFA_HDDC(
+        torch.zeros(1, 4), rank=3, shared_b=shared_b, isotropic_psi=not shared_b,
+    )
+    N = torch.tensor([100.], dtype=torch.float64)
+    covariance = torch.diag(torch.tensor(eigenvalues, dtype=torch.float64))
+    stats = reconstruct_components(
+        model, N, torch.zeros(1, 4, dtype=torch.float64), covariance[None] * N[:, None, None],
+        SurgeryConfig(threshold=threshold, eig_batch_size=eig_batch_size),
+    )
+    assert model.component_ranks.tolist() == [expected_rank]
+    assert stats["n_shared_b_pruned_directions"] == 0
+    expected_b = sum(eigenvalues[expected_rank:]) / (4 - expected_rank)
+    assert float(model._psi()[0, 0].detach()) == pytest.approx(expected_b)
+
+
+def test_no_gap_fallback_is_per_component():
+    model = MFA_HDDC(torch.zeros(2, 4), rank=3, isotropic_psi=True)
+    N = torch.tensor([100., 50.], dtype=torch.float64)
+    covariance = torch.diag_embed(torch.tensor(
+        [[8., 7., 6., 5.], [8., 6., 2., 1.]], dtype=torch.float64,
+    ))
+    reconstruct_components(
+        model, N, torch.zeros(2, 4, dtype=torch.float64), covariance * N[:, None, None],
+        SurgeryConfig(threshold=0.25),
+    )
+    assert model.component_ranks.tolist() == [3, 2]
+
+
+def test_shared_b_prunes_no_gap_q_max_proposals():
+    model = MFA_HDDC(torch.zeros(2, 4), rank=3, shared_b=True)
+    N = torch.tensor([100., 100.], dtype=torch.float64)
+    covariance = torch.diag_embed(torch.tensor(
+        [[20., 4., 3., 2.], [100., 10., 10., 10.]], dtype=torch.float64,
+    ))
+    stats = reconstruct_components(
+        model, N, torch.zeros(2, 4, dtype=torch.float64), covariance * N[:, None, None],
+        SurgeryConfig(threshold=1.0),
+    )
+    # Both caps are 3. Pooling lambda=3 then lambda=4 lowers b from 6 to 4.75.
+    assert float(stats["b_shared_at_cattell"]) == pytest.approx(6.)
+    assert float(stats["b_shared"]) == pytest.approx(4.75)
+    assert model.component_ranks.tolist() == [1, 3]
+    assert stats["n_shared_b_pruned_directions"] == 2
+    assert stats["n_shared_b_pruned_components"] == 1
+
+
+def test_higher_threshold_selects_a_smaller_rank_when_gaps_qualify():
     x, mu, _U, _lam = _planted_gaussian(D=32, d_true=3, b_true=0.02)
     ranks = {}
-    for t in (0.01, 0.5):
+    for t in (0.01, 0.4):
         model = MFA_HDDC(mu[None, :].clone(), rank=8, isotropic_psi=True, psi_init=0.5)
         summary = hddc_surgery(
             model,
@@ -803,9 +875,9 @@ def test_higher_threshold_selects_a_smaller_rank():
             SurgeryConfig(enabled=True, every=1, threshold=t, min_count=10.0),
         )
         ranks[t] = summary["d_k_per_component"][0]
-    # lam = [4, 2, 1, b, ...]: only the leading gap clears t = 0.5 * lam_1.
-    assert ranks[0.5] < ranks[0.01]
-    assert ranks[0.5] >= 1
+    # lam = [4, 2, 1, b, ...]: the leading gap comfortably clears t = 0.4.
+    assert ranks[0.4] == 1
+    assert ranks[0.01] == 3
 
 
 def test_low_count_components_are_skipped_untouched():
@@ -835,7 +907,7 @@ def test_rank_can_increase_at_a_later_surgery():
 
     tight = hddc_surgery(
         model, batches,
-        SurgeryConfig(enabled=True, every=1, threshold=0.5, min_count=10.0),
+        SurgeryConfig(enabled=True, every=1, threshold=0.4, min_count=10.0),
     )
     loose = hddc_surgery(
         model, batches,

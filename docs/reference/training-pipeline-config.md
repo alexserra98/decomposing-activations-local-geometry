@@ -167,13 +167,28 @@ and
 
 ### Full-data EM
 
-For `model.kind: hddc`, set `training.fit_method: em` and
-`model.shared_b: true`. EM updates all parameters after each complete training
-pass, including Cattell rank selection using `model.surgery_threshold`.
+For `model.kind: hddc`, set `training.fit_method: em` and select exactly one
+isotropic noise mode: `model.shared_b: true` for a common variance, or
+`model.isotropic_psi: true` with `model.shared_b: false` (or omitted) for
+component-specific variances. EM updates all parameters after each complete
+training pass, including Cattell rank selection using `model.surgery_threshold`.
+
+```yaml
+model:
+  kind: hddc
+  shared_b: false
+  isotropic_psi: true
+training:
+  fit_method: em
+  training_mode: single_process
+```
+
+Keep the experiment's other model and data settings. `shared_b: false` alone
+does not select isotropic noise; `isotropic_psi: true` is required.
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `fit_method` | `adam` or `em` | `adam` | HDDC fitting method; EM supports single-process CPU/CUDA shared scalar noise only. |
+| `fit_method` | `adam` or `em` | `adam` | HDDC fitting method; EM supports single-process CPU/CUDA with shared or component-specific isotropic noise. |
 | `em_component_chunk_size` | positive integer | `32` | Number of components in likelihood and centered-moment workspaces. |
 | `em_eig_batch_size` | positive integer | `128` | Covariances per eigensolver call. |
 | `em_tol` | non-negative float | `0.00001` | Relative training-NLL tolerance. Stop after three consecutive small changes with unchanged ranks; zero disables convergence stopping. |
@@ -191,8 +206,9 @@ partition, including local covariance directions. Omit `direction_init`;
 `cluster_pca` is rejected because stored directions are not used. Centroid-only
 and PCA-bearing KMeans checkpoints are accepted via `kmeans_model_path`. Compatible
 `init_model_path` models bypass this initialization. Resume uses EM-tagged
-`checkpoint.pt`; switching between Adam and EM requires a new run initialized
-from `mfa_model.pt`.
+`checkpoint.pt` and requires the same noise mode. Older EM checkpoints without
+noise-mode metadata remain resumable as shared-b runs. Switching between Adam
+and EM requires a new run initialized from `mfa_model.pt`.
 
 The example [hddc_em_D128_1M.yaml](../../configs/archived/hddc_em_D128_1M.yaml)
 uses 2048-activation batches and sweeps K=500 and K=5000. The

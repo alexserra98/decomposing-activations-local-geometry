@@ -170,6 +170,37 @@ that invocation only. Omitted settings in older manifests default to enabled;
 the original manifests, training artifacts, and run identities stay unchanged.
 See the [saved-run workflow](../workflows/training-pipeline.md#evaluate-saved-runs).
 
+## Standalone spatial plot
+
+To compare selected saved pipeline runs outside any benchmark, use
+[`plot_toy_coverage.py`](../../scripts/temporary/plot_toy_coverage.py):
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/temporary/plot_toy_coverage.py \
+  --run kmeans /path/to/kmeans_run \
+  --run mfa /path/to/mfa_run \
+  --labels 'KMeans+PCA' 'MFA' \
+  --output outputs/coverage/comparison.png
+```
+
+Repeat `--run KIND DIRECTORY` for each panel (`kmeans`, `mfa`, `ard`, or `hddc`).
+Each directory must contain its saved config, `val_indices.json`, model export,
+and `*_model_assignments.pt`. These are the current pipeline artifacts, not the
+older three-way experiment layout. Runs must share the dataset, layer, and
+training rows; the dataset must have a valid independent `test/` population.
+
+The figure uses one PCA basis fitted on training rows, red crosses for
+training-live centroids, and a shared color scale for ambient test distances,
+clipped at the largest panel `r99`. `--max-points N` subsamples only displayed
+points; statistics always use the full test population. `--device cuda` moves
+distance computation to the GPU. Training PCA covariance is accumulated in
+CPU batches. PNG, PDF, and SVG are supported.
+
+The script writes the figure, a sibling JSON summary, and a sibling `.pt` file
+containing the projection, projected points, live masks, and full distance
+vectors. Existing outputs are rejected. It does not retrain models or change
+saved runs, manifests, or benchmark reports.
+
 ## Interpretation boundary
 
 This metric estimates probability-mass coverage under the test distribution.

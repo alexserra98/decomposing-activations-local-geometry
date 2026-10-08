@@ -4,7 +4,7 @@
 # fixed and directions are centered on the saved KMeans centroid.
 
 experiment:
-  name: toy_noiseless_sweepk_hddc_cluster_pca
+  name: toy_noiseless_sweepk_hddc_cluster_pca_bk
   output_root: dalg-cache/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0/noiseless/models
 
 dataset:
@@ -16,7 +16,8 @@ model:
   kind: hddc
   K: 1000
   q_max: 32
-  shared_b: true
+  shared_b: false
+  isotropic_psi: true
   surgery_every_epochs: 0.5
   surgery_threshold: 0.05
   surgery_min_count: 64

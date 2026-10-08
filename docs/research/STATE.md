@@ -1,12 +1,17 @@
-# Research State (updated 2026-09-29)
+# Research State (updated 2026-10-08)
 
 > **Kind:** Research state · **Status:** Current as of 2026-09-29 · **Use when:**
 > Establishing the current research direction, findings, and immediate goals.
 
-I have assessed that MFA actually beat kmeans on noisy datasets especially for low-dimensional manifolds. Unfortunately the metric I used - tangent containment - is not very informative and it indicate more a necessary rather than sufficient condition for good tiling. 
-I have updated tangent containment which now measure the maximum tangent alignement for each subset of dimension r and of the first q_k PCs of the covariance matrix and the r-dimensiona base of the manifold tangent space. I also created a new  adjusted tangent alignment that penalise when q_k < r. 
-Under these new set metric it was clear that MFA is better only in the noisy setting but fail to beat kmeans in basically any other setting and metric. 
-I have update MFA to use EM instead of Adam (sgd) and now I have finally something the is comparable to kmeans in low-noise regime and better in high-noise regime.
-The only problems left to solve are:
-- [ ] Both Kmeans and MFA-em fail to learn the tangent dimension of the swiss roll and learn the ambient dim instead (although the tangent alignment is good)
-- [ ] Both Kmeans and MFA-em fail to tile of the 12d torus and 10d hypersphere because it learn the ambient dim instead insted of tangent dim and becuase tangent alignment is not high 
+I have fixed a majory issue with the way surgery was computed. Before when no gap where found for some reason I was putting q_k=1 which made no sense. Now when no gap is found q_k is set to q_max and then adjusted further by comparing with the noise b_k. Directions with eigenvalue $< b_k$ where removed from a_ij and the noise was recomputed.
+
+I have explored how the model behave on torus12d running different experiments. The problem is the following: we can get a good adjusted tantent alignment but we cannot recover the ID. I tried:
+- increasing K and number of points doesn't improve much the results at least for the scale I have currently tried
+- I have tried to increase the number of points but still can get the ID right
+- I tried reducing the dimensionality of the torus and for $dim<6$ I can recoover ID.
+An important thing I have observed is that using a dataset with only a torus6d and 5M of points I was able to reduce NLL but getting worse performance than with a dataset of 500k. Looking further I have discovered that the 5M was reaching an high adjusted tangetn alignment in the first 2 iteration and then the training improved NLL but degraded alignment. This is yet an other evidence that NLL is not a good metric for our problem. 
+
+I tried plotting the spectrum for different manifolds and I have observed a couple interesting things:
+- For smaller id manifolds the spectrum has two jump, one in correspondece of ID and the other of manifold dim.
+- For the torus there was no jump for the ID in the 30k dataset.
+- In 5M dataset the jump was more visible.

@@ -21,29 +21,36 @@ that is diagonal and (by default) shared across components.
 
 ## Streamed full-data EM
 
-Select `--fit-method em --shared-b`, or `training.fit_method: em` with
-`model.shared_b: true` in YAML. The default `fit_method: adam` retains the
-Adam/surgery trainer. EM supports one CPU or CUDA process and
+Select `--fit-method em` with either `--shared-b` or `--isotropic-psi`.
+In YAML, use `training.fit_method: em` and exactly one of
+`model.shared_b: true` (one common noise variance) or
+`model.isotropic_psi: true` (one noise variance per component). For the latter,
+set `model.shared_b: false` or omit it. The default `fit_method: adam` retains
+the Adam/surgery trainer. EM supports one CPU or CUDA process and
 `1 <= q_max < D`; the intended scale is D=128 and K=500–5000.
 
 The EM trainer freezes parameters for a complete pass and computes soft
 responsibilities over **all K components**. It accumulates the same float64
-counts, residual sums and scatter described below, then calls the shared HDDC
+counts, residual sums and scatter described below, then calls the existing HDDC
 M-step to update means, mixture weights, orientations, individual signal
-variances, ranks and the single noise scalar. Components with zero effective
+variances, ranks and isotropic noise. Components with zero effective
 mass keep their means, loadings and rank masks, but receive exactly zero mixture
 weight (`pi_logits = -inf`). They remain inactive in subsequent soft E-passes.
 Only positive-mass components contribute to the shared-noise estimate; the new
-global noise floor still applies to every component. This also handles empty
-components in hard initialization. Negative or nonfinite moments remain errors.
+global noise floor still applies to every component. With component-specific
+noise, zero-mass components keep their own noise variance unchanged. This also
+handles empty components in hard initialization. Negative or nonfinite moments remain errors.
 There are no Adam steps, learning-rate schedules, subsampled E-passes, or online
-averages. Cattell ranks and the shared-noise feasibility solve run every iteration.
+averages. Cattell ranks are selected every iteration. Shared noise additionally
+uses the shared-noise feasibility solve; component-specific noise uses each
+component's discarded-eigenvalue mean and corrects its rank against the stored
+noise variance, including the numerical floor. Either mode can yield rank zero.
 
 Fresh fits load or fit KMeans centroids through the existing initialization
 path, then make one full nearest-centroid pass over training activations to
 initialize **all** parameters. This hard pass uses indexed moments rather than
 dense soft memberships. Stored PCA directions are not required. Alternatively,
-`init_model_path` uses a compatible shared-b HDDC model directly as iteration
+`init_model_path` uses a compatible HDDC model directly as iteration
 zero, without refitting its parameters; K, D, q and noise mode must match.
 
 Float64 cached likelihoods explicitly center observations before evaluating
@@ -58,12 +65,19 @@ while the eigensolver costs O(K D³) per iteration.
 `epochs` counts M-steps; iteration zero is initialization. The next E-pass scores
 each updated model while collecting the moments for its next M-step. The final
 pass only scores. `em_history.json` records train/validation NLL, ranks, rank
-changes, shared noise, effective memberships, dead-component counts, timing and
-peak GPU allocation.
+changes, noise, effective memberships, dead-component counts, timing and
+peak GPU allocation. `b` is the common variance in shared mode and null in
+component-specific mode; `b_min`, `b_mean`, and `b_max` summarize the current
+noise variances over all components (including inactive ones). The mean is
+unweighted. Exact per-component variances remain available in the model.
+`pruned_directions` counts directions removed from Cattell proposals by the
+preceding iterative M-step in either noise mode.
 Checkpoint scores always refer to their actual parameter state. The trainer
 selects the best validation NLL (or train NLL without validation), retaining
 that model as `mfa_model.pt`; `checkpoint.pt` holds the current iteration and
-best state for resume. Adam training checkpoints cannot be resumed as EM;
+best state for resume. Resume requires the same noise mode; older EM checkpoints
+without noise-mode metadata are treated as shared-b checkpoints.
+Adam training checkpoints cannot be resumed as EM;
 use a new output directory and `init_model_path` to switch fitting methods.
 
 Convergence requires three consecutive iterations with unchanged ranks and
@@ -171,7 +185,9 @@ by default uses one frozen set of soft responsibilities for means, weights, and 
   scale-free Cattell scree test on consecutive eigenvalue differences,
 
   ```text
-  r_k = max{ j <= q_max : (lam_j - lam_{j+1}) / lam_1 > threshold }
+  J_k = { 1 <= j <= q_max : (lam_j - lam_{j+1}) / lam_1 > threshold }
+  r_k = max(J_k) if J_k is nonempty, otherwise q_max
+  r_k = min(r_k, D - 1)
   b_k = (Tr(C_hat_k) - sum_{j<=r_k} lam_j) / (D - r_k)    # mean discarded eigenvalue
   ```
 
@@ -182,15 +198,38 @@ by default uses one frozen set of soft responsibilities for means, weights, and 
       / sum_k N_k (D - r_k)
   ```
 
-  An empty Cattell selection still proposes rank one. For component-specific
-  `b_k`, the Cattell proposal is the final rank
-  `d_k = r_k`; surgery raises if an imposed numerical floor nevertheless
-  overtakes a retained eigenvalue. For shared `b`, the independently proposed
+  No qualifying gap means no detected boundary: the proposal is `q_max`,
+  subject to the `D - 1` limit that leaves at least one noise dimension. A gap
+  equal to the threshold does not qualify. While a gap still qualifies, raising
+  the threshold can only preserve or lower the proposal for a fixed spectrum;
+  once the last qualifying gap disappears, the proposal jumps to `q_max`.
+  Thus proposed ranks are not globally monotone in the threshold.
+
+  This rule applies to periodic surgery, full-data EM updates, and EM hard
+  initialization. Existing checkpoints remain readable; their next surgery or
+  M-step uses this rule. KMeans has its own rank-selection policy.
+
+  For component-specific `b_k`, the Cattell proposal is a rank cap. Compute
+  the discarded-eigenvalue mean, apply the numerical floor, and round-trip
+  through the model's stored noise parameterization. Use the larger of the
+  estimated and stored noise for the rank check, so rounding cannot turn an
+  exact noise tie into signal or invalidate a loading. If a retained eigenvalue
+  is at or below that threshold, remove the weakest retained direction from
+  that component and recompute its tail mean and stored noise. Repeat until all
+  retained eigenvalues strictly exceed `b_k`. Components are independent in
+  this solve; rank zero gives `Sigma_k = b_k I` and uses the full trace divided
+  by `D` for the unfloored noise estimate. Equality is treated as noise.
+  A later M-step can restore directions. This correction handles numerical
+  floors, flat spectra, and dtype rounding without rerunning Cattell.
+
+  For shared `b`, the independently proposed
   ranks can be inconsistent with the common absolute floor: reconstruction
   requires every retained eigenvalue to satisfy `lam_kj > b`, because its
   loading variance is `lam_kj - b`. Shared-b surgery therefore treats `r_k` as
-  a rank cap and runs an active-set solve. It starts with all `j > r_k` in the
-  pooled noise estimate, then considers optional directions `1 <= j <= r_k`
+  a rank cap and runs an active-set solve, including after a no-gap `q_max`
+  proposal. The final rank may therefore be below `q_max`, including zero.
+  It starts with all `j > r_k` in the pooled noise estimate, then considers
+  optional directions `1 <= j <= r_k`
   globally from smallest to largest eigenvalue. A candidate enters the noise
   pool when `lam_kj <= b`; the weighted pooled floor is updated before
   considering the next candidate. Once the next candidate is above `b`, all
@@ -340,8 +379,9 @@ five-file deletion.
   jointly updated floor, including the first. A component with no remaining
   signal directions has rank zero and covariance `b I`; subsequent updates can
   restore its rank. This does not relax nonfinite-statistics or parameter checks.
-  Component-specific-noise surgery keeps its existing minimum-rank and strict
-  floor checks.
+  Component-specific noise applies the same strict retained-eigenvalue
+  condition independently, reducing ranks down to zero when necessary and
+  recomputing each affected component's tail noise.
 - On noiseless data, `b_k` is driven to the numerical floor and the NLL goes
   strongly negative; do not compare it naively with noisy-data likelihoods.
 
