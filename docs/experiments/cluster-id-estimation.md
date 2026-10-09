@@ -1,6 +1,6 @@
 # Per-cluster intrinsic dimension across the toy noise sweep
 
-> **Kind:** Experimental workflow · **Status:** Tests passed; smoke test pending · **Use when:**
+> **Kind:** Experimental workflow · **Status:** Smoke tests passed; production pending · **Use when:**
 > Computing separate training/test 2NN and GRIDE estimates for saved toy-noise
 > model runs. **Related:** [Toy datasets](../reference/toy-manifold-dataset.md),
 > [held-out populations](../evaluation/heldout-distribution-coverage.md), and
@@ -109,8 +109,8 @@ CPUs, 16 GB RAM, 45 minutes, no GPU. Its output directory is
 Job `1747864` completed with exit code zero in 5 minutes 12 seconds and peak
 batch memory of 2,423,400 KiB. DADApy installed successfully, all eight tests
 passed, and `manifest.json` recorded **740 runs with all required files
-present**. This checks file availability; saved checkpoints and assignment
-contents still need an end-to-end smoke test. The test suite reported one
+present**. This inventory checked file availability; selected checkpoint and
+assignment contents were then tested by the smoke runs below. The suite reported one
 existing iterable-dataset length warning from its small KMeans fixture.
 
 The validation launcher runs the tests and records a manifest of every source
@@ -126,11 +126,12 @@ job-specific temporary caches instead of the home directory.
 inclusive 500-point threshold, empty/degenerate clusters, saved global-row split
 alignment, native KMeans/MFA/HDDC test memberships, and preservation of inputs.
 
-## Proposed smoke test (not submitted)
+## Completed smoke test
 
-Use the installed `.venv` and the validation manifest to test both ends of the
-cluster-count range for each checkpoint implementation. All six selected runs
-use `noise_ratio_10` and the agreed estimator settings:
+The user approved six runs at both ends of the cluster-count range for each
+checkpoint implementation. Array `1747872` used the installed `.venv`, source
+commit `44604bd`, and the validation manifest. All six runs used
+`noise_ratio_10` and the agreed estimator settings:
 
 | Manifest index | Model | K | Run suffix |
 | --- | --- | --- | --- |
@@ -141,13 +142,12 @@ use `noise_ratio_10` and the agreed estimator settings:
 | 149 | KMeans | 100 | `4b90d591` |
 | 158 | KMeans | 2000 | `2e55d444` |
 
-Proposed allocation per task: EPYC, account `lade`, QoS `normal`, one node/task,
-four CPUs, 16 GB RAM, 45 minutes, no GPU; array concurrency two. This measures
-resource use and checks real saved artifacts before planning the 740-run
-production sweep. Expected smoke outputs are under 100 MB, excluding temporary
-library caches. Existing result directories are rejected.
+Allocation per task: EPYC, account `lade`, QoS `normal`, one node/task, four
+CPUs, 16 GB RAM, 45 minutes, no GPU; array concurrency two. All six tasks
+completed with exit code zero. Outputs are under
+`outputs/experiments/id_est_exp/smoke_20261009_01`.
 
-From the repository root, after user approval:
+Executed submission from the repository root:
 
 ```bash
 sbatch --parsable --job-name=id-est-smoke \
@@ -163,8 +163,87 @@ sbatch --parsable --job-name=id-est-smoke \
   --device cpu --batch-size 1024
 ```
 
-Inspect every task's exit code, stderr, completion fingerprint, populations,
-estimator statuses, elapsed time, and peak memory. Preserve any failed task's
-outputs and diagnose it before proposing a retry. The production submission
-requires a separate exact plan and explicit authorization under the user's
-Orfeo instructions.
+| Model | K | Eligible train clusters | Eligible test clusters | Slurm elapsed | MaxRSS, KiB |
+| --- | --- | --- | --- | --- | --- |
+| MFA | 100 | 40 | 30 | 27 s | 809168 |
+| MFA | 2000 | 145 | 4 | 29 s | 1842724 |
+| HDDC, EM | 100 | 98 | 6 | 18 s | 680364 |
+| HDDC, EM | 2000 | 16 | 0 | 20 s | 1752644 |
+| KMeans | 100 | 100 | 13 | 16 s | 685332 |
+| KMeans | 2000 | 11 | 0 | 9 s | 757648 |
+
+Follow-up job `1747881`, dependent on `afterok:1747872`, ran
+`scripts/slurm/temporary/sbatch_check_cluster_id_smoke.sh` with one CPU, 4 GB,
+and ten minutes on EPYC (`lade`, `normal`, no GPU). It verified completion and
+source fingerprints, train/validation/test populations, test assignment counts,
+the 500-point threshold, every ID and GRIDE scale, and CSV row alignment. It
+also exercised aggregation on the six selected runs. All checks passed; every
+run retained 270,000 training points, excluded 30,000 validation points, and
+assigned 30,000 independent test points. Both estimators succeeded for all
+410 eligible training and 53 eligible test clusters, without estimator warnings.
+
+At K=2000 the selected HDDC and KMeans test populations have no cluster with
+500 points. Their test rows correctly retain populations and undefined IDs.
+The smoke outputs and combined tables occupy about 12.2 MB. Machine-readable
+checks and eligibility counts are in `smoke_checks.json` and `summary/runs.csv`.
+
+## Proposed production submission (not authorized or submitted)
+
+Evaluate all 740 manifest entries, including all noise conditions, five K
+values, and every saved model/configuration variant. Use the same numerical
+runner, estimator settings, CPU assignment implementation, batch size 1024,
+and installed `.venv` as the successful smoke tests. The numerical runner is
+unchanged from `44604bd`; the subsequent documentation and smoke-check changes
+are committed on `id_est_exp` before requesting production approval.
+
+Inputs are the immutable recorded paths in
+`outputs/experiments/id_est_exp/validation_20261009_02/manifest.json`, rooted at
+the agreed scratch results and `assets/` datasets. The proposed new output root
+is `/orfeo/cephfs/scratch/dssc/malessi/decomposing-activations-local-geometry/outputs/experiments/id_est_exp/full_20261009_01`.
+Existing per-run output directories are rejected, and the source artifacts
+remain read-only.
+
+| Stage | Allocation | Mapping and dependency |
+| --- | --- | --- |
+| ID estimates | EPYC, `lade`, `normal`, one node/task, 4 CPUs, 8 GB, 15 minutes, no GPU | Array `0-739%8`; no upstream dependency |
+| Aggregate | EPYC, `lade`, `normal`, one node/task, 1 CPU, 4 GB, 15 minutes, no GPU | One job, `afterok` on the entire ID array; cancel on invalid dependency |
+
+The six observed task times project to roughly 15–45 minutes for the array at
+concurrency eight, excluding queueing and aggregation. Allow roughly one hour
+and under 2 GB of output as planning estimates. Other noise conditions and
+model variants were not timed; the per-task limits provide headroom. Slurm
+memory measurements are sampled; 8 GB exceeds the largest observed 1.8 GiB.
+
+Exact commands, to run from the repository root only after explicit approval:
+
+```bash
+ID_EXP_MANIFEST="$PWD/outputs/experiments/id_est_exp/validation_20261009_02/manifest.json"
+ID_EXP_OUTPUT="$PWD/outputs/experiments/id_est_exp/full_20261009_01"
+ID_EXP_ARRAY_JOB=$(sbatch --parsable --job-name=id-est-full \
+  --partition=EPYC --account=lade --qos=normal \
+  --nodes=1 --ntasks=1 --cpus-per-task=4 --mem=8G --time=00:15:00 \
+  --array=0-739%8 \
+  --output=logs/jobs/id_est_full_%A_%a.out \
+  --error=logs/jobs/id_est_full_%A_%a.err \
+  --export=ALL,ID_EXP_PYTHON="$PWD/.venv/bin/python" \
+  scripts/slurm/temporary/sbatch_cluster_id_experiment.sh run \
+  --manifest "$ID_EXP_MANIFEST" --output-root "$ID_EXP_OUTPUT" \
+  --device cpu --batch-size 1024)
+printf 'ID array: %s\n' "$ID_EXP_ARRAY_JOB"
+sbatch --parsable --job-name=id-est-aggregate \
+  --partition=EPYC --account=lade --qos=normal \
+  --nodes=1 --ntasks=1 --cpus-per-task=1 --mem=4G --time=00:15:00 \
+  --dependency="afterok:$ID_EXP_ARRAY_JOB" --kill-on-invalid-dep=yes \
+  --output=logs/jobs/id_est_aggregate_%j.out \
+  --error=logs/jobs/id_est_aggregate_%j.err \
+  --export=ALL,ID_EXP_PYTHON="$PWD/.venv/bin/python" \
+  scripts/slurm/temporary/sbatch_cluster_id_experiment.sh aggregate \
+  --manifest "$ID_EXP_MANIFEST" --output-root "$ID_EXP_OUTPUT"
+```
+
+Record both job IDs and the current source commit. Monitor the exact array and
+dependent job through `squeue`/`sacct` and their stdout/stderr logs. Validate
+completion fingerprints, all 740 runs, and combined train/test totals before
+reporting completion. Preserve successful and failed outputs; diagnose failed
+indices and propose a bounded retry without overwriting them. The production
+submission requires explicit authorization under the user's Orfeo instructions.
