@@ -1,6 +1,6 @@
 # Per-cluster intrinsic dimension across the toy noise sweep
 
-> **Kind:** Experimental workflow · **Status:** Smoke tests passed; production pending · **Use when:**
+> **Kind:** Experimental workflow · **Status:** Complete and validated · **Use when:**
 > Computing separate training/test 2NN and GRIDE estimates for saved toy-noise
 > model runs. **Related:** [Toy datasets](../reference/toy-manifold-dataset.md),
 > [held-out populations](../evaluation/heldout-distribution-coverage.md), and
@@ -97,8 +97,8 @@ are not rewritten.
 ## Validation status
 
 The user selected the repository's Python 3.12 `.venv` and authorized adding
-DADApy there. Installation and validation run only through Slurm. The full
-experiment has not been submitted.
+DADApy there. Installation, validation, and the full experiment ran through
+Slurm. Production execution details are recorded below.
 
 Validation job `1747862` failed before installation because pip's home-directory
 cache exceeded the user's quota. Retry `1747864` uses scratch for its cache and
@@ -187,18 +187,18 @@ At K=2000 the selected HDDC and KMeans test populations have no cluster with
 The smoke outputs and combined tables occupy about 12.2 MB. Machine-readable
 checks and eligibility counts are in `smoke_checks.json` and `summary/runs.csv`.
 
-## Proposed production submission (not authorized or submitted)
+## Completed production submission
 
-Evaluate all 740 manifest entries, including all noise conditions, five K
-values, and every saved model/configuration variant. Use the same numerical
-runner, estimator settings, CPU assignment implementation, batch size 1024,
-and installed `.venv` as the successful smoke tests. The numerical runner is
-unchanged from `44604bd`; the subsequent documentation and smoke-check changes
-are committed on `id_est_exp` before requesting production approval.
+The user approved all 740 manifest entries, including all noise conditions,
+five K values, and every saved model/configuration variant. Array `1748327`
+and dependent aggregation job `1748336` ran from clean commit `bc12432` on
+`id_est_exp`. They used the same numerical runner, estimator settings, CPU
+assignment implementation, batch size 1024, and installed `.venv` as the
+successful smoke tests. The numerical runner is unchanged from `44604bd`.
 
 Inputs are the immutable recorded paths in
 `outputs/experiments/id_est_exp/validation_20261009_02/manifest.json`, rooted at
-the agreed scratch results and `assets/` datasets. The proposed new output root
+the agreed scratch results and `assets/` datasets. The output root
 is `/orfeo/cephfs/scratch/dssc/malessi/decomposing-activations-local-geometry/outputs/experiments/id_est_exp/full_20261009_01`.
 Existing per-run output directories are rejected, and the source artifacts
 remain read-only.
@@ -208,13 +208,13 @@ remain read-only.
 | ID estimates | EPYC, `lade`, `normal`, one node/task, 4 CPUs, 8 GB, 15 minutes, no GPU | Array `0-739%8`; no upstream dependency |
 | Aggregate | EPYC, `lade`, `normal`, one node/task, 1 CPU, 4 GB, 15 minutes, no GPU | One job, `afterok` on the entire ID array; cancel on invalid dependency |
 
-The six observed task times project to roughly 15–45 minutes for the array at
-concurrency eight, excluding queueing and aggregation. Allow roughly one hour
-and under 2 GB of output as planning estimates. Other noise conditions and
-model variants were not timed; the per-task limits provide headroom. Slurm
-memory measurements are sampled; 8 GB exceeds the largest observed 1.8 GiB.
+Every array task and aggregation completed with exit code zero. The array ran
+from 13:04:54 to 13:40:01 on 2026-10-09 (Europe/Rome), about 35 minutes;
+aggregation took another 35 seconds. Individual tasks took 9–226 seconds
+(mean 22.7 seconds). The largest recorded batch MaxRSS was 1,825,304 KiB,
+under 1.8 GiB. Slurm memory measurements are sampled.
 
-Exact commands, to run from the repository root only after explicit approval:
+Executed commands from the repository root after explicit approval:
 
 ```bash
 ID_EXP_MANIFEST="$PWD/outputs/experiments/id_est_exp/validation_20261009_02/manifest.json"
@@ -241,9 +241,34 @@ sbatch --parsable --job-name=id-est-aggregate \
   --manifest "$ID_EXP_MANIFEST" --output-root "$ID_EXP_OUTPUT"
 ```
 
-Record both job IDs and the current source commit. Monitor the exact array and
-dependent job through `squeue`/`sacct` and their stdout/stderr logs. Validate
-completion fingerprints, all 740 runs, and combined train/test totals before
-reporting completion. Preserve successful and failed outputs; diagnose failed
-indices and propose a bounded retry without overwriting them. The production
-submission requires explicit authorization under the user's Orfeo instructions.
+The output root contains `submission.json`, `slurm_tasks.psv`, and
+`slurm_accounting.psv`. These record the source, environment path, exact array
+mapping and resources, job IDs, dependency, times, and final task states.
+
+Final validation job `1749225` ran
+`scripts/slurm/temporary/sbatch_check_cluster_id_full.sh` on EPYC (`lade`,
+`normal`, one node/task, one CPU, 4 GB, 15 minutes, no GPU). It verifies source
+and result fingerprints, train/test populations, saved test assignments, every
+per-run and aggregated CSV field, eligibility counts, and estimator statuses.
+It also reported estimator warnings and unexpected stderr lines without
+recomputing the scientific estimates. All checks passed. The report is
+`final_checks.json`; the combined tables are `summary/clusters.csv` (335 MiB)
+and `summary/runs.csv` (1,480 run/split rows). Total output size is about 1.25 GB.
+
+Every condition has 185 completed model runs: noiseless, noise ratio 1000,
+noise ratio 100, and noise ratio 10. The combined cluster table contains
+1,139,600 rows, retaining every component ID for both splits.
+
+| Split | Cluster rows | At least 500 points | Valid 2NN and GRIDE | Undefined: zero nearest-neighbour distance | Below 500 points |
+| --- | --- | --- | --- | --- | --- |
+| Train | 569800 | 98029 | 97848 | 181 | 471771 |
+| Test | 569800 | 3637 | 3637 | 0 | 566163 |
+
+All valid GRIDE outputs retain the six neighbour ranks 2, 4, 8, 16, 32, 64.
+The 181 undefined training estimates retain their populations and the status
+`zero_neighbour_distance`; no points were removed or perturbed. DADApy emitted
+its small-distance warning for 1,421 cluster/split records. The library warns
+at distances up to `1.01 * float32 epsilon`, so a warning alone does not mean an
+exact zero was computed. Warning text is preserved in the result records;
+all other eligible estimates were finite. No unexpected stderr issues were
+found.
