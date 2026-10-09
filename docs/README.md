@@ -75,6 +75,9 @@ scope.
 - [Toy held-out coverage](experiments/toy-heldout-coverage.md) defines the
   strict D=128 noiseless pilot and its fixed train/validation/test artifacts,
   with paired noisy spheres retained as a low-dimensional visual control.
+- [Per-cluster intrinsic dimension](experiments/cluster-id-estimation.md)
+  records the separate training/test 2NN and GRIDE experiment across all saved
+  toy-noise model runs, with a 500-point minimum per split's cluster.
 
 ## Document roles
 
