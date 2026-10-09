@@ -272,3 +272,49 @@ at distances up to `1.01 * float32 epsilon`, so a warning alone does not mean an
 exact zero was computed. Warning text is preserved in the result records;
 all other eligible estimates were finite. No unexpected stderr issues were
 found.
+
+## Notebook: mean estimated ID across noise levels
+
+[toy_manifold_noise_sweep_intrinsic_dimension.ipynb](../../notebooks/toy_manifold_noise_sweep_intrinsic_dimension.ipynb)
+reproduces the original noise-sweep notebook's summary table and per-manifold
+heatmap using the saved ID estimates. Its initial selection matches the original:
+K=2000, threshold 0.05, KMeans, HDDC Adam, and HDDC EM with shared noise variance,
+across all four noise conditions. Other completed configurations can be selected;
+EM with component-specific noise variance has the separate key `em_bk`.
+
+Training and independent test appear separately. There is one figure for 2NN
+and one for each of the six GRIDE neighbour-rank pairs. The temporary helper
+`scripts/temporary/plot_cluster_id_experiment.py` reuses
+`_associate_component_means` with the original saved distance cutoff. It projects
+only centres eligible in at least one split; no model or ID estimator is refit.
+Original per-manifold metrics supply the total associated-component counts.
+
+Within a manifold, means give equal weight to valid clusters with at least 500
+points in that split. Summary tables give equal weight to each manifold with
+an available mean, and display both contributing manifold and cluster counts.
+Missing estimates are undefined, not zero. These populations differ from the
+original learned-rank population and can differ between training and test.
+Heatmaps print the actual mean ID and its cluster count; colour is the absolute
+distance between that mean and the planted noiseless intrinsic dimension, using
+the original power scale capped at five. This is a reference comparison, not a
+claim that noisy data have that dimension at every neighbourhood scale.
+
+Run the notebook in Slurm using
+`scripts/slurm/temporary/sbatch_plot_cluster_id_experiment.sh OUTPUT_DIRECTORY`,
+with resources supplied to `sbatch`. The launcher uses the repository `.venv`
+and needs `nbclient` and `nbformat`; installation is opt-in via
+`ID_PLOT_INSTALL_NOTEBOOK_TOOLS=1`. It runs four focused aggregation checks and
+saves an executed notebook, two summary-table images, seven train/test figures
+in PNG/PDF, numerical CSVs, source fingerprints, source snapshots, and environment
+package lists. It rejects an existing output directory. The notebook's original
+source remains in the repository branch; generated outputs stay under `outputs/`.
+
+Approved plotting job `1749233` completed with exit code zero in 2 minutes
+16 seconds, with batch MaxRSS 932,228 KiB. It used EPYC, account `lade`, QoS
+`normal`, one node/task, one CPU, 4 GB RAM, a 30-minute limit, and no GPU.
+All four checks passed and all notebook code cells executed successfully.
+Outputs are under `outputs/experiments/id_est_exp/figures_20261009_01`: 12
+selected runs, 240 manifold/split rows, two summary tables, and seven paired
+train/test figures. Visual inspection confirmed labels and annotations are
+readable. `nbclient` 0.11.0 and `nbformat` 5.11.1 were added with their schema
+dependencies; no previously installed package version changed.
