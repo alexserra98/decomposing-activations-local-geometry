@@ -64,6 +64,7 @@ resources:
   ntasks_per_node: 1
   cpus_per_task: 8
   gpus: 1
+  max_parallel: 1
   gpu_type: H100
   memory: 80G
   time: "10:00:00"

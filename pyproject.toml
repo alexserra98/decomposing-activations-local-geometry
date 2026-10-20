@@ -25,12 +25,15 @@ dependencies = [
     "scikit-learn-extra>=0.3.0",
     "scipy>=1.17.1",
     "streamlit>=1.45.0",
+    "torch>=2.6",
+    "transformers>=5.9.0,<6",
     "umap-learn>=0.5.12",
     "wandb>=0.17",
 ]
 
 [project.scripts]
 dalg-run-extraction = "dalg.cli.run_extraction:main"
+dalg-run-prompt-extraction = "dalg.cli.run_prompt_extraction:main"
 dalg-run-metrics = "dalg.cli.run_metrics:main"
 dalg-aggregate-metrics = "dalg.analysis.aggregate_metrics:main"
 dalg-run-training = "dalg.cli.run_training:main"

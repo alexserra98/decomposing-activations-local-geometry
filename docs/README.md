@@ -28,6 +28,9 @@ relevant to it.
   activation-compatible shard format.
 - [Recreating Pile activations](workflows/recreate-pile-activations.md) covers
   rebuilding token windows and Gemma-2B activation shards on a new cluster.
+- [Prompt activation extraction](reference/prompt-activations.md) defines
+  selected-token extraction, original prompt/label provenance, and resumable
+  layer shards for Llama-family models.
 
 ## I want to run or inspect training
 
