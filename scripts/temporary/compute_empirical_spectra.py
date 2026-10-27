@@ -1,4 +1,4 @@
-r"""Export full soft empirical covariance spectra for a saved toy MFA/HDDC run.
+r"""Export full empirical covariance spectra for a saved MFA/HDDC or KMeans run.
 
 Example (from the repository root)::
 
@@ -23,6 +23,7 @@ from dalg.data.shard_activations import ActivationBatchDataset, load_meta_index,
 from dalg.data.subset_spec import resolve_spec_positions, split_shard_dir_spec
 from dalg.models.adaptive_q.mfa_hddc import load_mfa_hddc
 from dalg.models.mfa import load_mfa
+from dalg.models.kmeans import load_kmeans
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -38,16 +39,19 @@ def export_spectra(checkpoint, output, *, config=None, device="cpu", batch_size=
     config = Path(config).expanduser() if config is not None else checkpoint.parent / "config.json"
     config = config.resolve(strict=True)
     cfg = json.loads(config.read_text())
-    model_kind = {"MFA": "mfa", "MFA_HDDC": "hddc"}.get(cfg.get("model", "MFA"))
+    model_kind = ("kmeans" if cfg.get("method") == "kmeans" else
+                  {"MFA": "mfa", "MFA_HDDC": "hddc"}.get(cfg.get("model", "MFA")))
     if model_kind is None:
-        raise ValueError("Only vanilla MFA and HDDC run configurations are supported")
+        raise ValueError("Only vanilla MFA, HDDC, and KMeans run configurations are supported")
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     if not isinstance(payload, dict) or "state_dict" not in payload or "meta" not in payload:
         raise ValueError("Expected a saved model export, not an optimizer/resume checkpoint")
-    if "ard" in payload["meta"] or ("rank_mask" in payload["state_dict"]) != (model_kind == "hddc"):
-        raise ValueError("Checkpoint model family does not match the MFA/HDDC configuration")
+    is_kmeans = payload["meta"].get("model_type") == "kmeans"
+    if (is_kmeans != (model_kind == "kmeans") or "ard" in payload["meta"] or
+            ("rank_mask" in payload["state_dict"]) != (model_kind == "hddc")):
+        raise ValueError("Checkpoint model family does not match the run configuration")
     del payload
-    load_model = load_mfa_hddc if model_kind == "hddc" else load_mfa
+    load_model = {"hddc": load_mfa_hddc, "mfa": load_mfa, "kmeans": load_kmeans}[model_kind]
     model = load_model(checkpoint, map_location="cpu")
     if (model.K, model.D, model.q) != (cfg["K"], cfg["d_model"], cfg["rank"]):
         raise ValueError("Checkpoint dimensions do not match the saved configuration")
@@ -94,7 +98,8 @@ def export_spectra(checkpoint, output, *, config=None, device="cpu", batch_size=
             "val_frac": val_frac, "split_seed": split_seed, "n_train_windows": len(train_positions),
         },
         "computation": {
-            "memberships": "soft", "dtype": "float64", "device": str(device),
+            "memberships": "hard" if model_kind == "kmeans" else "soft",
+            "dtype": "float64", "device": str(device),
             "batch_size": batch_size, "eig_batch_size": eig_batch_size,
             "normalization": "sum of responsibilities (ML)",
             "centering": "responsibility-weighted empirical mean",
@@ -111,7 +116,7 @@ def export_spectra(checkpoint, output, *, config=None, device="cpu", batch_size=
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--checkpoint", required=True, type=Path, help="Saved mfa_model.pt export")
+    parser.add_argument("--checkpoint", required=True, type=Path, help="Saved mfa_model.pt or kmeans_model.pt export")
     parser.add_argument("--output", required=True, type=Path, help="New spectra .pt file; never overwritten")
     parser.add_argument("--config", type=Path, help="Run config.json (default: beside checkpoint)")
     parser.add_argument("--device", default="cpu", help="cpu or cuda[:index]")

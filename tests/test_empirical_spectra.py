@@ -15,6 +15,7 @@ from dalg.analysis.empirical_spectra import compute_empirical_spectra, _spectra_
 from dalg.data.shard_activations import stratified_split
 from dalg.models.mfa import MFA, save_mfa
 from dalg.models.adaptive_q.mfa_hddc import MFA_HDDC, save_mfa_hddc
+from dalg.models.kmeans import KMeans, save_kmeans
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/temporary/compute_empirical_spectra.py"
@@ -180,3 +181,41 @@ def test_resume_checkpoint_rejected(run_files):
     with pytest.raises(ValueError, match="model export"):
         export_spectra(checkpoint, path / "spectra.pt")
     assert not (path / "spectra.pt").exists()
+
+
+def test_kmeans_empirical_centering_sparse_clusters_and_batch_sizes():
+    # Saved centroids deliberately differ from empirical cluster means.
+    model = KMeans.from_centroids(torch.tensor([[0., 0.], [10., 10.], [30., 30.]], dtype=torch.float64))
+    x = torch.tensor([[1., 0.], [2., 1.], [3., 2.], [11., 10.]], dtype=torch.float64)
+    expected_covariance = (x[:3] - x[:3].mean(0)).T @ (x[:3] - x[:3].mean(0)) / 3
+    for batch_size in [1, 4]:
+        result = compute_empirical_spectra(model, x.split(batch_size), eig_batch_size=1)
+        torch.testing.assert_close(result["eigenvalues"][0], torch.linalg.eigvalsh(expected_covariance).flip(0))
+        torch.testing.assert_close(result["empirical_means"][:2], torch.stack([x[:3].mean(0), x[3]]))
+        assert result["effective_counts"].tolist() == [3, 1, 0]
+        assert result["valid"].tolist() == [True, True, False]
+        assert result["eigenvalues"][1].eq(0).all()
+        assert result["eigenvalues"][2].isnan().all()
+        assert result["n_activations"] == len(x)
+
+
+def test_kmeans_export_training_split_and_provenance(run_files):
+    path, config, cfg, train = run_files
+    model = KMeans.from_centroids(torch.tensor([[-1., 0., 0., 0.], [1., 0., 0., 0.]]))
+    cfg.update(method="kmeans", rank=0)
+    config.write_text(json.dumps(cfg))
+    checkpoint = path / "kmeans_model.pt"
+    save_kmeans(model, checkpoint)
+    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    result = export_spectra(checkpoint, path / "spectra.pt", batch_size=3, eig_batch_size=1)
+    labels = torch.cdist(train.double(), model.mu.double()).argmin(1)
+    for k in range(2):
+        members = train[labels == k].double()
+        centered = members - members.mean(0)
+        expected = torch.linalg.eigvalsh(centered.T @ centered / len(members)).flip(0).clamp_min(0)
+        torch.testing.assert_close(result["eigenvalues"][k], expected)
+        torch.testing.assert_close(result["empirical_means"][k], members.mean(0))
+    assert result["n_activations"] == len(train)
+    assert result["source"]["model_kind"] == "kmeans"
+    assert result["computation"]["memberships"] == "hard"
+    assert hashlib.sha256(checkpoint.read_bytes()).hexdigest() == digest

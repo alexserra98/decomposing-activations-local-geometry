@@ -1,0 +1,52 @@
+# Training only, on original 4096-dimensional last-token activations.
+# Layers are zero-based decoder-block indices. Each file resolves to 72 runs.
+# Large-K runs require the covariance/PCA memory issue to be resolved before submission.
+experiment:
+  name: sae_manifold_temperature_02d_years_neutral_kmeans_pca
+  output_root: dalg-cache/sae_manifold_models_temperature_years
+
+dataset:
+  id: temperature_02d_years_neutral
+  shard_dir: dalg-cache/sae_manifold_temperature_02d_years_neutral_llama31_8b_last
+  layer: 4
+
+model:
+  kind: kmeans
+  K: 50
+  surgery_threshold: 0.00025
+
+training:
+  max_iter: 100
+  restarts: 10
+  tol: 0.000001
+  pca_chunk_elems: 8388608
+  pca_eig_batch_size: 1
+  training_mode: single_process
+  drop_prefix: 0
+  val_frac: 0.1
+  split_seed: 42
+  seed: 42
+  device: cuda
+
+assignments:
+  enabled: false
+
+evaluation:
+  enabled: false
+
+resources:
+  partition: H100
+  account: LADE
+  nodes: 1
+  ntasks_per_node: 1
+  cpus_per_task: 8
+  gpus: 1
+  gpu_type: H100
+  memory: 80G
+  time: "23:00:00"
+  max_parallel: 1
+
+sweep:
+  dataset.layer: [4, 28]
+  model.K: [50, 100, 200, 400]
+  model.surgery_threshold: [0.00025, 0.005, 0.01, 0.05, 0.1, 0.15, 0.2, 0.5, 1.0]

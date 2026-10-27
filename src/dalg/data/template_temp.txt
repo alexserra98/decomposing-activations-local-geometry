@@ -1,0 +1,12 @@
+TEMPERATURE_TEMPLATES = (
+    "The temperature in degrees Fahrenheit is {temperature}",
+    "According to this record, the temperature in degrees Fahrenheit is {temperature}",
+    "For this entry, the temperature in degrees Fahrenheit is {temperature}",
+    "In this account, the temperature in degrees Fahrenheit is {temperature}",
+    "As noted here, the temperature in degrees Fahrenheit is {temperature}",
+    "The thermometer indicates that the temperature in degrees Fahrenheit is {temperature}",
+    "As recorded here, the temperature in degrees Fahrenheit is {temperature}",
+    "According to this entry, the temperature in degrees Fahrenheit is {temperature}",
+    "In this record, the temperature in degrees Fahrenheit is {temperature}",
+    "For the record, the temperature in degrees Fahrenheit is {temperature}",
+)

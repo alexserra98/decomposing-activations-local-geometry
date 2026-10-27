@@ -1,6 +1,7 @@
 """Build the prompt datasets from "Do Sparse Autoencoders Capture Concept Manifolds?".
 
-The eight build_* functions preserve Goodfire's prompt-generation logic.
+The build_* functions adapt Goodfire's prompt-generation logic.
+The years dataset uses 20 neutral templates for each year from 1000 through 2000.
 WikiText uses its canonical Salesforce/wikitext ID for Hugging Face compatibility.
 Upstream data.py:
 https://github.com/goodfire-ai/sae-manifold/blob/f2632ddbb25f4c670254ceea999058b9ba4b0450/data.py
@@ -80,10 +81,14 @@ def build_age():
 
 
 def build_temperature():
+    """Append .01–.99 to each integer temperature, retaining integer prompts."""
     prompts, labels = [], []
-    for f in range(-30, 120):
-        prompts.append(f"Today it's {f} degrees Fahrenheit outside")
-        labels.append(dict(fahrenheit=float(f), celsius=(f - 32) * 5 / 9))
+    for whole in range(-30, 120):
+        for fraction in range(100):
+            value = str(whole) if fraction == 0 else f"{whole}.{fraction:02d}"
+            f = float(value)
+            prompts.append(f"Today it's {value} degrees Fahrenheit outside")
+            labels.append(dict(fahrenheit=f, celsius=(f - 32) * 5 / 9))
     return prompts, labels
 
 
@@ -127,16 +132,42 @@ def build_days():
     return prompts, labels
 
 
+YEAR_TEMPLATES = (
+    "The year is {year}",
+    "According to this record, the year is {year}",
+    "For this entry, the year is {year}",
+    "In this account, the year is {year}",
+    "As noted here, the year is {year}",
+    "The calendar indicates that the year is {year}",
+    "As recorded here, the year is {year}",
+    "According to this entry, the year is {year}",
+    "In this record, the year is {year}",
+    "For the record, the year is {year}",
+    "As indicated here, the year is {year}",
+    "As stated in this entry, the year is {year}",
+    "The record indicates that the year is {year}",
+    "The entry indicates that the year is {year}",
+    "The notation indicates that the year is {year}",
+    "For this record, the year is {year}",
+    "According to the calendar, the year is {year}",
+    "In the calendar shown here, the year is {year}",
+    "As specified in this record, the year is {year}",
+    "Based on this entry, the year is {year}",
+)
+
+
 def build_years():
-    """Years 1800-1999 — helical manifold (linear century + periodic decade)."""
+    """Years 1000–2000 inclusive crossed with neutral year-ending templates."""
     prompts, labels = [], []
-    for year in range(1800, 1999):
-        prompts.append(f"The date is {year}")
-        labels.append(dict(
-            year=float(year),
-            decade_digit=float(year % 10),
-            decade=float((year % 100) // 10),
-        ))
+    for year in range(1000, 2001):
+        for template_id, template in enumerate(YEAR_TEMPLATES):
+            prompts.append(template.format(year=year))
+            labels.append(dict(
+                year=float(year),
+                decade_digit=float(year % 10),
+                decade=float((year % 100) // 10),
+                template_id=template_id,
+            ))
     return prompts, labels
 
 
@@ -196,7 +227,7 @@ MANIFOLDS = dict(
     sent_length=build_sent_length,
 )
 
-# Selection settings describe the unchanged builders above, not CLI overrides.
+# Selection settings describe the builders above, not CLI overrides.
 SOURCE_SETTINGS = {
     "colors": {
         "dataset": "burkelibbey/colors", "config": None, "split": "train",
@@ -208,7 +239,11 @@ SOURCE_SETTINGS = {
     },
     "temperature": {
         "dataset": None, "config": None, "split": None,
-        "selection": {"fahrenheit_range": [-30, 120], "stop_exclusive": True},
+        "selection": {
+            "integer_part_range": [-30, 120], "stop_exclusive": True,
+            "fractional_suffix_range": [0, 100], "decimal_places": 2,
+            "retain_integer_prompts": True, "order": "integer_then_fractional_suffix",
+        },
     },
     "geography": {
         "dataset": "jamescalam/world-cities-geo", "config": None, "split": "train",
@@ -220,7 +255,11 @@ SOURCE_SETTINGS = {
     },
     "years": {
         "dataset": None, "config": None, "split": None,
-        "selection": {"year_range": [1800, 1999], "stop_exclusive": True},
+        "selection": {
+            "year_range": [1000, 2001], "stop_exclusive": True,
+            "granularity": "year", "order": "year_then_template",
+            "templates": YEAR_TEMPLATES,
+        },
     },
     "formality": {
         "dataset": "osyvokon/pavlick-formality-scores", "config": None, "split": "train",
@@ -290,8 +329,8 @@ def main() -> None:
         "row_fields": {
             "row_id": "Zero-based contiguous row index across all selected manifolds.",
             "subset": "Upstream manifold name.",
-            "prompt": "Exact prompt returned by the upstream builder.",
-            "labels": "Original manifold-specific label dictionary.",
+            "prompt": "Exact prompt returned by the builder.",
+            "labels": "Manifold-specific label dictionary.",
         },
     }
     args.out.mkdir(parents=True, exist_ok=True)

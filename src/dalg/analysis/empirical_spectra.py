@@ -1,10 +1,31 @@
-"""Full spectra of empirical covariances under frozen soft responsibilities."""
+"""Full empirical covariance spectra under frozen MFA or KMeans memberships."""
 
 from __future__ import annotations
 
 import torch
 
 from dalg.models.adaptive_q.hddc_surgery import accumulate_statistics
+from dalg.models.kmeans import KMeans
+
+
+@torch.no_grad()
+def _kmeans_statistics(model, loader, *, device):
+    """Accumulate hard-cluster moments about saved centroids for recentering."""
+    counts = torch.zeros(model.K, dtype=torch.float64, device=device)
+    residual_sum = torch.zeros_like(model.mu)
+    scatter = torch.zeros(model.K, model.D, model.D, dtype=torch.float64, device=device)
+    n_rows = 0
+    for x in loader:
+        labels = model.predict(x)
+        for k in labels.unique().tolist():
+            residual = x[labels == k] - model.mu[k]
+            counts[k] += len(residual)
+            residual_sum[k] += residual.sum(0)
+            scatter[k].addmm_(residual.T, residual)
+        n_rows += len(x)
+    if n_rows == 0:
+        raise ValueError("Empirical spectra require a non-empty activation stream")
+    return counts, residual_sum, scatter, n_rows
 
 
 def _spectra_from_statistics(mu, counts, residual_sum, scatter, *, eig_batch_size):
@@ -49,9 +70,10 @@ def _spectra_from_statistics(mu, counts, residual_sum, scatter, *, eig_batch_siz
 
 @torch.no_grad()
 def compute_empirical_spectra(model, loader, *, device="cpu", eig_batch_size=32):
-    """Stream full soft covariances; move and freeze the supplied model in float64.
+    """Stream covariances; move and freeze the supplied model in float64.
 
-    Uses O(K D^2) accumulator memory, intended for low-dimensional toy runs.
+    Uses O(K D^2) accumulator memory; batch eigensolves for large D.
+    MFA/HDDC uses soft posterior weights; KMeans uses hard nearest centroids.
     Covariances are centered on weighted empirical means and divided by total
     responsibility (ML normalization). Zero-mass components have NaN outputs.
     """
@@ -69,10 +91,13 @@ def compute_empirical_spectra(model, loader, *, device="cpu", eig_batch_size=32)
                 raise ValueError(f"Expected finite activation batches of shape (B, {model.D})")
             yield x.to(device=device, dtype=torch.float64)
 
-    with model.inference_cache():
-        counts, residual_sum, scatter, n_rows = accumulate_statistics(
-            model, batches(), device=device, hard_assignment_covariance=False,
-        )
+    if isinstance(model, KMeans):
+        counts, residual_sum, scatter, n_rows = _kmeans_statistics(model, batches(), device=device)
+    else:
+        with model.inference_cache():
+            counts, residual_sum, scatter, n_rows = accumulate_statistics(
+                model, batches(), device=device, hard_assignment_covariance=False,
+            )
     result = _spectra_from_statistics(
         model.mu.detach(), counts, residual_sum, scatter, eig_batch_size=eig_batch_size,
     )

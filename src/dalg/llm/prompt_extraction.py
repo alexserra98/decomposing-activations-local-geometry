@@ -1,4 +1,4 @@
-"""Extract original Llama block outputs at selected prompt tokens."""
+"""Extract last-token original Llama block outputs."""
 
 from __future__ import annotations
 
@@ -16,16 +16,14 @@ from dalg.data.prompt_activations import FORMAT, load_prompt_records
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 
 
-def select_token_positions(input_ids: list[int], selection: str = "last") -> list[int]:
-    """Select positions in a BOS-prefixed, unpadded model input."""
-    if selection != "last":
-        raise ValueError(f"Unsupported token selection: {selection}")
+def select_token_positions(input_ids: list[int]) -> list[int]:
+    """Select the last token in a BOS-prefixed, unpadded model input."""
     if len(input_ids) < 2:
         raise ValueError("A prompt must contain at least one token besides the added BOS")
     return [len(input_ids) - 1]
 
 
-def tokenize_prompt_records(records, tokenizer, *, max_length: int, selection="last"):
+def tokenize_prompt_records(records, tokenizer, *, max_length: int):
     """Preserve source records and attach the exact model inputs and token offsets."""
     if not tokenizer.is_fast or tokenizer.bos_token_id is None:
         raise ValueError("Extraction requires a fast tokenizer with a BOS token")
@@ -46,7 +44,7 @@ def tokenize_prompt_records(records, tokenizer, *, max_length: int, selection="l
             "tokenization": {
                 "input_ids": ids,
                 "offset_mapping": [None, *[list(span) for span in encoded["offset_mapping"]]],
-                "selected_positions": select_token_positions(ids, selection),
+                "selected_positions": select_token_positions(ids),
             },
         })
     return tokenized
@@ -54,7 +52,7 @@ def tokenize_prompt_records(records, tokenizer, *, max_length: int, selection="l
 
 @torch.inference_mode()
 def collect_prompt_activations(model, records, *, layers, pad_token_id, device, dtype):
-    """Return CPU tensors (selected tokens, d_model), retaining only selected positions.
+    """Return CPU tensors (prompts, d_model), selecting the last token on the model device.
 
     Each record carries its unpadded input_ids and selected_positions. Hooks are
     removed even if a forward pass fails. Right padding leaves real token
@@ -69,10 +67,12 @@ def collect_prompt_activations(model, records, *, layers, pad_token_id, device, 
     batch_indices, positions = [], []
     for i, record in enumerate(records):
         tokens = record["tokenization"]
+        if tokens["selected_positions"] != select_token_positions(tokens["input_ids"]):
+            raise ValueError("Selected positions must contain only the last prompt token")
         ids[i, :lengths[i]] = torch.tensor(tokens["input_ids"], device=device)
         mask[i, :lengths[i]] = 1
         positions.extend(tokens["selected_positions"])
-        batch_indices.extend([i] * len(tokens["selected_positions"]))
+        batch_indices.append(i)
     batch_indices = torch.tensor(batch_indices, device=device)
     positions = torch.tensor(positions, device=device)
     captured, handles = {}, []
@@ -132,7 +132,6 @@ def _target_metadata(records, tokenizer):
     rows = []
     for record in records:
         tokenization = record["tokenization"]
-        # V1 stores exactly one last-token activation for each source record.
         position, = tokenization["selected_positions"]
         token_id = tokenization["input_ids"][position]
         rows.append({
@@ -169,11 +168,11 @@ def _shard_complete(root, shard, layers, expected_meta, d_model, dtype):
 
 def run_prompt_extraction(
     *, dataset, out_dir, model_name="meta-llama/Llama-3.1-8B", revision=None,
-    layers=None, token_selection="last", dtype="bfloat16", device="cuda",
+    layers=None, dtype="bfloat16", device="cuda",
     batch_size=8, shard_size=512, max_length=None,
     cache_dir="dalg-cache/huggingface/hub", preview=False,
 ):
-    """Write resumable selected-token shards and a self-contained source snapshot.
+    """Write resumable prompt representation shards and a source snapshot.
 
     Model/tokenizer loading supports a Hugging Face repository or a local Llama
     checkpoint. A finished run can be resumed without loading the model weights.
@@ -216,20 +215,21 @@ def run_prompt_extraction(
     layers = list(range(model_config.num_hidden_layers)) if layers is None else sorted(set(layers))
     if not layers or layers[0] < 0 or layers[-1] >= model_config.num_hidden_layers:
         raise ValueError("Requested layers are outside the model's decoder blocks")
-    records = tokenize_prompt_records(records, tokenizer, max_length=max_length, selection=token_selection)
-    targets = _target_metadata(records, tokenizer) # metadata of each token (source_row_id, subset, ...)
+    records = tokenize_prompt_records(records, tokenizer, max_length=max_length)
+    targets = _target_metadata(records, tokenizer)
     # copy of the original records for reproducibility
     snapshots = "".join(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n" for row in records)
     d_model = model_config.hidden_size
     num_shards = math.ceil(len(records) / shard_size)
     config = {
-        "format": FORMAT, "model": model_name, "model_revision": resolved_revision,
+        "format": FORMAT,
+        "model": model_name, "model_revision": resolved_revision,
         "local_checkpoint_sha256": _local_checkpoint_hash(model_name) if local_model else None,
         "tokenizer_revision": resolved_revision,
         "tokenizer_sha256": hashlib.sha256(tokenizer.backend_tokenizer.to_str().encode()).hexdigest(),
         "mode": "residual", "representation": "decoder_block_output_before_final_norm",
         "layers": layers, "d_model": d_model, "window": 1, "drop_prefix": 0, "dtype": dtype,
-        "token_selection": token_selection, "prepend_bos": True, "append_eos": False,
+        "token_selection": "last", "prepend_bos": True, "append_eos": False,
         "chat_template": None, "padding_side": "right", "pad_token_id": pad_token_id,
         "bos_token_id": tokenizer.bos_token_id, "max_length": max_length, "truncation": False,
         "dataset": str(source_path.resolve()), "dataset_sha256": _sha256(source_path),

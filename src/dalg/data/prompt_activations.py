@@ -1,4 +1,4 @@
-"""Prompt records and provenance lookup for selected-token activation shards."""
+"""Prompt records and provenance lookup for last-token shards."""
 
 from __future__ import annotations
 
@@ -55,6 +55,8 @@ def load_prompt_activation_index(activation_dir: str | Path, layer: int) -> list
     config = json.loads((root / "config.json").read_text())
     if config.get("format") != FORMAT:
         raise ValueError(f"{root} is not a prompt activation dataset")
+    if config["token_selection"] != "last":
+        raise ValueError("Token selection does not match the prompt activation format")
     if layer not in config["layers"]:
         raise ValueError(f"Layer {layer} was not extracted")
     progress = json.loads((root / "progress.json").read_text())
@@ -72,14 +74,17 @@ def load_prompt_activation_index(activation_dir: str | Path, layer: int) -> list
         target = shard_metadata[shard][coordinate["row_in_shard"]]
         source = sources[target["source_row_id"]]
         ids = source["tokenization"]["input_ids"]
-        if ids[target["token_index"]] != target["token_id"]:
+        positions = source["tokenization"]["selected_positions"]
+        valid = (positions == [len(ids) - 1] and target["token_index"] == positions[0]
+                 and ids[target["token_index"]] == target["token_id"])
+        if not valid:
             raise ValueError(f"Token provenance mismatch at row {coordinate['global_row']}")
         index.append({
             **coordinate, **target,
             "layer": layer, "token_slot": 0,
             "activation_path": str(root / f"layer{layer:02d}" / f"shard_{shard:05d}.pt"),
             "prompt": source["prompt"], "labels": source["labels"],
-            "input_ids": ids,
+            "input_ids": ids, "selected_positions": positions,
         })
     if len(index) != config["num_rows"]:
         raise ValueError("Activation index does not cover the configured number of rows")

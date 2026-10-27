@@ -1,12 +1,12 @@
 # Prompt activation extraction
 
-> **Kind:** Reference · **Status:** Current · **Use when:** Extracting selected
-> prompt-token representations or recovering their original text and labels.
+> **Kind:** Reference · **Status:** Current · **Use when:** Extracting
+> last-token prompt representations, or recovering their text and labels.
 
 `dalg-run-prompt-extraction` reads the JSONL prompt schema produced by
-`dalg.data.build_sae_manifold_prompts`. It saves one activation row per selected
-prompt token using the existing layer-shard format. V1 selects the last token
-and supports native Hugging Face Llama-family models, including Llama-3.1-8B.
+`dalg.data.build_sae_manifold_prompts`. It saves one activation row per prompt,
+using the last token. It supports native Hugging Face Llama-family models,
+including Llama-3.1-8B.
 
 ## Run
 
@@ -22,6 +22,12 @@ PYTHONPATH=src .venv/bin/python -m dalg.cli.run_prompt_extraction \
 ```
 
 The installed `dalg-run-prompt-extraction` command accepts the same arguments.
+The pinned-revision Slurm launcher uses the same last-token representation:
+
+```bash
+sbatch scripts/slurm/temporary/sbatch_extract_sae_manifold_llama31.sh
+```
+
 Add `--preview` to print input lengths and a selected-token example for each
 subset without loading model weights or writing extraction outputs. It still
 needs the model configuration and tokenizer. Hugging Face downloads go to
@@ -55,7 +61,8 @@ Each layer tensor contains the residual stream after its complete decoder
 block, before the model's final normalization. For Llama-3.1-8B these are blocks
 0–31, each with 4096 features. Embeddings and final-normalization outputs are
 not saved. Inference uses unmodified model weights, evaluation mode, no
-gradients, and no KV cache. Hooks copy only selected positions to CPU.
+gradients, and no KV cache. Hooks select the last token on the model device
+and copy only one vector per prompt to CPU.
 
 ## Output contract
 
@@ -78,10 +85,13 @@ gradients, and no KV cache. Hooks copy only selected positions to CPU.
 - `config.json`: `format=dalg_prompt_activations_v1`, `window=1`,
   `drop_prefix=0`, selected layers, model/tokenizer identity, input and snapshot
   fingerprints, tokenization policy, shard sizes, and library versions.
+  `token_selection` is always `last`; existing configs and snapshots retain
+  their format.
 - `source/records.jsonl`: each original record once, extended with
   `tokenization.input_ids`, `offset_mapping`, and `selected_positions`.
   Input IDs include BOS and exclude batch padding. The BOS offset is null;
   other offsets are the tokenizer's character spans in the original text.
+  `selected_positions` contains only the final prompt-token position.
 - Shard metadata follows the existing `start`, `end`, `row_indices`, `rows`
   structure. Each row records `source_row_id`, `subset`, `token_index`,
   `token_id`, `token_piece`, `decoded_token`, and `char_span`.
@@ -121,6 +131,14 @@ The existing window-based context-labeling workflow assumes original token
 positions equal stored window positions; use this lookup for prompt contexts
 until that workflow has an explicit prompt-data adapter. Future multi-token
 selection must also group train/validation splits by source prompt.
+
+## PCA inspection
+
+[`notebooks/prompt_activations_pca_parallel.ipynb`](../../notebooks/prompt_activations_pca_parallel.ipynb)
+loads the completed last-token extraction. Select a subset and run all cells.
+Each layer gets an independent three-component PCA of the selected subset,
+centered without standardization or whitening. Hover text identifies the
+selected token. The PCA bases are not aligned between layers.
 
 ## Resume and validation
 

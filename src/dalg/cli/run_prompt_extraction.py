@@ -1,4 +1,4 @@
-"""Extract selected prompt-token activations with complete source provenance."""
+"""Extract last-token prompt activations with source provenance."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default="meta-llama/Llama-3.1-8B", help="Hugging Face ID or local Llama checkpoint.")
     parser.add_argument("--revision", help="Model/tokenizer revision; resolved to an immutable commit.")
     parser.add_argument("--layers", type=int, nargs="+", help="Zero-based decoder blocks (default: all).")
-    parser.add_argument("--token-selection", choices=["last"], default="last")
     parser.add_argument("--dtype", choices=list(DTYPES), default="bfloat16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--extract-batch-size", type=int, default=8)

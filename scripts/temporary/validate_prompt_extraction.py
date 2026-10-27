@@ -29,6 +29,7 @@ def main():
         {"row_id": 44, "prompt": "Café, 日本語, and a longer sentence.", "subset": "text", "labels": {"nested": {"values": [1, None, "é"]}}},
         {"row_id": 19, "prompt": "Hi!", "subset": "text", "labels": {}},
         {"row_id": 22, "prompt": "They are 7 years old. ", "subset": "age", "labels": {"age": 7.0}},
+        {"row_id": 31, "prompt": "!", "subset": "text", "labels": {}},
     ]
     with tempfile.TemporaryDirectory(prefix="dalg_prompt_smoke_") as directory:
         root = Path(directory)
