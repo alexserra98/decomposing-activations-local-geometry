@@ -32,8 +32,9 @@ submission = experiment.read_json(output / "submission.json")
 expected_script = hashlib.sha256(subprocess.check_output([
     "git", "show", f"{submission['commit']}:scripts/temporary/run_cluster_id_experiment.py",
 ])).hexdigest()
-minimum = plan["settings"]["min_population"]
-assert plan["settings"] == experiment.settings_for_population(minimum)
+settings = plan["settings"]
+assert settings == experiment.settings_for_population(settings["min_population"], settings.get("test_min_population"))
+minimums = {split: experiment.split_min_population(settings, split) for split in settings["splits"]}
 totals, warnings, conditions = Counter(), Counter(), Counter()
 comparison = Counter()
 statuses = {}
@@ -70,7 +71,8 @@ with (output / "summary/clusters.csv").open() as combined_handle:
             assert experiment.sha256(previous_dir / "results.json") == experiment.read_json(
                 previous_dir / "COMPLETED.json")["results_sha256"]
             assert baseline["input_sha256"] == report["input_sha256"]
-            assert baseline["settings"]["min_population"] > minimum
+            assert all(experiment.split_min_population(baseline["settings"], split) >= minimum
+                       for split, minimum in minimums.items())
             previous_assignments = torch.load(previous_dir / "test_assignments.pt", weights_only=True)
             torch.testing.assert_close(saved["assignments"], previous_assignments["assignments"])
         assert len(report["clusters"]) == 2 * run["K"]
@@ -82,6 +84,7 @@ with (output / "summary/clusters.csv").open() as combined_handle:
                 assert next(combined) == {key: csv_value(value) for key, value in {**identity, **row}.items()}
             assert next(local, None) is None
         for split in ("train", "test"):
+            minimum = minimums[split]
             rows = [row for row in report["clusters"] if row["split"] == split]
             assert [row["cluster_id"] for row in rows] == list(range(run["K"]))
             assert sum(row["n_points"] for row in rows) == report["populations"][split]
@@ -106,11 +109,14 @@ with (output / "summary/clusters.csv").open() as combined_handle:
                     for key in ("gride_ids", "gride_errors", "gride_scales"):
                         assert len(row[key]) == 6 and all(math.isfinite(x) and x > 0 for x in row[key])
             if baseline is not None:
+                previous_minimum = experiment.split_min_population(baseline["settings"], split)
                 previous_rows = [row for row in baseline["clusters"] if row["split"] == split]
                 assert len(previous_rows) == len(rows)
+                if previous_minimum == minimum:
+                    assert rows == previous_rows, f"Changed {split} estimates at an unchanged threshold"
                 for row, previous in zip(rows, previous_rows):
                     assert (row["cluster_id"], row["n_points"]) == (previous["cluster_id"], previous["n_points"])
-                    if row["n_points"] >= baseline["settings"]["min_population"]:
+                    if row["n_points"] >= previous_minimum:
                         for key in ("two_nn_status", "gride_status", "gride_ranks", "warnings"):
                             assert row[key] == previous[key]
                         for key in ("two_nn_id", "two_nn_error", "two_nn_scale",
@@ -143,7 +149,8 @@ for run in plan["runs"]:
             log_issues.append({"index": run["index"], "line": line})
 result = {"checks_passed": True, "slurm_job_id": os.environ["SLURM_JOB_ID"],
           "manifest_sha256": experiment.sha256(manifest), "runs": len(plan["runs"]),
-          "min_population": minimum, "comparison_with_previous": comparison,
+          "min_population": settings["min_population"], "min_population_by_split": minimums,
+          "comparison_with_previous": comparison,
           "conditions": conditions, "totals": totals, "statuses": statuses,
           "estimator_warnings": warnings, "stderr_issues": log_issues,
           "artifact_bytes": sum(path.stat().st_size for path in output.rglob("*") if path.is_file())}

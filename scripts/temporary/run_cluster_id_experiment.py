@@ -41,11 +41,25 @@ SETTINGS = {
 }
 
 
-def settings_for_population(min_population):
+def settings_for_population(min_population, test_min_population=None):
     """Keep the estimator contract fixed while varying cluster eligibility."""
-    if type(min_population) is not int or min_population < 3:
-        raise ValueError("minimum cluster population must be an integer >= 3")
-    return {**SETTINGS, "min_population": min_population}
+    for value in (min_population, test_min_population):
+        if value is not None and (type(value) is not int or value < 3):
+            raise ValueError("minimum cluster population must be an integer >= 3")
+    if min_population is None:
+        raise ValueError("minimum cluster population is required")
+    settings = {**SETTINGS, "min_population": min_population}
+    if test_min_population is not None:
+        settings["test_min_population"] = test_min_population
+    return settings
+
+
+def split_min_population(settings, split):
+    """Use the optional test override; historical manifests keep one threshold."""
+    if split not in SETTINGS["splits"]:
+        raise ValueError(f"unknown split: {split}")
+    return (settings.get("test_min_population", settings["min_population"])
+            if split == "test" else settings["min_population"])
 
 
 def select_runs(plan, *, K, thresholds, noise_levels, models):
@@ -154,7 +168,7 @@ def describe_run(run_dir, cache_root):
     }
 
 
-def make_plan(results_root, cache_root, output, *, min_population=500,
+def make_plan(results_root, cache_root, output, *, min_population=500, test_min_population=None,
               K=None, surgery_threshold=None, models=None):
     """List every run at the expected sweep depth; never silently drop a run."""
     results_root, cache_root = Path(results_root).resolve(), Path(cache_root).resolve()
@@ -169,7 +183,7 @@ def make_plan(results_root, cache_root, output, *, min_population=500,
         runs.append(record)
     if not runs:
         raise ValueError(f"no model runs found in {results_root}")
-    settings = settings_for_population(min_population)
+    settings = settings_for_population(min_population, test_min_population)
     plan = {"schema_version": 1, "results_root": str(results_root),
             "cache_root": str(cache_root), "settings": settings, "runs": runs,
             "provenance": provenance()}
@@ -327,8 +341,9 @@ def write_cluster_csv(path, rows):
                              for key, value in row.items()})
 
 
-def run_one(record, cache_root, output, *, device="cpu", batch_size=1024, min_population=500):
-    settings = settings_for_population(min_population)
+def run_one(record, cache_root, output, *, device="cpu", batch_size=1024,
+            min_population=500, test_min_population=None):
+    settings = settings_for_population(min_population, test_min_population)
     if not record["ready"]:
         raise FileNotFoundError(f"incomplete input run: {record['missing']}")
     for path, expected in record["input_stats"].items():
@@ -365,7 +380,7 @@ def run_one(record, cache_root, output, *, device="cpu", batch_size=1024, min_po
     for name, points, labels in (("train", train_points, train_labels), ("test", test_points, test_labels)):
         clusters.extend(estimate_split(
             points, labels, record["K"], name,
-            min_population=settings["min_population"], range_max=settings["gride_range_max"],
+            min_population=split_min_population(settings, name), range_max=settings["gride_range_max"],
         ))
     report = {"schema_version": 1, "run": record, "settings": settings,
               "provenance": runtime, "input_sha256": fingerprints, "test_source": source,
@@ -385,7 +400,7 @@ def run_one(record, cache_root, output, *, device="cpu", batch_size=1024, min_po
 def aggregate(plan, output_root):
     """Combine completed results without replacing source metrics or selecting scales."""
     settings = plan["settings"]
-    if settings != settings_for_population(settings["min_population"]):
+    if settings != settings_for_population(settings["min_population"], settings.get("test_min_population")):
         raise ValueError("unsupported manifest estimator settings")
     summary = []
 
@@ -405,7 +420,8 @@ def aggregate(plan, output_root):
                 selected = [row for row in report["clusters"] if row["split"] == split]
                 summary.append({**identity, "split": split, "clusters": len(selected),
                                 "points": sum(row["n_points"] for row in selected),
-                                "eligible_clusters": sum(row["n_points"] >= settings["min_population"] for row in selected),
+                                "eligible_clusters": sum(row["n_points"] >= split_min_population(settings, split)
+                                                         for row in selected),
                                 "two_nn_valid": sum(row["two_nn_status"] == "ok" for row in selected),
                                 "gride_valid": sum(row["gride_status"] == "ok" for row in selected)})
 
@@ -424,6 +440,8 @@ def main():
     plan_parser.add_argument("--cache-root", type=Path, required=True)
     plan_parser.add_argument("--output", type=Path, required=True)
     plan_parser.add_argument("--min-population", type=int, default=500)
+    plan_parser.add_argument("--test-min-population", type=int,
+                             help="Override the minimum population for test clusters only")
     plan_parser.add_argument("--K", type=int)
     plan_parser.add_argument("--surgery-threshold", type=float)
     plan_parser.add_argument("--models", nargs="+", choices=("kmeans", "mfa", "hddc", "em", "em_bk"))
@@ -439,10 +457,13 @@ def main():
     args = parser.parse_args()
     if args.command == "plan":
         make_plan(args.results_root, args.cache_root, args.output, min_population=args.min_population,
+                  test_min_population=args.test_min_population,
                   K=args.K, surgery_threshold=args.surgery_threshold, models=args.models)
         return
     plan = read_json(args.manifest)
-    if plan["settings"] != settings_for_population(plan["settings"]["min_population"]):
+    if plan["settings"] != settings_for_population(
+        plan["settings"]["min_population"], plan["settings"].get("test_min_population"),
+    ):
         raise ValueError("manifest estimator settings differ from this experiment")
     if args.command == "aggregate":
         aggregate(plan, args.output_root)
@@ -452,7 +473,8 @@ def main():
         record = plan["runs"][args.index]
         run_one(record, plan["cache_root"], args.output_root / "runs" / record["relative_run"],
                 device=args.device, batch_size=args.batch_size,
-                min_population=plan["settings"]["min_population"])
+                min_population=plan["settings"]["min_population"],
+                test_min_population=plan["settings"].get("test_min_population"))
 
 
 if __name__ == "__main__":

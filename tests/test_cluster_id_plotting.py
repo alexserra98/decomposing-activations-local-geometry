@@ -80,10 +80,13 @@ def test_em_variants_are_selected_separately(tmp_path):
     assert [item["model"] for item in selection] == ["em", "em_bk"]
 
 
-@pytest.mark.parametrize("minimum, expected", [(200, 6), (500, 10)])
-def test_manifold_means_include_newly_eligible_clusters(minimum, expected):
-    rows = [cluster(0, 199), cluster(1, 200, 2), cluster(2, 499, 6), cluster(3, 500, 10)]
-    result = summarize_split(rows, {1: 0, 2: 0, 3: 0}, [manifold(0, 4)],
+@pytest.mark.parametrize("minimum, expected, count", [(65, 6, 5), (200, 8, 3), (500, 10, 1)])
+def test_manifold_means_include_newly_eligible_clusters(minimum, expected, count):
+    rows = [cluster(0, 64), cluster(1, 65, 2), cluster(2, 199, 4),
+            cluster(3, 200, 6), cluster(4, 499, 8), cluster(5, 500, 10)]
+    result = summarize_split(rows, {index: 0 for index in range(1, 6)}, [manifold(0, 6)],
                              min_population=minimum)
     assert result[0]["two_nn_mean"] == expected
-    assert result[0]["two_nn_n"] == (3 if minimum == 200 else 1)
+    assert result[0]["two_nn_n"] == count
+    assert result[0]["gride_64_n"] == count
+    assert result[0]["gride_64_mean"] == expected + 5

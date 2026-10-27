@@ -16,7 +16,7 @@ import torch
 from dalg.evaluation.toy_manifold_metrics import _associate_component_means
 from dalg.evaluation.toy_manifold_tiling import _load_model
 from run_cluster_id_experiment import (
-    file_stat, read_json, select_runs, settings_for_population, sha256,
+    file_stat, read_json, select_runs, settings_for_population, sha256, split_min_population,
 )
 
 
@@ -67,8 +67,9 @@ def build_manifold_tables(plan, selected, id_root, output):
     projection. Original per-manifold metrics supply the all-component counts.
     Source and result fingerprints are recorded with the derived tables.
     """
-    min_population = plan["settings"]["min_population"]
-    assert plan["settings"] == settings_for_population(min_population)
+    settings = plan["settings"]
+    assert settings == settings_for_population(settings["min_population"], settings.get("test_min_population"))
+    minimums = {split: split_min_population(settings, split) for split in settings["splits"]}
     id_root, output = Path(id_root), Path(output)
     output.mkdir(parents=True, exist_ok=True)
     metadata_cache, provenance, tables, membership_rows = {}, [], [], []
@@ -106,11 +107,11 @@ def build_manifold_tables(plan, selected, id_root, output):
         for split, rows in split_rows.items():
             assert [row["cluster_id"] for row in rows] == list(range(run["K"]))
             assert sum(row["n_points"] for row in rows) == report["populations"][split]
-            assert all(row["n_points"] >= min_population or
+            assert all(row["n_points"] >= minimums[split] or
                        row["two_nn_status"] == row["gride_status"] == "below_min_population"
                        for row in rows)
         eligible = sorted({row["cluster_id"] for row in report["clusters"]
-                           if row["n_points"] >= min_population})
+                           if row["n_points"] >= minimums[row["split"]]})
         print(f"{run['condition']} {item['model']} K={run['K']}: "
               f"associate {len(eligible)} eligible component means", flush=True)
         associations = {}
@@ -131,13 +132,12 @@ def build_manifold_tables(plan, selected, id_root, output):
             del model, projection
         identity = {"relative_run": run["relative_run"], "K": run["K"],
                     "condition": run["condition"], "model": item["model"],
-                    "noise_ratio": item["noise_ratio"], "surgery_threshold": item["surgery_threshold"],
-                    "min_population": min_population}
+                    "noise_ratio": item["noise_ratio"], "surgery_threshold": item["surgery_threshold"]}
         for split, rows in split_rows.items():
-            tables.extend({**identity, "split": split, **row}
+            tables.extend({**identity, "min_population": minimums[split], "split": split, **row}
                           for row in summarize_split(rows, associations, manifolds,
-                                                     min_population=min_population))
-        provenance.append({**identity, "results_sha256": digest,
+                                                     min_population=minimums[split]))
+        provenance.append({**identity, "min_population_by_split": minimums, "results_sha256": digest,
             "model_sha256": report["input_sha256"][run["model_path"]],
             "metrics_path": str(metrics_path), "metrics_sha256": sha256(metrics_path),
             "metadata_path": metadata_path, "metadata_sha256": metadata_digest,

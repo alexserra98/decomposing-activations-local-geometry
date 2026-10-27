@@ -42,6 +42,7 @@ import sys
 
 import nbformat
 from nbclient import NotebookClient
+import pandas as pd
 
 output = Path(os.environ["ID_FIGURE_OUTPUT"])
 kernel = Path(os.environ["JUPYTER_PATH"]) / "kernels/python3"
@@ -60,5 +61,25 @@ finally:
     nbformat.write(notebook, output / "toy_manifold_noise_sweep_intrinsic_dimension_executed.ipynb")
 assert len(list(output.glob("*.png"))) == 9
 assert len(list(output.glob("*.pdf"))) == 9
+if os.environ.get("ID_BASELINE_FIGURES"):
+    baseline = Path(os.environ["ID_BASELINE_FIGURES"])
+    keys = ["relative_run", "split", "manifold_id"]
+    current = pd.read_csv(output / "manifold_ids.csv").set_index(keys).sort_index().sort_index(axis=1)
+    previous = pd.read_csv(baseline / "manifold_ids.csv").set_index(keys).sort_index().sort_index(axis=1)
+    pd.testing.assert_index_equal(current.index, previous.index)
+    pd.testing.assert_frame_equal(current.xs("train", level="split"),
+                                  previous.xs("train", level="split"), rtol=1e-12, atol=1e-12)
+    checks = {"training_summaries_unchanged": True, "baseline_figures": str(baseline), "test": {}}
+    for estimator in ["two_nn", "gride_2", "gride_4", "gride_8", "gride_16", "gride_32", "gride_64"]:
+        before = previous.xs("test", level="split")[f"{estimator}_n"]
+        after = current.xs("test", level="split")[f"{estimator}_n"]
+        assert after.ge(before).all()
+        checks["test"][estimator] = {
+            "valid_clusters_before": int(before.sum()), "valid_clusters_after": int(after.sum()),
+            "empty_cells_before": int(before.eq(0).sum()), "empty_cells_after": int(after.eq(0).sum()),
+            "total_cells": len(after),
+        }
+    (output / "comparison_checks.json").write_text(json.dumps(checks, indent=2) + "\n")
+    print(json.dumps(checks, indent=2), flush=True)
 print(f"Rendered both summary tables and seven train/test figures in {output}", flush=True)
 PY

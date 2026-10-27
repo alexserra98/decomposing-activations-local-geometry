@@ -77,8 +77,8 @@ scope.
   with paired noisy spheres retained as a low-dimensional visual control.
 - [Per-cluster intrinsic dimension](experiments/cluster-id-estimation.md)
   records the separate training/test 2NN and GRIDE experiment across all saved
-  toy-noise model runs, including the K=500, threshold=0.2 repeat with a
-  200-point minimum per split's cluster.
+  toy-noise model runs, including the K=500, threshold=0.2 repeats with
+  separate training/test population thresholds.
 
 ## Document roles
 

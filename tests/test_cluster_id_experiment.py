@@ -39,7 +39,7 @@ def test_ids_match_direct_dadapy_and_include_every_gride_scale():
     assert result["n_points"] == len(points)
 
 
-@pytest.mark.parametrize("minimum", [200, 500])
+@pytest.mark.parametrize("minimum", [65, 200, 500])
 def test_population_threshold_is_inclusive_and_keeps_empty_clusters(minimum):
     points = torch.randn(2 * minimum - 1, 3, generator=torch.Generator().manual_seed(1))
     labels = torch.cat((torch.zeros(minimum - 1, dtype=torch.long), torch.full((minimum,), 2)))
@@ -68,8 +68,8 @@ def test_training_membership_uses_saved_global_rows_not_row_positions():
 
 
 @pytest.mark.parametrize("kind", ["kmeans", "mfa", "hddc"])
-@pytest.mark.parametrize("minimum", [200, 500])
-def test_saved_run_separates_train_and_test_and_preserves_inputs(tmp_path, kind, minimum):
+@pytest.mark.parametrize("minimum, test_minimum", [(200, None), (500, None), (200, 65)])
+def test_saved_run_separates_train_and_test_and_preserves_inputs(tmp_path, kind, minimum, test_minimum):
     if kind == "kmeans":
         run, root, *_ = _build_kmeans_run(tmp_path, "cluster", False)
     else:
@@ -89,8 +89,9 @@ def test_saved_run_separates_train_and_test_and_preserves_inputs(tmp_path, kind,
     before = {p: p.read_bytes() for p in run.iterdir() if p.is_file()}
     record = experiment.describe_run(run, tmp_path)
     output = tmp_path / "id_results"
-    report = experiment.run_one(record, tmp_path, output, batch_size=7, min_population=minimum)
-    assert report["settings"] == experiment.settings_for_population(minimum)
+    report = experiment.run_one(record, tmp_path, output, batch_size=7, min_population=minimum,
+                                test_min_population=test_minimum)
+    assert report["settings"] == experiment.settings_for_population(minimum, test_minimum)
     train = [row for row in report["clusters"] if row["split"] == "train"]
     test = [row for row in report["clusters"] if row["split"] == "test"]
     assert len(train) == len(test) == model.K
@@ -116,14 +117,18 @@ def test_recorded_home_alias_is_resolved_only_through_selected_cache(tmp_path):
     assert experiment.source_path(value, tmp_path) == tmp_path / "assets/example/noiseless"
 
 
-def test_aggregation_uses_the_manifest_population_threshold(tmp_path):
+@pytest.mark.parametrize("test_minimum", [None, 65])
+def test_aggregation_uses_the_manifest_population_threshold(tmp_path, test_minimum):
     run = {"condition": "noiseless", "family": "example", "relative_run": "example",
-           "model_kind": "kmeans", "K": 4}
-    rows = [{"cluster_id": index, "split": split, "n_points": size,
-             "two_nn_status": "ok" if size >= 200 else "below_min_population",
-             "gride_status": "ok" if size >= 200 else "below_min_population"}
-            for split in ["train", "test"] for index, size in enumerate([199, 200, 499, 500])]
-    plan = {"runs": [run], "settings": experiment.settings_for_population(200)}
+           "model_kind": "kmeans", "K": 5}
+    rows = []
+    for split in ["train", "test"]:
+        minimum = test_minimum if split == "test" and test_minimum is not None else 200
+        for index, size in enumerate([64, 65, 199, 200, 500]):
+            status = "ok" if size >= minimum else "below_min_population"
+            rows.append({"cluster_id": index, "split": split, "n_points": size,
+                         "two_nn_status": status, "gride_status": status})
+    plan = {"runs": [run], "settings": experiment.settings_for_population(200, test_minimum)}
     directory = tmp_path / "runs/example"
     directory.mkdir(parents=True)
     experiment.write_json(directory / "results.json", {
@@ -135,5 +140,8 @@ def test_aggregation_uses_the_manifest_population_threshold(tmp_path):
     experiment.aggregate(plan, tmp_path)
     with (tmp_path / "summary/runs.csv").open() as handle:
         summary = list(csv.DictReader(handle))
-    assert [int(row["eligible_clusters"]) for row in summary] == [3, 3]
+    expected = [2, 4 if test_minimum == 65 else 2]
+    assert [int(row["eligible_clusters"]) for row in summary] == expected
+    assert [int(row["two_nn_valid"]) for row in summary] == expected
+    assert [int(row["gride_valid"]) for row in summary] == expected
     assert experiment.SETTINGS["min_population"] == 500

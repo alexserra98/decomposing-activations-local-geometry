@@ -23,7 +23,7 @@ is `scripts/slurm/temporary/sbatch_cluster_id_experiment.sh`. Validation uses
   posterior-responsibility argmax for MFA/HDDC. Reuse saved development
   assignments for training and infer test memberships from the saved model.
 - The original sweep requires **at least 500 points in that split's cluster**;
-  the K=500 repeat below lowers this to 200. Keep every component
+  the K=500 repeats below lower this to 200 and optionally 65 for test only. Keep every component
   ID, including empty and below-threshold clusters, with its actual population
   and an explicit estimate status.
 - Use every assigned point in an eligible cluster, in the original ambient
@@ -32,7 +32,7 @@ is `scripts/slurm/temporary/sbatch_cluster_id_experiment.sh`. Validation uses
 The source datasets have 300,000 development points and a separate 30,000-point
 supplemental test population. Actual training membership is reconstructed from
 each run's `val_indices.json`. With 30,000 test points, at most 60 clusters per
-run can satisfy the test population threshold.
+run can satisfy the original 500-point test threshold.
 
 ## Estimators
 
@@ -68,7 +68,8 @@ The runner has three commands:
 1. `plan --results-root ROOT --cache-root CACHE --output MANIFEST` records every
    run at `CONDITION/models/FAMILY/RUN`, its input paths, file sizes/timestamps,
    readiness, and the agreed estimator settings. Missing artifacts are reported.
-   `--min-population` sets split-specific eligibility (default 500). Supplying
+   `--min-population` sets eligibility for both splits (default 500), while
+   `--test-min-population` optionally overrides the test threshold only. Supplying
    `--K`, `--surgery-threshold`, and `--models` together restricts the manifest
    to one saved configuration per selected model in all four noise conditions;
    missing requested combinations fail planning. Workers and aggregation read
@@ -390,3 +391,26 @@ fingerprints are saved beside it. All notebook cells executed successfully;
 the plotting checks passed (six tests), and the tables, 2NN figure, and largest
 GRIDE scale were visually inspected. Validation and rendering package lists
 confirm that the environment was unchanged.
+
+## K=500, threshold=0.2, training minimum 200 and test minimum 65
+
+The user requested another repeat on 2026-10-27 and selected **65 points in
+test clusters**, retaining **200 points in training clusters**. The model
+selection remains KMeans and HDDC EM with shared noise variance, K=500,
+threshold 0.2, and all four noise conditions. All six GRIDE scales remain
+available at the inclusive 65-point boundary, including the 64th neighbour.
+
+The new result root is
+`outputs/experiments/id_est_exp/k500_tau0p2_train200_test65_20261027_01`.
+The planner arguments are `--K 500 --surgery-threshold 0.2 --models kmeans em
+--min-population 200 --test-min-population 65`. The optional test override is
+recorded in the manifest and every result; old manifests without it retain
+their original common threshold. The notebook derives the correct threshold
+for each split and prints it in the corresponding panel and summary table.
+
+This repeat uses the existing environment and Slurm launchers. Artifact checks
+compare against the preceding minimum-200 experiment: input fingerprints,
+test assignments, all training records, and previously eligible test estimates
+must remain unchanged. Setting `ID_BASELINE_FIGURES` to the old `figures/`
+directory also verifies unchanged training summaries and records how many
+additional test clusters and manifold cells contribute.
