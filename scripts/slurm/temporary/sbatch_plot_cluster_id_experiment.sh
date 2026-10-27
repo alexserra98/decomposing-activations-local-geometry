@@ -22,6 +22,7 @@ hostname
 git rev-parse HEAD > "$ID_FIGURE_OUTPUT/source_commit.txt"
 git diff --stat > "$ID_FIGURE_OUTPUT/source_diff_stat.txt"
 cp scripts/temporary/plot_cluster_id_experiment.py \
+   scripts/temporary/run_cluster_id_experiment.py \
    scripts/slurm/temporary/sbatch_plot_cluster_id_experiment.sh \
    tests/test_cluster_id_plotting.py \
    notebooks/toy_manifold_noise_sweep_intrinsic_dimension.ipynb \

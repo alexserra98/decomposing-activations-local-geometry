@@ -12,21 +12,30 @@ hostname
 "$REPO_ROOT/.venv/bin/python" - "$@" <<'PY'
 from collections import Counter
 import csv
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import sys
+import subprocess
 
+import numpy as np
 import torch
 import run_cluster_id_experiment as experiment
 
-manifest, output = map(Path, sys.argv[1:])
+manifest, output, *baseline_args = map(Path, sys.argv[1:])
+assert len(baseline_args) <= 1, "optional third argument is the previous ID result root"
+baseline_root = baseline_args[0] if baseline_args else None
 plan = experiment.read_json(manifest)
 submission = experiment.read_json(output / "submission.json")
-expected_script = experiment.sha256(experiment.__file__)
-assert len(plan["runs"]) == 740
+expected_script = hashlib.sha256(subprocess.check_output([
+    "git", "show", f"{submission['commit']}:scripts/temporary/run_cluster_id_experiment.py",
+])).hexdigest()
+minimum = plan["settings"]["min_population"]
+assert plan["settings"] == experiment.settings_for_population(minimum)
 totals, warnings, conditions = Counter(), Counter(), Counter()
+comparison = Counter()
 statuses = {}
 source_hashes = {}
 run_summaries = []
@@ -42,7 +51,7 @@ with (output / "summary/clusters.csv").open() as combined_handle:
         report = experiment.read_json(directory / "results.json")
         marker = experiment.read_json(directory / "COMPLETED.json")
         assert experiment.sha256(directory / "results.json") == marker["results_sha256"]
-        assert report["run"] == run and report["settings"] == plan["settings"] == experiment.SETTINGS
+        assert report["run"] == run and report["settings"] == plan["settings"]
         assert report["provenance"]["commit"] == submission["commit"]
         assert report["provenance"]["script_sha256"] == expected_script
         assert report["populations"] == {"train": 270000, "validation_excluded": 30000, "test": 30000}
@@ -54,6 +63,16 @@ with (output / "summary/clusters.csv").open() as combined_handle:
         assert saved["K"] == run["K"] and len(saved["assignments"]) == 30000
         counts = torch.bincount(saved["assignments"], minlength=run["K"])
         torch.testing.assert_close(counts, saved["cluster_sizes"])
+        baseline = None
+        if baseline_root is not None:
+            previous_dir = baseline_root / "runs" / run["relative_run"]
+            baseline = experiment.read_json(previous_dir / "results.json")
+            assert experiment.sha256(previous_dir / "results.json") == experiment.read_json(
+                previous_dir / "COMPLETED.json")["results_sha256"]
+            assert baseline["input_sha256"] == report["input_sha256"]
+            assert baseline["settings"]["min_population"] > minimum
+            previous_assignments = torch.load(previous_dir / "test_assignments.pt", weights_only=True)
+            torch.testing.assert_close(saved["assignments"], previous_assignments["assignments"])
         assert len(report["clusters"]) == 2 * run["K"]
         identity = {key: run[key] for key in ("condition", "family", "relative_run", "model_kind", "K")}
         with (directory / "clusters.csv").open() as local_handle:
@@ -73,7 +92,7 @@ with (output / "summary/clusters.csv").open() as combined_handle:
                 for estimator in ("two_nn", "gride"):
                     statuses.setdefault(f"{split}_{estimator}", Counter())[row[f"{estimator}_status"]] += 1
                 warnings.update(row["warnings"])
-                if row["n_points"] < 500:
+                if row["n_points"] < minimum:
                     assert row["two_nn_status"] == row["gride_status"] == "below_min_population"
                     assert row["two_nn_id"] is None and not row["gride_ids"]
                     continue
@@ -86,14 +105,33 @@ with (output / "summary/clusters.csv").open() as combined_handle:
                     assert row["gride_ranks"] == [2, 4, 8, 16, 32, 64]
                     for key in ("gride_ids", "gride_errors", "gride_scales"):
                         assert len(row[key]) == 6 and all(math.isfinite(x) and x > 0 for x in row[key])
+            if baseline is not None:
+                previous_rows = [row for row in baseline["clusters"] if row["split"] == split]
+                assert len(previous_rows) == len(rows)
+                for row, previous in zip(rows, previous_rows):
+                    assert (row["cluster_id"], row["n_points"]) == (previous["cluster_id"], previous["n_points"])
+                    if row["n_points"] >= baseline["settings"]["min_population"]:
+                        for key in ("two_nn_status", "gride_status", "gride_ranks", "warnings"):
+                            assert row[key] == previous[key]
+                        for key in ("two_nn_id", "two_nn_error", "two_nn_scale",
+                                    "gride_ids", "gride_errors", "gride_scales"):
+                            if previous[key] is None:
+                                assert row[key] is None
+                            else:
+                                np.testing.assert_allclose(np.asarray(row[key], dtype=float),
+                                    np.asarray(previous[key], dtype=float), rtol=1e-12, atol=1e-12)
+                        comparison[f"{split}_previously_eligible_unchanged"] += 1
+                    elif row["n_points"] >= minimum:
+                        assert previous["two_nn_status"] == previous["gride_status"] == "below_min_population"
+                        comparison[f"{split}_newly_eligible"] += 1
             run_summaries.append({**identity, "split": split, "clusters": len(rows),
                 "points": sum(row["n_points"] for row in rows),
-                "eligible_clusters": sum(row["n_points"] >= 500 for row in rows),
+                "eligible_clusters": sum(row["n_points"] >= minimum for row in rows),
                 "two_nn_valid": sum(row["two_nn_status"] == "ok" for row in rows),
                 "gride_valid": sum(row["gride_status"] == "ok" for row in rows)})
         conditions[run["condition"]] += 1
         if (run["index"] + 1) % 100 == 0:
-            print(f"Validated {run['index'] + 1}/740 runs", flush=True)
+            print(f"Validated {run['index'] + 1}/{len(plan['runs'])} runs", flush=True)
     assert next(combined, None) is None
 with (output / "summary/runs.csv").open() as handle:
     assert list(csv.DictReader(handle)) == [{key: csv_value(value) for key, value in row.items()} for row in run_summaries]
@@ -105,6 +143,7 @@ for run in plan["runs"]:
             log_issues.append({"index": run["index"], "line": line})
 result = {"checks_passed": True, "slurm_job_id": os.environ["SLURM_JOB_ID"],
           "manifest_sha256": experiment.sha256(manifest), "runs": len(plan["runs"]),
+          "min_population": minimum, "comparison_with_previous": comparison,
           "conditions": conditions, "totals": totals, "statuses": statuses,
           "estimator_warnings": warnings, "stderr_issues": log_issues,
           "artifact_bytes": sum(path.stat().st_size for path in output.rglob("*") if path.is_file())}

@@ -15,7 +15,9 @@ import torch
 
 from dalg.evaluation.toy_manifold_metrics import _associate_component_means
 from dalg.evaluation.toy_manifold_tiling import _load_model
-from run_cluster_id_experiment import SETTINGS, file_stat, read_json, sha256
+from run_cluster_id_experiment import (
+    file_stat, read_json, select_runs, settings_for_population, sha256,
+)
 
 
 GRIDE_RANKS = (2, 4, 8, 16, 32, 64)
@@ -28,40 +30,11 @@ MODEL_NAMES = {
 }
 
 
-def select_runs(plan, *, K, thresholds, noise_levels, models):
-    """Keep model/configuration identities distinct, including both EM variants."""
-    selected = []
-    for run in plan["runs"]:
-        noise = ("noiseless" if run["condition"] == "noiseless"
-                 else int(run["condition"].removeprefix("noise_ratio_")))
-        if run["K"] != K or noise not in noise_levels:
-            continue
-        config = read_json(Path(run["run_dir"]) / "config.json")
-        model = run["model_kind"]
-        if model == "hddc" and config["fit_method"] == "em":
-            model = "em" if config["shared_b"] else "em_bk"
-        if model not in models:
-            continue
-        threshold = config.get("surgery_threshold")
-        if model != "mfa" and threshold != thresholds[model]:
-            continue
-        selected.append({"run": run, "model": model, "noise_ratio": noise,
-                         "surgery_threshold": threshold})
-    keys = [(item["noise_ratio"], item["model"]) for item in selected]
-    if len(keys) != len(set(keys)):
-        raise ValueError("Select exactly one fitted configuration per model/noise cell")
-    if not selected:
-        raise ValueError("No saved ID results match the notebook selection")
-    return sorted(selected, key=lambda item: (
-        noise_levels.index(item["noise_ratio"]), models.index(item["model"]),
-    ))
-
-
-def summarize_split(rows, associations, manifolds):
+def summarize_split(rows, associations, manifolds, *, min_population=500):
     """Average valid IDs equally within each manifold, separately for one split."""
     result = []
     for manifold in manifolds:
-        eligible = [row for row in rows if row["n_points"] >= 500
+        eligible = [row for row in rows if row["n_points"] >= min_population
                     and associations[row["cluster_id"]] == manifold["manifold_id"]]
         record = {key: manifold[key] for key in
                   ("manifold_id", "type_name", "intrinsic_dim", "embedding_dim")}
@@ -94,7 +67,8 @@ def build_manifold_tables(plan, selected, id_root, output):
     projection. Original per-manifold metrics supply the all-component counts.
     Source and result fingerprints are recorded with the derived tables.
     """
-    assert plan["settings"] == SETTINGS and SETTINGS["min_population"] == 500
+    min_population = plan["settings"]["min_population"]
+    assert plan["settings"] == settings_for_population(min_population)
     id_root, output = Path(id_root), Path(output)
     output.mkdir(parents=True, exist_ok=True)
     metadata_cache, provenance, tables, membership_rows = {}, [], [], []
@@ -105,7 +79,7 @@ def build_manifold_tables(plan, selected, id_root, output):
         report = read_json(results_path)
         digest = sha256(results_path)
         assert digest == read_json(directory / "COMPLETED.json")["results_sha256"]
-        assert report["run"] == run and report["settings"] == SETTINGS
+        assert report["run"] == run and report["settings"] == plan["settings"]
         for path in (run["model_path"], str(Path(run["run_dir"]) / "config.json")):
             assert file_stat(path) == run["input_stats"][path], f"Changed input: {path}"
             assert sha256(path) == report["input_sha256"][path], f"Changed input: {path}"
@@ -132,11 +106,11 @@ def build_manifold_tables(plan, selected, id_root, output):
         for split, rows in split_rows.items():
             assert [row["cluster_id"] for row in rows] == list(range(run["K"]))
             assert sum(row["n_points"] for row in rows) == report["populations"][split]
-            assert all(row["n_points"] >= 500 or
+            assert all(row["n_points"] >= min_population or
                        row["two_nn_status"] == row["gride_status"] == "below_min_population"
                        for row in rows)
         eligible = sorted({row["cluster_id"] for row in report["clusters"]
-                           if row["n_points"] >= 500})
+                           if row["n_points"] >= min_population})
         print(f"{run['condition']} {item['model']} K={run['K']}: "
               f"associate {len(eligible)} eligible component means", flush=True)
         associations = {}
@@ -157,10 +131,12 @@ def build_manifold_tables(plan, selected, id_root, output):
             del model, projection
         identity = {"relative_run": run["relative_run"], "K": run["K"],
                     "condition": run["condition"], "model": item["model"],
-                    "noise_ratio": item["noise_ratio"], "surgery_threshold": item["surgery_threshold"]}
+                    "noise_ratio": item["noise_ratio"], "surgery_threshold": item["surgery_threshold"],
+                    "min_population": min_population}
         for split, rows in split_rows.items():
             tables.extend({**identity, "split": split, **row}
-                          for row in summarize_split(rows, associations, manifolds))
+                          for row in summarize_split(rows, associations, manifolds,
+                                                     min_population=min_population))
         provenance.append({**identity, "results_sha256": digest,
             "model_sha256": report["input_sha256"][run["model_path"]],
             "metrics_path": str(metrics_path), "metrics_sha256": sha256(metrics_path),

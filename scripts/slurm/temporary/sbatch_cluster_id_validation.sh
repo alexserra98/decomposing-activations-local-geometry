@@ -6,6 +6,7 @@ set -euo pipefail
 REPO_ROOT="${SLURM_SUBMIT_DIR:?Submit from the experiment checkout}"
 ID_EXP_PYTHON="${ID_EXP_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 ID_EXP_VALIDATION_DIR="${1:?Provide a new validation output directory}"
+shift
 ID_EXP_CACHE_ROOT="/orfeo/scratch/dssc/zenocosini/dalg-cache"
 ID_EXP_RESULTS_ROOT="$ID_EXP_CACHE_ROOT/toy_manifolds_10types_1each_D128_30Keach_noise_sweep_seed0"
 cd "$REPO_ROOT"
@@ -37,9 +38,9 @@ fi
 "$ID_EXP_PYTHON" -m pip freeze > "$ID_EXP_VALIDATION_DIR/environment.txt"
 bash -n scripts/slurm/temporary/sbatch_cluster_id_experiment.sh
 bash -n scripts/slurm/temporary/sbatch_cluster_id_validation.sh
-"$ID_EXP_PYTHON" -m pytest tests/test_cluster_id_experiment.py -q \
+"$ID_EXP_PYTHON" -m pytest tests/test_cluster_id_experiment.py tests/test_cluster_id_plotting.py -q \
     --junitxml="$ID_EXP_VALIDATION_DIR/tests.xml"
 "$ID_EXP_PYTHON" scripts/temporary/run_cluster_id_experiment.py plan \
     --results-root "$ID_EXP_RESULTS_ROOT" \
     --cache-root "$ID_EXP_CACHE_ROOT" \
-    --output "$ID_EXP_VALIDATION_DIR/manifest.json"
+    --output "$ID_EXP_VALIDATION_DIR/manifest.json" "$@"

@@ -1,6 +1,7 @@
 """ID estimates preserve the saved training split and native test memberships."""
 
 import importlib.util
+import csv
 import json
 from pathlib import Path
 
@@ -38,14 +39,16 @@ def test_ids_match_direct_dadapy_and_include_every_gride_scale():
     assert result["n_points"] == len(points)
 
 
-def test_population_threshold_is_inclusive_and_keeps_empty_clusters():
-    points = torch.randn(999, 3, generator=torch.Generator().manual_seed(1))
-    labels = torch.cat((torch.zeros(499, dtype=torch.long), torch.full((500,), 2)))
-    rows = experiment.estimate_split(points, labels, 3, "train")
+@pytest.mark.parametrize("minimum", [200, 500])
+def test_population_threshold_is_inclusive_and_keeps_empty_clusters(minimum):
+    points = torch.randn(2 * minimum - 1, 3, generator=torch.Generator().manual_seed(1))
+    labels = torch.cat((torch.zeros(minimum - 1, dtype=torch.long), torch.full((minimum,), 2)))
+    rows = experiment.estimate_split(points, labels, 3, "train", min_population=minimum)
     assert [row["cluster_id"] for row in rows] == [0, 1, 2]
-    assert [row["n_points"] for row in rows] == [499, 0, 500]
+    assert [row["n_points"] for row in rows] == [minimum - 1, 0, minimum]
     assert rows[0]["two_nn_status"] == rows[1]["gride_status"] == "below_min_population"
     assert rows[2]["two_nn_status"] == rows[2]["gride_status"] == "ok"
+    assert rows[2]["gride_ranks"] == [2, 4, 8, 16, 32, 64]
 
 
 def test_degenerate_cluster_preserves_population_and_records_reason():
@@ -65,7 +68,8 @@ def test_training_membership_uses_saved_global_rows_not_row_positions():
 
 
 @pytest.mark.parametrize("kind", ["kmeans", "mfa", "hddc"])
-def test_saved_run_separates_train_and_test_and_preserves_inputs(tmp_path, kind):
+@pytest.mark.parametrize("minimum", [200, 500])
+def test_saved_run_separates_train_and_test_and_preserves_inputs(tmp_path, kind, minimum):
     if kind == "kmeans":
         run, root, *_ = _build_kmeans_run(tmp_path, "cluster", False)
     else:
@@ -85,7 +89,8 @@ def test_saved_run_separates_train_and_test_and_preserves_inputs(tmp_path, kind)
     before = {p: p.read_bytes() for p in run.iterdir() if p.is_file()}
     record = experiment.describe_run(run, tmp_path)
     output = tmp_path / "id_results"
-    report = experiment.run_one(record, tmp_path, output, batch_size=7)
+    report = experiment.run_one(record, tmp_path, output, batch_size=7, min_population=minimum)
+    assert report["settings"] == experiment.settings_for_population(minimum)
     train = [row for row in report["clusters"] if row["split"] == "train"]
     test = [row for row in report["clusters"] if row["split"] == "test"]
     assert len(train) == len(test) == model.K
@@ -109,3 +114,26 @@ def test_saved_run_separates_train_and_test_and_preserves_inputs(tmp_path, kind)
 def test_recorded_home_alias_is_resolved_only_through_selected_cache(tmp_path):
     value = experiment.HOME_CACHE + "assets/example/noiseless"
     assert experiment.source_path(value, tmp_path) == tmp_path / "assets/example/noiseless"
+
+
+def test_aggregation_uses_the_manifest_population_threshold(tmp_path):
+    run = {"condition": "noiseless", "family": "example", "relative_run": "example",
+           "model_kind": "kmeans", "K": 4}
+    rows = [{"cluster_id": index, "split": split, "n_points": size,
+             "two_nn_status": "ok" if size >= 200 else "below_min_population",
+             "gride_status": "ok" if size >= 200 else "below_min_population"}
+            for split in ["train", "test"] for index, size in enumerate([199, 200, 499, 500])]
+    plan = {"runs": [run], "settings": experiment.settings_for_population(200)}
+    directory = tmp_path / "runs/example"
+    directory.mkdir(parents=True)
+    experiment.write_json(directory / "results.json", {
+        "run": run, "settings": plan["settings"], "clusters": rows,
+    })
+    experiment.write_json(directory / "COMPLETED.json", {
+        "results_sha256": experiment.sha256(directory / "results.json"),
+    })
+    experiment.aggregate(plan, tmp_path)
+    with (tmp_path / "summary/runs.csv").open() as handle:
+        summary = list(csv.DictReader(handle))
+    assert [int(row["eligible_clusters"]) for row in summary] == [3, 3]
+    assert experiment.SETTINGS["min_population"] == 500

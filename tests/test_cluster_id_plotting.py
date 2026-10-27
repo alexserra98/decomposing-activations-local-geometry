@@ -78,3 +78,12 @@ def test_em_variants_are_selected_separately(tmp_path):
     selection = select_runs({"runs": runs}, K=2000, thresholds={"em": 0.05, "em_bk": 0.05},
                             noise_levels=["noiseless"], models=["em", "em_bk"])
     assert [item["model"] for item in selection] == ["em", "em_bk"]
+
+
+@pytest.mark.parametrize("minimum, expected", [(200, 6), (500, 10)])
+def test_manifold_means_include_newly_eligible_clusters(minimum, expected):
+    rows = [cluster(0, 199), cluster(1, 200, 2), cluster(2, 499, 6), cluster(3, 500, 10)]
+    result = summarize_split(rows, {1: 0, 2: 0, 3: 0}, [manifold(0, 4)],
+                             min_population=minimum)
+    assert result[0]["two_nn_mean"] == expected
+    assert result[0]["two_nn_n"] == (3 if minimum == 200 else 1)

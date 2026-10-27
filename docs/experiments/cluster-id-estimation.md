@@ -1,6 +1,6 @@
 # Per-cluster intrinsic dimension across the toy noise sweep
 
-> **Kind:** Experimental workflow · **Status:** Complete and validated · **Use when:**
+> **Kind:** Experimental workflow · **Status:** Original sweep validated; K=500 repeat in progress · **Use when:**
 > Computing separate training/test 2NN and GRIDE estimates for saved toy-noise
 > model runs. **Related:** [Toy datasets](../reference/toy-manifold-dataset.md),
 > [held-out populations](../evaluation/heldout-distribution-coverage.md), and
@@ -22,7 +22,8 @@ is `scripts/slurm/temporary/sbatch_cluster_id_experiment.sh`. Validation uses
 - Keep the fitted model's assignment rule: nearest centroid for KMeans,
   posterior-responsibility argmax for MFA/HDDC. Reuse saved development
   assignments for training and infer test memberships from the saved model.
-- Require **at least 500 points in that split's cluster**. Keep every component
+- The original sweep requires **at least 500 points in that split's cluster**;
+  the K=500 repeat below lowers this to 200. Keep every component
   ID, including empty and below-threshold clusters, with its actual population
   and an explicit estimate status.
 - Use every assigned point in an eligible cluster, in the original ambient
@@ -67,6 +68,11 @@ The runner has three commands:
 1. `plan --results-root ROOT --cache-root CACHE --output MANIFEST` records every
    run at `CONDITION/models/FAMILY/RUN`, its input paths, file sizes/timestamps,
    readiness, and the agreed estimator settings. Missing artifacts are reported.
+   `--min-population` sets split-specific eligibility (default 500). Supplying
+   `--K`, `--surgery-threshold`, and `--models` together restricts the manifest
+   to one saved configuration per selected model in all four noise conditions;
+   missing requested combinations fail planning. Workers and aggregation read
+   the threshold from the manifest, which is also preserved in every result.
 2. `run --manifest MANIFEST --index INDEX --output-root OUTPUT --device cpu|cuda`
    processes one recorded run. Slurm arrays pass `INDEX` through the launcher.
    DADApy runs on CPU; `--device` selects the test-assignment device.
@@ -277,10 +283,12 @@ found.
 
 [toy_manifold_noise_sweep_intrinsic_dimension.ipynb](../../notebooks/toy_manifold_noise_sweep_intrinsic_dimension.ipynb)
 reproduces the original noise-sweep notebook's summary table and per-manifold
-heatmap using the saved ID estimates. Its initial selection matches the original:
-K=2000, threshold 0.05, KMeans, HDDC Adam, and HDDC EM with shared noise variance,
-across all four noise conditions. Other completed configurations can be selected;
-EM with component-specific noise variance has the separate key `em_bk`.
+heatmap using the saved ID estimates. Its first rendering used K=2000,
+threshold 0.05, KMeans, HDDC Adam, and HDDC EM with shared noise variance,
+across all four noise conditions. The current selectors target the K=500 repeat
+below. Other completed configurations can be selected with a matching result
+root and manifest; EM with component-specific noise variance has the separate
+key `em_bk`. `ID_RESULTS_ROOT` and `ID_MANIFEST_PATH` override the input paths.
 
 Training and independent test appear separately. There is one figure for 2NN
 and one for each of the six GRIDE neighbour-rank pairs. The temporary helper
@@ -289,8 +297,8 @@ and one for each of the six GRIDE neighbour-rank pairs. The temporary helper
 only centres eligible in at least one split; no model or ID estimator is refit.
 Original per-manifold metrics supply the total associated-component counts.
 
-Within a manifold, means give equal weight to valid clusters with at least 500
-points in that split. Summary tables give equal weight to each manifold with
+Within a manifold, means give equal weight to valid clusters meeting the
+manifest's minimum population in that split. Summary tables give equal weight to each manifold with
 an available mean, and display both contributing manifold and cluster counts.
 Missing estimates are undefined, not zero. These populations differ from the
 original learned-rank population and can differ between training and test.
@@ -303,7 +311,7 @@ Run the notebook in Slurm using
 `scripts/slurm/temporary/sbatch_plot_cluster_id_experiment.sh OUTPUT_DIRECTORY`,
 with resources supplied to `sbatch`. The launcher uses the repository `.venv`
 and needs `nbclient` and `nbformat`; installation is opt-in via
-`ID_PLOT_INSTALL_NOTEBOOK_TOOLS=1`. It runs four focused aggregation checks and
+`ID_PLOT_INSTALL_NOTEBOOK_TOOLS=1`. It runs focused aggregation checks and
 saves an executed notebook, two summary-table images, seven train/test figures
 in PNG/PDF, numerical CSVs, source fingerprints, source snapshots, and environment
 package lists. It rejects an existing output directory. The notebook's original
@@ -318,3 +326,30 @@ selected runs, 240 manifold/split rows, two summary tables, and seven paired
 train/test figures. Visual inspection confirmed labels and annotations are
 readable. `nbclient` 0.11.0 and `nbformat` 5.11.1 were added with their schema
 dependencies; no previously installed package version changed.
+
+## K=500, threshold=0.2, minimum population 200
+
+On 2026-10-27 the user requested a repeat at K=500, surgery threshold 0.2,
+and at least 200 points per split's cluster. HDDC Adam is excluded at the user's
+request. The comparison retains KMeans and HDDC EM with shared noise variance,
+in all four noise conditions: eight fitted runs. All other estimator, assignment,
+train/test isolation, and plotting conventions stay the same.
+
+The result directory is
+`outputs/experiments/id_est_exp/k500_tau0p2_min200_20261027_01`;
+it contains the new `manifest.json`, per-run results, aggregate tables, and
+`figures/`. Original estimates and figures remain in their existing directories.
+This reruns ID estimation, including clusters with 200–499 points; changing a
+plot filter alone cannot recover these previously skipped estimates.
+
+The existing validation launcher accepts planner options after its output
+directory. This repeat uses `--K 500 --surgery-threshold 0.2 --models kmeans em
+--min-population 200`. The production checker accepts the old full-sweep output
+root as an optional third argument. It checks identical input fingerprints,
+populations and test memberships, and verifies previously eligible ID estimates
+agree within `rtol=atol=1e-12`, while counting newly eligible clusters.
+
+Validation job `1853543` passed all 19 tests and recorded eight ready runs.
+The two warnings are the existing iterable-dataset length warning from the
+small KMeans fixture, exercised at both population thresholds. The repeat
+uses the existing `.venv`; no packages are installed or updated.
