@@ -1,6 +1,6 @@
 # Per-cluster intrinsic dimension across the toy noise sweep
 
-> **Kind:** Experimental workflow · **Status:** Original sweep and K=500 repeat complete and validated · **Use when:**
+> **Kind:** Experimental workflow · **Status:** Original sweep and K=500 repeats complete and validated · **Use when:**
 > Computing separate training/test 2NN and GRIDE estimates for saved toy-noise
 > model runs. **Related:** [Toy datasets](../reference/toy-manifold-dataset.md),
 > [held-out populations](../evaluation/heldout-distribution-coverage.md), and
@@ -414,3 +414,46 @@ test assignments, all training records, and previously eligible test estimates
 must remain unchanged. Setting `ID_BASELINE_FIGURES` to the old `figures/`
 directory also verifies unchanged training summaries and records how many
 additional test clusters and manifold cells contribute.
+
+All stages completed with exit code zero from clean commit `6c500bd`, using
+the existing `.venv` without installing or changing packages. Validation job
+`1853792` passed 25 tests, including the inclusive 65-point boundary and all
+six GRIDE scales. Its three warnings are the pre-existing KMeans fixture's
+iterable-dataset length warning, exercised with three threshold settings.
+
+| Stage | Job | Allocation | Elapsed |
+| --- | --- | --- | --- |
+| Validation and manifest | 1853792 | 1 CPU, 4 GB, 15 minutes | 51 s |
+| ID estimates | 1853794, tasks 0–7 | 4 CPUs, 8 GB, 15 minutes per task, concurrency 8 | 16–40 s per task |
+| Aggregation | 1853795 | 1 CPU, 4 GB, 15 minutes | 2 s |
+| Comparison and artifact checks | 1853803 | 1 CPU, 4 GB, 15 minutes | 4 s |
+| Notebook, figures, summary comparison | 1853804 | 1 CPU, 4 GB, 30 minutes | 48 s |
+
+All jobs used EPYC, account `lade`, QoS `normal`, one node/task, and no GPU.
+The output root records `submission.json`, `slurm_accounting.psv`, and
+`final_checks.json`. All 4,000 training records are unchanged, including
+2,854 valid estimates and the two existing zero-neighbour-distance clusters.
+The 99 previously valid test estimates agree within `rtol=atol=1e-12`;
+**1,439 additional test clusters** are eligible and valid for both estimators.
+Test memberships and all source fingerprints match the preceding experiment.
+
+| Noise condition | KMeans valid test clusters | EM shared-b valid test clusters |
+| --- | --- | --- |
+| Noiseless | 186 | 196 |
+| 1000 | 190 | 190 |
+| 100 | 207 | 211 |
+| 10 | 181 | 177 |
+
+The test total is **1,538 valid clusters out of 4,000**; the other 2,462 are
+below 65 points. Every valid test cluster has all six GRIDE estimates.
+The rendered test heatmaps now have **8 empty manifold/model/noise cells out
+of 80**, down from 66, for every estimator. Remaining empty cells concern
+the hypersphere or product torus. Training manifold summaries are unchanged.
+These checks are recorded in `figures/comparison_checks.json`.
+
+The notebook executed successfully, seven plotting checks passed, and all
+seven heatmaps plus the test summary table were visually inspected. The
+`figures/` directory contains the executed notebook, two summary tables,
+seven train/test figures in PNG and PDF, CSVs, source fingerprints, and source
+snapshots. Panel titles and table footers explicitly distinguish the
+200-point training threshold from the 65-point test threshold.
