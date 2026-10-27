@@ -1,6 +1,6 @@
 # Per-cluster intrinsic dimension across the toy noise sweep
 
-> **Kind:** Experimental workflow · **Status:** Original sweep validated; K=500 repeat in progress · **Use when:**
+> **Kind:** Experimental workflow · **Status:** Original sweep and K=500 repeat complete and validated · **Use when:**
 > Computing separate training/test 2NN and GRIDE estimates for saved toy-noise
 > model runs. **Related:** [Toy datasets](../reference/toy-manifold-dataset.md),
 > [held-out populations](../evaluation/heldout-distribution-coverage.md), and
@@ -353,3 +353,40 @@ Validation job `1853543` passed all 19 tests and recorded eight ready runs.
 The two warnings are the existing iterable-dataset length warning from the
 small KMeans fixture, exercised at both population thresholds. The repeat
 uses the existing `.venv`; no packages are installed or updated.
+
+The repeat ran from clean commit `5d4d1e3` on `id_est_exp`. All jobs completed
+with exit code zero on EPYC, account `lade`, QoS `normal`, with no GPU:
+
+| Stage | Job | Allocation | Elapsed |
+| --- | --- | --- | --- |
+| Validation and manifest | 1853543 | 1 CPU, 4 GB, 15 minutes | 5 min 42 s |
+| ID estimates | 1853594, tasks 0–7 | 4 CPUs, 8 GB, 15 minutes per task, concurrency 8 | 20–164 s per task |
+| Aggregation | 1853595 | 1 CPU, 4 GB, 15 minutes | 3 s |
+| Comparison and artifact checks | 1853596 | 1 CPU, 4 GB, 15 minutes | 19 s |
+| Notebook and figures | 1853598 | 1 CPU, 4 GB, 30 minutes | 2 min 38 s |
+
+Stages after the array used `afterok` dependencies. `submission.json` records
+the job IDs, resources, source commit, and comparison root. `final_checks.json`
+confirms input fingerprints, memberships, populations, every per-run and
+aggregated CSV field, and estimator status/scale checks. Previously eligible
+outputs match the old experiment within the recorded tolerance: 1,735 training
+and five test cluster records, including unchanged undefined outputs.
+
+| Split | Cluster records | At least 200 points | Valid 2NN and GRIDE | Newly eligible versus minimum 500 |
+| --- | --- | --- | --- | --- |
+| Training | 4000 | 2856 | 2854 | 1121 |
+| Test | 4000 | 99 | 99 | 94 |
+
+Two noiseless training clusters have zero nearest-neighbour distance and retain
+undefined estimates. Sixteen records carry DADApy's small-distance warning;
+no points were removed or perturbed. No unexpected stderr issues were found.
+The test populations at noise ratio 10 have no cluster with 200 points for
+either selected model, so those figure cells remain undefined.
+
+The executed notebook under `figures/` contains two summary tables and seven
+paired train/test figures, with all six GRIDE scales kept separate. PNG/PDF
+exports, 160 manifold/split summary rows, contributor counts, and source
+fingerprints are saved beside it. All notebook cells executed successfully;
+the plotting checks passed (six tests), and the tables, 2NN figure, and largest
+GRIDE scale were visually inspected. Validation and rendering package lists
+confirm that the environment was unchanged.
