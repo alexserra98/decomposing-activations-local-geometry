@@ -677,6 +677,21 @@ planted instance, including instances with zero associated components. Global
 tangent-metric summaries pool components, not manifold means, so
 manifolds with more associated Gaussians receive proportionally more weight.
 
+## Neighboring-tile alignment
+
+The report also includes the shared
+[neighboring-tile alignment metrics](../../evaluation/unsupervised.md#neighboring-tile-alignment),
+enabled by default with five directed centroid neighbors. These compare leading
+PCs and the best PC subset between live, positive-rank tiles, independently of
+manifold associations or ground-truth tangents. KMeans additionally requires
+valid PCA. The covariance decomposition is shared with tangent evaluation.
+
+The `tile_alignment` block records global and per-tile means and individual
+neighbor comparisons. Tied retained eigenvalues produce an aggregated warning
+without changing these scores or the existing tangent-metric eligibility rules.
+There are no per-manifold tile-alignment summaries. Older reports require explicit
+saved-run reevaluation when tile alignment is enabled.
+
 ## Pipeline configuration
 
 The evaluator is enabled after the required assignments stage:
@@ -693,6 +708,8 @@ evaluation:
   rank_threshold: 1.0
   max_mean_to_manifold_distance: null
   heldout_distribution_coverage: true
+  tile_alignment: true
+  tile_alignment_neighbors: 5
 ```
 
 `null` is the default and disables distance filtering, so every component with
@@ -721,8 +738,10 @@ raises an exception naming `scripts/temporary/add_toy_manifold_test_split.py`.
 
 - `toy_manifold_geometry.py` implements noiseless projections and orthonormal
   tangent construction for all registered manifold types.
-- `toy_manifold_metrics.py` implements proximity association, covariance
-  eigenspaces, effective rank, principal-angle scores, and aggregation.
+- `toy_manifold_metrics.py` implements proximity association and tangent/rank
+  aggregation, using shared rank, eigenspace, and alignment helpers in `subspaces.py`.
+- `tile_alignment.py` implements the shared directed neighbor graph, tile alignment
+  scores, and report validation.
 - `toy_manifold_tiling.py` loads artifacts and models, reconstructs the
   train/validation split, computes NLL, augmented BIC, and clustering metrics, and
   assembles the report.

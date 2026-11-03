@@ -14,8 +14,10 @@ from dalg.evaluation.coverage import evaluate_heldout_distribution_coverage
 from dalg.evaluation.toy_manifold_coverage import (
     coverage_report_valid, evaluate_toy_test_coverage, validate_toy_test_split,
 )
-from dalg.evaluation.toy_manifold_tiling import _load_model, evaluate_toy_manifold_tiling
-from dalg.pipeline import _evaluation_metrics_valid, execute_run, resolve_run
+from dalg.evaluation.common import load_model as _load_model
+from dalg.evaluation.toy_manifold_tiling import evaluate_toy_manifold_tiling
+from dalg.pipeline.evaluation import _evaluation_metrics_valid
+from dalg.pipeline import execute_run, map_run_to_manifest
 from tests.test_kmeans_evaluation import _build_kmeans_run
 from tests.test_kmeans_pipeline import _config
 from tests.test_toy_manifold_test_split import add_test_split
@@ -119,11 +121,11 @@ def test_supplemental_test_split_and_disabled_coverage(tmp_path):
     root = Path(config["dataset"]["shard_dir"])
     source = validate_toy_test_split(root, layer=0)
     assert source["partition"]["kind"] == "supplemental"
-    run = resolve_run(config)
+    run = map_run_to_manifest(config)
     shutil.rmtree(root / "test")
     message = "add_toy_manifold_test_split.py"
     with pytest.raises(FileNotFoundError, match=message):
-        resolve_run(config)
+        map_run_to_manifest(config)
     with pytest.raises(FileNotFoundError, match=message):
         execute_run(run)
     assert not Path(run["run_dir"]).exists()
@@ -132,7 +134,7 @@ def test_supplemental_test_split_and_disabled_coverage(tmp_path):
             tmp_path / "missing_run", shard_dir=root, layer=0, model_kind="kmeans", device="cpu",
         )
     config["evaluation"]["heldout_distribution_coverage"] = False
-    disabled = resolve_run(config)
+    disabled = map_run_to_manifest(config)
     directory = execute_run(disabled)
     assert "heldout_distribution_coverage" not in json.loads((directory / "metrics.json").read_text())
     add_test_split(root, n_samples=8)
@@ -161,5 +163,5 @@ def test_streamed_counts_are_checked(toy_root, monkeypatch, extra_rows):
     monkeypatch.setattr(coverage, "DataLoader", lambda *a, **kw: [
         torch.zeros(source["num_rows"] + extra_rows, 3),
     ])
-    with pytest.raises(ValueError, match="row count|scalable"):
+    with pytest.raises(ValueError, match="point count|scalable"):
         evaluate_toy_test_coverage(source, torch.zeros(1, 3), torch.tensor([True]), batch_size=7)

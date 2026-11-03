@@ -10,21 +10,18 @@ from pathlib import Path
 
 from dalg.pipeline import (
     REPO_ROOT,
-    default_manifest_path,
     execute_run,
     group_by_resources,
     pipeline_status,
     read_manifest,
-    resolve_experiment,
+    save_experiment_manifest_to_disk,
     sbatch_command,
     write_manifest,
 )
 
 
 def _plan(config: str, manifest: str | None, *, check_inputs: bool) -> tuple[Path, list[dict]]:
-    runs = resolve_experiment(config, check_inputs=check_inputs)
-    path = Path(manifest).resolve() if manifest else default_manifest_path(runs)
-    path = write_manifest(runs, path)
+    path, runs = save_experiment_manifest_to_disk(config, manifest, check_inputs=check_inputs)
     print(f"planned {len(runs)} run(s): {path}")
     for index, run in enumerate(runs):
         print(f"  [{index:04d}] {run['run_id']} -> {run['run_dir']}")
@@ -133,12 +130,25 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate = sub.add_parser("evaluate", help="recompute and overwrite saved-run metrics without training")
     evaluate.add_argument("--manifest", nargs="+", required=True)
     evaluate.add_argument(
+        "--evaluation-kind", dest="kind", choices=("toy_manifold_tiling", "unsupervised"),
+        default=argparse.SUPPRESS,
+    )
+    evaluate.add_argument(
+        "--test-shard-dir", default=argparse.SUPPRESS,
+        help="independent activation shards for unsupervised coverage; accepts a subset suffix",
+    )
+    evaluate.add_argument(
         "--indices", nargs="+",
         help="row indices, or manifest-position:row-index for multiple manifests",
     )
     evaluate.add_argument("--device", default=argparse.SUPPRESS)
     evaluate.add_argument("--batch-size", type=int, default=argparse.SUPPRESS)
     evaluate.add_argument("--rank-threshold", type=float, default=argparse.SUPPRESS)
+    evaluate.add_argument(
+        "--tile-alignment", action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS, help="include neighboring-tile PC alignment (defaults to enabled)",
+    )
+    evaluate.add_argument("--tile-alignment-neighbors", type=int, default=argparse.SUPPRESS)
     evaluate.add_argument(
         "--heldout-distribution-coverage", action=argparse.BooleanOptionalAction,
         default=argparse.SUPPRESS,

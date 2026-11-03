@@ -5,8 +5,8 @@
 > [YAML training workflow](../workflows/training-pipeline.md)
 
 This file documents every field accepted by the experimental YAML training
-pipeline. The source of truth is `src/dalg/pipeline.py` together with the four
-trainer parsers selected by `model.kind`.
+pipeline. The source of truth is `src/dalg/pipeline/main.py`, its phase helpers,
+and the four trainer parsers selected by `model.kind`.
 
 YAML keys use the Python/manifest spelling with underscores, such as
 `early_stop_patience`, rather than CLI spelling such as
@@ -458,20 +458,34 @@ assignment count before the stage is marked complete.
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `false` | Run evaluation after assignments. |
-| `kind` | string or `null` | `null` | The only current evaluator is `toy_manifold_tiling`. |
+| `kind` | string or `null` | `null` | `toy_manifold_tiling` or `unsupervised`. |
 | `batch_size` | integer | `4096` | Batch size used for evaluation NLL, quantization error, and test coverage. |
 | `device` | string | `cuda` | Evaluation device. |
 | `rank_threshold` | float | `1.0` | For vanilla MFA and ARD, a loading column is effectively active when its variance exceeds this multiple of its component's mean unique variance. Ignored for HDDC and KMeans, which use saved component ranks. |
-| `max_mean_to_manifold_distance` | float or `null` | `null` | Optional maximum ambient Euclidean distance between a Gaussian mean and its unique nearest exact manifold projection. `null` associates each Gaussian with its unique nearest manifold without distance filtering. |
-| `heldout_distribution_coverage` | boolean | `true` | Compute distance summaries and the full empirical coverage curve on `<dataset>/test/`, using training-live centroids. Set `false` to omit coverage and its test-data requirement. |
+| `max_mean_to_manifold_distance` | float or `null` | `null` | Toy evaluation only: optional maximum mean-to-manifold distance. Must be `null` for `unsupervised`. |
+| `heldout_distribution_coverage` | boolean | `true` | Compute distance summaries and the full empirical coverage curve using training-live centroids. Set `false` to omit coverage and its test-data requirement. |
+| `tile_alignment` | boolean | `true` | Compute neighboring-tile leading-PC and best-subset PC alignment in either suite. |
+| `tile_alignment_neighbors` | integer | `5` | Positive directed centroid kNN neighbor count, capped at eligible tiles minus one. |
+| `test_shard_dir` | string or `null` | `null` | Unsupervised evaluation only: explicit independent test shards, required when coverage is enabled. Accepts the subset suffix; relative paths resolve against the repository root. |
 
 `evaluation.enabled: true` requires `assignments.enabled: true`.
-When coverage is enabled, planning and execution require a compatible reserved
-or supplemental test population with at most 100,000 points. A missing `test/`
+Both suites share the [neighboring-tile alignment contract](../evaluation/unsupervised.md#neighboring-tile-alignment),
+including eigenvalue warnings, per-tile means, and directed neighbor records.
+When coverage is enabled, planning and execution require at most 100,000 test
+points. `unsupervised` reads `test_shard_dir`; `toy_manifold_tiling` requires a
+compatible reserved or supplemental `<dataset>/test/` population. A missing toy `test/`
 raises an exception directing the user to
 `scripts/temporary/add_toy_manifold_test_split.py`; an oversized population
 raises an exception requesting a scalable coverage implementation. See the
 [coverage contract](../evaluation/heldout-distribution-coverage.md#pipeline-integration).
+
+`unsupervised` accepts all four model kinds and reports existing NLL/BIC or
+KMeans quantization, live/dead components, effective-rank summaries, and optional
+coverage, plus neighboring-tile alignment by default. It requires no manifold
+metadata. Alignment computes PCs using the shared Python helpers; disabling it
+avoids that eigendecomposition. No PC artifact is saved. See the
+[unsupervised evaluation contract](../evaluation/unsupervised.md) for stream
+alignment, test-data requirements, and output populations.
 
 `toy_manifold_tiling` accepts `model.kind: mfa`, `ard`, `hddc`, or `kmeans` and requires
 shards created by the toy-manifold shard writer. For MFA-family models it produces NLL, training-set
@@ -607,6 +621,8 @@ for local and Slurm examples, result layout, and retry behavior.
 | Argument | Meaning |
 | --- | --- |
 | `--manifest PATH [PATH ...]` | Required source manifests, in order. |
+| `--evaluation-kind KIND` | Override the evaluator with `toy_manifold_tiling` or `unsupervised`. |
+| `--test-shard-dir PATH` | Explicit independent test shards for unsupervised coverage. Accepts a subset suffix. |
 | `--indices INDEX [INDEX ...]` | Optional original rows; use `manifest-position:row-index` with multiple manifests. |
 | `--device DEVICE` | Override each row's evaluation device. |
 | `--batch-size N` | Positive evaluation batch size. |

@@ -9,6 +9,14 @@ from typing import Any
 import torch
 
 from dalg.models.kmeans import KMeans
+from dalg.evaluation.subspaces import (
+    PC_RELATIVE_EIGENGAP_THRESHOLD,
+    effective_component_ranks,
+    leading_covariance_eigenspaces,
+    subspace_alignment,
+    best_subset_alignment,
+    leading_subspace_is_identifiable,
+)
 
 from dalg.evaluation.toy_manifold_geometry import (
     _distance_tied,
@@ -16,8 +24,7 @@ from dalg.evaluation.toy_manifold_geometry import (
 )
 
 
-_PC_RELATIVE_EIGENGAP_THRESHOLD = 1e-6
-_COVARIANCE_EIGH_BATCH_SIZE = 64
+_PC_RELATIVE_EIGENGAP_THRESHOLD = PC_RELATIVE_EIGENGAP_THRESHOLD
 
 
 @dataclass(frozen=True)
@@ -51,21 +58,6 @@ class _ComponentMetrics:
     partial_containment_defined: torch.Tensor
     adjusted_alignment_overlap: torch.Tensor
     adjusted_alignment_defined: torch.Tensor
-
-
-@torch.no_grad()
-def _effective_component_ranks(model, threshold: float) -> torch.Tensor:
-    """Use saved KMeans/HDDC ranks, or threshold loadings for MFA and ARD."""
-    if isinstance(model, KMeans):
-        return model.component_ranks.detach().cpu().long()
-    rank_mask = getattr(model, "rank_mask", None)
-    if rank_mask is not None:
-        return rank_mask.sum(dim=1).detach().cpu().long()
-    if threshold <= 0.0:
-        raise ValueError("rank threshold must be positive")
-    scales = model._scale()
-    noise_floor = model._psi().mean(dim=1, keepdim=True)
-    return (scales.square() > threshold * noise_floor).sum(dim=1).cpu().long()
 
 
 @torch.no_grad()
@@ -136,113 +128,6 @@ def _associate_component_means(
 
 
 @torch.no_grad()
-def _leading_covariance_eigenspaces(
-    model,
-    max_subspace_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return saved PCA geometry or the eigenspaces of Gaussian covariances."""
-    if not (1 <= max_subspace_dim <= model.D):
-        raise ValueError("maximum subspace dimension must be in [1, D]")
-    if isinstance(model, KMeans):
-        if max_subspace_dim > model.q:
-            raise ValueError(
-                f"KMeans stored PC capacity {model.q} cannot support the requested "
-                f"tangent comparison; at least {max_subspace_dim} PCs are required"
-            )
-        return (
-            model.eigenvalues[:, : min(max_subspace_dim + 1, model.D)].detach().cpu().double(),
-            model.W[:, :, :max_subspace_dim].detach().cpu().double(),
-        )
-
-    loadings = model._W().detach().cpu().double()
-    psi = model._psi().detach().cpu().double()
-    num_eigenvalues = min(max_subspace_dim + 1, model.D)
-    eigenvalues = torch.empty(
-        (model.K, num_eigenvalues), dtype=torch.float64
-    )
-    eigenvectors = torch.empty(
-        (model.K, model.D, max_subspace_dim), dtype=torch.float64
-    )
-    for start in range(0, model.K, _COVARIANCE_EIGH_BATCH_SIZE):
-        end = min(start + _COVARIANCE_EIGH_BATCH_SIZE, model.K)
-        batch_loadings = loadings[start:end]
-        covariances = torch.bmm(
-            batch_loadings,
-            batch_loadings.transpose(1, 2),
-        )
-        covariances += torch.diag_embed(psi[start:end])
-        batch_values, batch_vectors = torch.linalg.eigh(covariances)
-        eigenvalues[start:end] = batch_values[:, -num_eigenvalues:].flip(1)
-        eigenvectors[start:end] = batch_vectors[:, :, -max_subspace_dim:].flip(2)
-    return eigenvalues, eigenvectors
-
-
-def _subspace_alignment(
-    tangent_basis: torch.Tensor,
-    principal_basis: torch.Tensor,
-) -> tuple[float, float]:
-    """Measure coverage of a tangent by an arbitrary-dimensional PC subspace."""
-    tangent_basis = tangent_basis.detach().cpu().double()
-    principal_basis = principal_basis.detach().cpu().double()
-    if tangent_basis.ndim != 2 or principal_basis.ndim != 2:
-        raise ValueError("subspace bases must be matrices")
-    if tangent_basis.shape[0] != principal_basis.shape[0]:
-        raise ValueError("subspace bases must have the same ambient dimension")
-    if tangent_basis.shape[1] == 0:
-        raise ValueError("tangent basis must contain at least one direction")
-    if principal_basis.shape[1] == 0:
-        return 0.0, 0.0
-
-    cosines = torch.linalg.svdvals(tangent_basis.T @ principal_basis).clamp(0.0, 1.0)
-    if not torch.isfinite(cosines).all():
-        raise ValueError("subspace alignment produced non-finite principal angles")
-    overlap = float(cosines.square().sum() / tangent_basis.shape[1])
-    worst = (
-        0.0
-        if principal_basis.shape[1] < tangent_basis.shape[1]
-        else float(cosines.min())
-    )
-    return overlap, worst
-
-
-def _best_subset_alignment(
-    tangent_basis: torch.Tensor,
-    principal_basis: torch.Tensor,
-) -> tuple[float, float]:
-    """Align the tangent with the intrinsic-size PC subset maximizing overlap."""
-    tangent_basis = tangent_basis.detach().cpu().double()
-    principal_basis = principal_basis.detach().cpu().double()
-    intrinsic_dim = tangent_basis.shape[1]
-    if not 1 <= intrinsic_dim <= principal_basis.shape[1]:
-        raise ValueError("best-subset alignment requires at least intrinsic_dim PCs")
-    contributions = (tangent_basis.T @ principal_basis).square().sum(dim=0)
-    if not torch.isfinite(contributions).all():
-        raise ValueError("PC tangent contributions must be finite")
-    # Stable sorting favors earlier PCs when tangent contributions are equal.
-    selected = torch.argsort(contributions, descending=True, stable=True)[:intrinsic_dim]
-    return _subspace_alignment(tangent_basis, principal_basis[:, selected])
-
-
-def _leading_subspace_is_identifiable(
-    eigenvalues: torch.Tensor,
-    subspace_dim: int,
-    ambient_dim: int,
-    relative_boundary_eigengap_threshold: float,
-) -> bool:
-    """Return whether the leading subspace has a unique covariance boundary."""
-    if not (1 <= subspace_dim <= ambient_dim):
-        raise ValueError("subspace dimension must be in [1, D]")
-    if subspace_dim == ambient_dim:
-        return True
-    retained = eigenvalues[subspace_dim - 1]
-    excluded = eigenvalues[subspace_dim]
-    relative_gap = (retained - excluded) / retained.abs().clamp_min(
-        torch.finfo(torch.float64).tiny
-    )
-    return float(relative_gap) > relative_boundary_eigengap_threshold
-
-
-@torch.no_grad()
 def _component_metrics(
     model,
     metadata: dict[str, Any],
@@ -250,6 +135,7 @@ def _component_metrics(
     rank_threshold: float,
     max_mean_to_manifold_distance: float | None,
     relative_boundary_eigengap_threshold: float,
+    eigenspaces: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> _ComponentMetrics:
     if relative_boundary_eigengap_threshold <= 0.0:
         raise ValueError("relative boundary eigengap threshold must be positive")
@@ -264,11 +150,11 @@ def _component_metrics(
     )
     if torch.any(intrinsic_dims <= 0):
         raise ValueError("manifold intrinsic dimensions must be positive")
-    effective_ranks = _effective_component_ranks(model, rank_threshold)
+    effective_ranks = effective_component_ranks(model, rank_threshold)
     max_subspace_dim = max(1, int(effective_ranks.max()))
-    eigenvalues, eigenvectors = _leading_covariance_eigenspaces(
-        model,
-        max_subspace_dim,
+    eigenvalues, eigenvectors = (
+        leading_covariance_eigenspaces(model, max_subspace_dim)
+        if eigenspaces is None else eigenspaces
     )
 
     overlap = torch.zeros(model.K, dtype=torch.float64)
@@ -300,7 +186,7 @@ def _component_metrics(
 
         component_eigenvalues = eigenvalues[component_id]
         if effective_rank < intrinsic_dim:
-            if _leading_subspace_is_identifiable(
+            if leading_subspace_is_identifiable(
                 component_eigenvalues,
                 effective_rank,
                 model.D,
@@ -308,7 +194,7 @@ def _component_metrics(
             ):
                 principal = eigenvectors[component_id, :, :effective_rank]
                 # Reverse coverage: measure how fully the tangent contains the PCs.
-                component_overlap, component_worst = _subspace_alignment(
+                component_overlap, component_worst = subspace_alignment(
                     principal, tangent
                 )
                 partial_containment_overlap[component_id] = component_overlap
@@ -320,14 +206,14 @@ def _component_metrics(
                 adjusted_alignment_defined[component_id] = True
             continue
 
-        if _leading_subspace_is_identifiable(
+        if leading_subspace_is_identifiable(
             component_eigenvalues,
             intrinsic_dim,
             model.D,
             relative_boundary_eigengap_threshold,
         ):
             principal = eigenvectors[component_id, :, :intrinsic_dim]
-            component_overlap, component_worst = _subspace_alignment(
+            component_overlap, component_worst = subspace_alignment(
                 tangent, principal
             )
             overlap[component_id] = component_overlap
@@ -336,14 +222,14 @@ def _component_metrics(
             adjusted_alignment_overlap[component_id] = component_overlap
             adjusted_alignment_defined[component_id] = True
 
-        if _leading_subspace_is_identifiable(
+        if leading_subspace_is_identifiable(
             component_eigenvalues,
             effective_rank,
             model.D,
             relative_boundary_eigengap_threshold,
         ):
             principal = eigenvectors[component_id, :, :effective_rank]
-            component_overlap, component_worst = _best_subset_alignment(
+            component_overlap, component_worst = best_subset_alignment(
                 tangent, principal
             )
             containment_overlap[component_id] = component_overlap
@@ -437,6 +323,7 @@ def evaluate_toy_manifold_metrics(
     rank_threshold: float = 1.0,
     max_mean_to_manifold_distance: float | None = None,
     relative_boundary_eigengap_threshold: float = _PC_RELATIVE_EIGENGAP_THRESHOLD,
+    eigenspaces: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> dict[str, Any]:
     """Evaluate proximity association, rank, and tangent geometry."""
     assignment_live = assignment_live.detach().cpu().bool().reshape(-1)
@@ -452,6 +339,7 @@ def evaluate_toy_manifold_metrics(
         rank_threshold=rank_threshold,
         max_mean_to_manifold_distance=max_mean_to_manifold_distance,
         relative_boundary_eigengap_threshold=relative_boundary_eigengap_threshold,
+        eigenspaces=eigenspaces,
     )
     associated = metrics.associations.associated
     pca_valid = model.pca_valid.detach().cpu() if isinstance(model, KMeans) else torch.ones(model.K, dtype=torch.bool)

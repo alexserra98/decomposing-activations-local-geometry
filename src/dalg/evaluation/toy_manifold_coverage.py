@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import shlex
 from collections.abc import Mapping
 from pathlib import Path
@@ -14,12 +13,8 @@ from torch.utils.data import DataLoader
 
 from dalg.data.shard_activations import ActivationBatchDataset, load_meta_index
 from dalg.data.subset_spec import split_shard_dir_spec
-from dalg.evaluation.coverage import (
-    MAX_EMPIRICAL_COVERAGE_POINTS,
-    check_empirical_coverage_size,
-    nearest_live_centroid_distances,
-    summarize_coverage_distances,
-)
+from dalg.evaluation import coverage
+from dalg.evaluation.coverage import check_empirical_coverage_size
 
 
 def validate_toy_test_split(shard_dir: str | Path, *, layer: int) -> dict:
@@ -78,42 +73,19 @@ def evaluate_toy_test_coverage(
         source["shard_dir"], layer=source["layer"], batch_size=batch_size,
         drop_prefix=0, dtype=torch.float32, shuffle_shards=False, shuffle_within_shard=False,
     )
-    chunks = []
-    count = 0
-    for batch in DataLoader(dataset, batch_size=None, num_workers=0):
-        count += len(batch)
-        check_empirical_coverage_size(count)
-        if count > source["num_rows"]:
-            raise ValueError("coverage test stream exceeds its declared row count")
-        chunks.append(nearest_live_centroid_distances(
-            batch, centroids, live_components=train_live, batch_size=batch_size,
-        ))
-    if count != source["num_rows"]:
-        raise ValueError("coverage test stream does not match its declared row count")
-    summary = summarize_coverage_distances(torch.cat(chunks), thresholds=None)
-    summary.update(
-        population="independent_test_split", components_total=int(centroids.shape[0]),
-        components_live=int(train_live.sum()), liveness_split="train",
-        curve_kind="full_empirical_cdf", source=source,
+    summary = coverage.evaluate_stream_coverage(
+        DataLoader(dataset, batch_size=None, num_workers=0), centroids, train_live,
+        expected_points=source["num_rows"], batch_size=batch_size,
     )
+    summary["source"] = source
     return summary
 
 
 def coverage_report_valid(report: object, *, components: int) -> bool:
-    """Check the bounded empirical-curve contract before publishing or reusing it."""
-    if not isinstance(report, Mapping):
+    """Validate toy test provenance in addition to the shared coverage summary."""
+    if not coverage.coverage_report_valid(report, components=components):
         return False
-    if (report.get("definition") != "heldout_point_to_nearest_live_centroid_euclidean_distance"
-            or report.get("population") != "independent_test_split"
-            or report.get("liveness_split") != "train"
-            or report.get("curve_kind") != "full_empirical_cdf"
-            or report.get("convention") != "lower_distances_and_higher_coverage_fractions_are_better"
-            or report.get("components_total") != components):
-        return False
-    count, live = report.get("reference_points"), report.get("components_live")
-    if (type(count) is not int or not 0 < count <= MAX_EMPIRICAL_COVERAGE_POINTS
-            or type(live) is not int or not 0 < live <= components):
-        return False
+    count = report["reference_points"]
     source = report.get("source")
     if not isinstance(source, Mapping) or source.get("num_rows") != count:
         return False
@@ -127,23 +99,4 @@ def coverage_report_valid(report: object, *, components: int) -> bool:
     if any(not isinstance(partition.get(f"source_{key}_sha256"), str)
            or len(partition[f"source_{key}_sha256"]) != 64 for key in ("config", "metadata")):
         return False
-    for key in ("mean", "root_mean_square", "median", "r90", "r95", "r99", "maximum"):
-        value = report.get(key)
-        if type(value) not in (float, int) or not math.isfinite(value) or value < 0:
-            return False
-    curve = report.get("coverage_curve")
-    if not isinstance(curve, list) or not 0 < len(curve) <= count:
-        return False
-    previous_radius, previous_fraction = -1.0, 0.0
-    for point in curve:
-        if not isinstance(point, Mapping):
-            return False
-        radius, fraction = point.get("radius"), point.get("fraction")
-        if (type(radius) not in (float, int) or not math.isfinite(radius)
-                or radius < 0 or radius <= previous_radius
-                or type(fraction) not in (float, int) or not math.isfinite(fraction)
-                or not previous_fraction < fraction <= 1
-                or not math.isclose(fraction * count, round(fraction * count), abs_tol=1e-8)):
-            return False
-        previous_radius, previous_fraction = radius, fraction
-    return previous_fraction == 1.0 and previous_radius == report["maximum"]
+    return True

@@ -5,7 +5,6 @@ import argparse
 import copy
 import hashlib
 import json
-import math
 import shlex
 import subprocess
 from uuid import uuid4
@@ -14,16 +13,20 @@ from pathlib import Path
 import torch
 import yaml
 
-from dalg.data.shard_activations import load_meta_index
-from dalg.data.subset_spec import resolve_spec_positions, split_shard_dir_spec
-from dalg.evaluation.toy_manifold_coverage import validate_toy_test_split
-from dalg.pipeline import (
-    REPO_ROOT, _EVALUATION_DEFAULTS,
-    _assignment_artifact_valid, _assignments_path, _canonical_json,
-    _evaluation_artifact_valid, _evaluation_metrics_valid, _mark_stage, _model_stem,
-    _normalise_resources, _training_artifacts_valid, _write_json_atomic,
-    group_by_resources, read_manifest, sbatch_command,
+from dalg.evaluation import validate_evaluation_inputs, validate_evaluation_settings
+from dalg.evaluation.common import load_evaluation_data, load_model
+from dalg.pipeline import REPO_ROOT, group_by_resources, read_manifest, sbatch_command
+from dalg.pipeline.evaluation import (
+    _EVALUATION_DEFAULTS,
+    _evaluation_artifact_valid,
+    _evaluation_metrics_valid,
 )
+from dalg.pipeline.resolution import _resolve_shard_dir
+from dalg.pipeline.assignments import _assignment_artifact_valid, _assignments_path
+from dalg.pipeline.common import _canonical_json, _model_stem, _write_json_atomic
+from dalg.pipeline.completion import _mark_stage
+from dalg.pipeline.slurm import _normalise_resources
+from dalg.pipeline.training import _training_artifacts_valid
 
 
 def _read_object(path: Path) -> dict:
@@ -39,22 +42,10 @@ def _read_object(path: Path) -> dict:
 def _settings(run: dict, overrides: dict) -> dict:
     cfg = {**_EVALUATION_DEFAULTS, **run.get("evaluation", {}), **overrides}
     cfg["enabled"] = True
-    if type(cfg["heldout_distribution_coverage"]) is not bool:
-        raise ValueError("evaluation.heldout_distribution_coverage must be true or false")
     cfg["kind"] = cfg["kind"] or "toy_manifold_tiling"
-    if cfg["kind"] != "toy_manifold_tiling":
-        raise ValueError(f"unsupported evaluation: {cfg['kind']}")
-    if int(cfg["batch_size"]) <= 0:
-        raise ValueError("evaluation batch_size must be positive")
-    torch.device(cfg["device"])
-    threshold = float(cfg["rank_threshold"])
-    if not math.isfinite(threshold) or (
-        run["training"]["model_kind"] not in {"kmeans", "hddc"} and threshold <= 0
-    ):
-        raise ValueError("invalid evaluation rank_threshold")
-    cutoff = cfg["max_mean_to_manifold_distance"]
-    if cutoff is not None and (not math.isfinite(float(cutoff)) or float(cutoff) <= 0):
-        raise ValueError("evaluation distance cutoff must be finite and positive, or none")
+    if cfg.get("test_shard_dir") is not None:
+        cfg["test_shard_dir"] = _resolve_shard_dir(str(cfg["test_shard_dir"]), None)
+    validate_evaluation_settings(cfg, model_kind=run["training"]["model_kind"])
     return cfg
 
 
@@ -84,33 +75,26 @@ def _prerequisites(run: dict, evaluation: dict) -> tuple[list[str], dict | None]
         if not required[3].is_file() and (directory / "mfa_model_shards.json").exists():
             missing.append("unsupported shard-only model: consolidated checkpoint required")
         return missing, spec
-    _read_object(directory / "config.json")
-    split = _read_object(directory / "val_indices.json")
-    if not isinstance(split.get("val_global_rows"), list):
-        raise ValueError(f"invalid validation split: {directory / 'val_indices.json'}")
-    root, subset = split_shard_dir_spec(run["dataset"]["shard_dir"])
-    dataset = _read_object(root / "config.json")
-    if dataset.get("source_kind") != "toy_manifolds" or dataset.get("window") != 1 or dataset.get("drop_prefix", 0) != 0:
-        raise ValueError(f"incompatible toy-manifold dataset: {root}")
-    if evaluation.get("heldout_distribution_coverage", True):
-        validate_toy_test_split(root, layer=run["dataset"]["layer"])
-    metadata = torch.load(root / dataset["manifold_metadata"], map_location="cpu", weights_only=True)
-    meta = load_meta_index(root, layer=run["dataset"]["layer"])
-    if metadata["row_manifold_ids"].numel() != len(meta):
-        raise ValueError(f"toy-manifold metadata does not match the stream: {root}")
-    positions = resolve_spec_positions(meta, subset, window=1, drop_prefix=0)
     if not _training_artifacts_valid(run):
         raise ValueError(f"invalid saved model artifacts: {directory}")
-    from dalg.evaluation.toy_manifold_tiling import _load_model
-    model = _load_model(directory, run["training"]["model_kind"])
-    if model.K != run["training"]["arguments"]["K"]:
-        raise ValueError(f"checkpoint K does not match the manifest: {directory}")
-    del model
     if not _assignment_artifact_valid(run):
         raise ValueError(f"invalid saved assignments: {_assignments_path(run)}")
-    bundle = torch.load(_assignments_path(run), map_location="cpu", mmap=True, weights_only=True)
-    if bundle["assignments"].numel() != len(positions) or bundle.get("subset_spec") != subset:
-        raise ValueError(f"assignments do not cover the selected stream: {_assignments_path(run)}")
+    kind, layer = run["training"]["model_kind"], run["dataset"]["layer"]
+    model = load_model(directory, kind)
+    if model.K != run["training"]["arguments"]["K"]:
+        raise ValueError(f"checkpoint K does not match the manifest: {directory}")
+    data = load_evaluation_data(directory, shard_dir=run["dataset"]["shard_dir"],
+                                layer=layer, model=model, model_kind=kind)
+    if evaluation["kind"] == "toy_manifold_tiling":
+        if (data.config.get("source_kind") != "toy_manifolds"
+                or data.config["window"] != 1 or data.drop_prefix != 0):
+            raise ValueError(f"incompatible toy-manifold dataset: {data.shard_dir}")
+        metadata = torch.load(data.shard_dir / data.config["manifold_metadata"],
+                              map_location="cpu", weights_only=True)
+        if metadata["row_manifold_ids"].numel() != len(data.meta_index):
+            raise ValueError(f"toy-manifold metadata does not match the stream: {data.shard_dir}")
+    validate_evaluation_inputs(run["dataset"]["shard_dir"], layer=layer, model_kind=kind,
+                               evaluation=evaluation, drop_prefix=data.drop_prefix)
     return [], spec
 
 
@@ -235,7 +219,7 @@ def evaluate_saved_run(plan: dict, index: int) -> None:
     missing, spec = _prerequisites(entry["run"], entry["evaluation"])
     if missing or spec != entry["source_spec"]:
         raise ValueError(f"source artifacts changed or are missing: {directory}; {missing}")
-    from dalg.evaluation.toy_manifold_tiling import evaluate_pipeline_run
+    from dalg.evaluation import evaluate_pipeline_run
     print(f"Reevaluating {index}: {directory}", flush=True)
     metrics = evaluate_pipeline_run(entry["run"], evaluation=entry["evaluation"])
     metrics.update(evaluation_config=entry["evaluation"], evaluation_provenance=_provenance(plan, entry))
@@ -309,7 +293,8 @@ def submit_evaluations(plan: dict, *, dry_run: bool = False) -> None:
 def command_evaluate(args) -> None:
     overrides = {key: getattr(args, key) for key in (
         "device", "batch_size", "rank_threshold", "max_mean_to_manifold_distance",
-        "heldout_distribution_coverage",
+        "heldout_distribution_coverage", "kind", "test_shard_dir",
+        "tile_alignment", "tile_alignment_neighbors",
     ) if hasattr(args, key)}
     resources = {}
     if args.resources:

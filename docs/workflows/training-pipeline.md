@@ -16,6 +16,78 @@ Each stage validates its output and writes a completion marker. Re-running the
 same manifest resumes training from the existing checkpoint or skips stages
 whose artifacts are already valid.
 
+## Code map and data flow
+
+Start with [`src/dalg/pipeline/main.py`](../../src/dalg/pipeline/main.py).
+It contains one function per phase and short coordinators showing their order.
+Each phase calls helpers in a matching module beside it. The package's
+`__init__.py` exports public entry points; private helpers are imported directly
+from their owning modules.
+
+Planning passes ordinary dictionaries between functions:
+
+```text
+YAML path
+  -> load_experiment               -> configuration dictionary
+  -> expand_sweep                  -> independent configuration dictionaries
+  -> map_run_to_manifest (per item) -> resolved run dictionaries
+  -> write_manifest                -> immutable JSONL manifest path
+```
+
+`map_experiments_to_manifest` coordinates the first three phases without writing
+files. `save_experiment_manifest_to_disk` adds manifest persistence and returns
+`(manifest_path, runs)`.
+Inside `map_run_to_manifest`, the code explicitly normalizes sections, resolves
+dataset and output locations, resolves trainer/initialization settings, resolves later
+stage settings, and builds the identified run specification. Planning does not
+fit models. Local workers and Slurm workers read the same saved manifest.
+
+Execution consumes one resolved row:
+
+```text
+execute_run(run)
+  -> prepare_run
+  -> initialize_run
+  -> train_run
+  -> assign_run
+  -> evaluate_run
+  -> complete_run
+```
+
+Each execution phase reads the shared run specification. The data passed
+between phases are files in its resolved run directory: training reads the
+initialization checkpoint, assignments read the final model, and evaluation
+reads the model, saved split, and assignments. Model instances and activation
+tensors remain inside the existing trainer/evaluator implementations.
+
+| Phase in `main.py` | Helper module | Output |
+| --- | --- | --- |
+| `load_experiment` | `configuration.py` | Validated YAML dictionary |
+| `expand_sweep` | `sweep.py` | List of independent configurations |
+| `map_run_to_manifest` | `resolution.py` | Fully defaulted run with identity and artifact paths |
+| `write_manifest` | `manifest.py` | Manifest path |
+| `prepare_run` | `preparation.py` | Run directory with matching `run_spec.json` |
+| `initialize_run` | `initialization.py` | Generated initialization checkpoint path, or `None` when inapplicable |
+| `train_run` | `training.py` | Final model checkpoint or model-shard manifest path |
+| `assign_run` | `assignments.py` | Assignment bundle path, or `None` when disabled |
+| `evaluate_run` | `evaluation.py` | `metrics.json` path, or `None` when disabled |
+| `complete_run` | `completion.py` | Completed run directory |
+
+The main phase functions show skip/run decisions. Helpers implement command
+construction, detailed artifact validation, and persistence. Phase errors
+propagate immediately, preventing later phases and the final completion marker
+from being written by that invocation. Successful retries reuse valid outputs
+and refresh their completion markers. Supplied initialization checkpoints are
+already recorded in the trainer arguments; they do not trigger the separate
+automatic-initialization phase.
+
+`status.py` inspects artifacts without executing phases. `slurm.py` handles
+resource normalization, grouping, and array commands. Neither is an additional
+sequential stage. `common.py` contains shared serialization, CLI encoding,
+subprocess execution, and basic naming helpers. Numerical evaluation remains
+under `src/dalg/evaluation/`; the pipeline's `evaluation.py` handles orchestration
+helpers and report reuse/publication checks.
+
 ## First smoke run
 
 Inspect the resolved command and Slurm allocation without submitting:
@@ -50,7 +122,7 @@ uv run --locked dalg-run-pipeline run --manifest /path/printed/by/plan --index 0
 
 ## Evaluate saved runs
 
-`evaluate` recomputes toy-manifold metrics and **overwrites each selected run's
+`evaluate` recomputes the configured suite and **overwrites each selected run's
 `metrics.json` and `EVALUATION_COMPLETED.json`**. It refreshes the experiment
 summary CSVs after all eligible evaluations succeed. Models, assignments,
 training configuration, saved splits, and original manifests remain unchanged.
@@ -84,7 +156,11 @@ to the same resolved source run directory are evaluated once per invocation,
 retaining all source references. Conflicting identities or effective evaluation
 settings for the same directory are errors.
 
-Settings default to each manifest row. Override them with `--device`,
+Settings default to each manifest row. Override the suite with
+`--evaluation-kind unsupervised` or `--evaluation-kind toy_manifold_tiling`.
+Unsupervised coverage uses `--test-shard-dir PATH` or its manifest setting.
+See [Unsupervised Evaluation](../evaluation/unsupervised.md) for a complete example.
+Override other settings with `--device`,
 `--batch-size`, `--rank-threshold`, or `--max-mean-to-manifold-distance` (`none`
 removes the cutoff). An originally disabled evaluation stage is allowed;
 unspecified evaluator kinds default to `toy_manifold_tiling`. HDDC and KMeans
@@ -93,8 +169,9 @@ retain the source `run_id` and `identity_hash`, with effective settings in
 `evaluation_config` and manifest references in `evaluation_provenance`.
 
 Held-out coverage defaults to enabled, including for older manifests that omit
-the setting. It requires an independent `<dataset>/test/` population of at most
-100,000 points. Missing test data raises an error with a command using
+the setting. Both suites require at most 100,000 test points. Toy evaluation
+reads an independent `<dataset>/test/` population; unsupervised evaluation reads
+the explicitly supplied `test_shard_dir`. Missing toy test data raises an error with a command using
 `scripts/temporary/add_toy_manifold_test_split.py`. Use
 `--no-heldout-distribution-coverage` to reevaluate without coverage, or
 `--heldout-distribution-coverage` to override a disabled source setting.
@@ -184,6 +261,8 @@ For every supported YAML field, default, and model-specific constraint, see the
 - `evaluation`: `toy_manifold_tiling` requires toy-manifold shards and reports
   clustering, component use, rank, and tangent geometry. MFA-family models also
   report NLL and BIC; KMeans reports split quantization error instead.
+  `unsupervised` supports ordinary activation shards and retains the existing
+  fit, component-use, rank-summary, and coverage metrics without known geometry.
 - `resources`: Slurm allocation and maximum array concurrency.
 
 Relative paths are resolved against the repository root. The shard subset can

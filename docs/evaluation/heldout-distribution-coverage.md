@@ -114,9 +114,17 @@ their existing behavior.
 
 ## Pipeline integration
 
-`toy_manifold_tiling` includes this metric by default for KMeans, MFA, ARD, and
-HDDC. Set `evaluation.heldout_distribution_coverage: false` to omit it. The
-direct evaluator accepts the same boolean keyword, defaulting to `True`.
+`toy_manifold_tiling` and `unsupervised` include this metric by default for
+KMeans, MFA, ARD, and HDDC. Set `evaluation.heldout_distribution_coverage: false`
+to omit it. Both direct evaluators accept the same boolean keyword, defaulting
+to `True`.
+
+The unsupervised suite reads an explicit `evaluation.test_shard_dir` and uses
+the same distance calculations, training-only liveness, full curve, and size
+limit. Point counts include every retained token activation in each selected
+window. Its source record describes the activation stream without toy metadata;
+see [Unsupervised Evaluation](unsupervised.md). The partition and fingerprint
+checks described below apply specifically to the toy suite.
 
 Coverage reads every point from `<dataset>/test/`, independently of the root's
 saved training/validation split. It accepts both reserved and supplemental

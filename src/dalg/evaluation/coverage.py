@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -206,8 +206,77 @@ def evaluate_heldout_distribution_coverage(
     return summary, distances
 
 
+@torch.no_grad()
+def evaluate_stream_coverage(
+    batches: Iterable[torch.Tensor], centroids: torch.Tensor, train_live: torch.Tensor,
+    *, expected_points: int, batch_size: int = 8192,
+) -> dict[str, Any]:
+    """Evaluate a bounded test stream, retaining only nearest-centroid distances."""
+    check_empirical_coverage_size(expected_points)
+    if expected_points <= 0:
+        raise ValueError("coverage requires at least one test point")
+    chunks = []
+    count = 0
+    for batch in batches:
+        count += len(batch)
+        check_empirical_coverage_size(count)
+        if count > expected_points:
+            raise ValueError("coverage test stream exceeds its declared point count")
+        chunks.append(nearest_live_centroid_distances(
+            batch, centroids, live_components=train_live, batch_size=batch_size,
+        ))
+    if count != expected_points:
+        raise ValueError("coverage test stream does not match its declared point count")
+    summary = summarize_coverage_distances(torch.cat(chunks), thresholds=None)
+    summary.update(
+        population="independent_test_split", components_total=int(centroids.shape[0]),
+        components_live=int(train_live.sum()), liveness_split="train",
+        curve_kind="full_empirical_cdf",
+    )
+    return summary
+
+
+def coverage_report_valid(report: object, *, components: int) -> bool:
+    """Check the bounded empirical-curve contract before publishing or reusing it."""
+    if not isinstance(report, Mapping):
+        return False
+    if (report.get("definition") != "heldout_point_to_nearest_live_centroid_euclidean_distance"
+            or report.get("population") != "independent_test_split"
+            or report.get("liveness_split") != "train"
+            or report.get("curve_kind") != "full_empirical_cdf"
+            or report.get("convention") != "lower_distances_and_higher_coverage_fractions_are_better"
+            or report.get("components_total") != components):
+        return False
+    count, live = report.get("reference_points"), report.get("components_live")
+    if (type(count) is not int or not 0 < count <= MAX_EMPIRICAL_COVERAGE_POINTS
+            or type(live) is not int or not 0 < live <= components):
+        return False
+    for key in ("mean", "root_mean_square", "median", "r90", "r95", "r99", "maximum"):
+        value = report.get(key)
+        if type(value) not in (float, int) or not math.isfinite(value) or value < 0:
+            return False
+    curve = report.get("coverage_curve")
+    if not isinstance(curve, list) or not 0 < len(curve) <= count:
+        return False
+    previous_radius, previous_fraction = -1.0, 0.0
+    for point in curve:
+        if not isinstance(point, Mapping):
+            return False
+        radius, fraction = point.get("radius"), point.get("fraction")
+        if (type(radius) not in (float, int) or not math.isfinite(radius)
+                or radius < 0 or radius <= previous_radius
+                or type(fraction) not in (float, int) or not math.isfinite(fraction)
+                or not previous_fraction < fraction <= 1
+                or not math.isclose(fraction * count, round(fraction * count), abs_tol=1e-8)):
+            return False
+        previous_radius, previous_fraction = radius, fraction
+    return previous_fraction == 1.0 and previous_radius == report["maximum"]
+
+
 __all__ = [
+    "coverage_report_valid",
     "evaluate_heldout_distribution_coverage",
+    "evaluate_stream_coverage",
     "nearest_live_centroid_distances",
     "split_fingerprint",
     "stratified_three_way_split",

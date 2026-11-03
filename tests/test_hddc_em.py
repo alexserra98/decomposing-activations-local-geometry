@@ -321,7 +321,7 @@ def test_warm_start_preserves_initial_state_before_first_update():
 @pytest.mark.parametrize("workers", [0, 2])
 @pytest.mark.parametrize("shared_b", [False, True])
 def test_em_pipeline_with_shards_and_assignments(tmp_path, monkeypatch, workers, shared_b):
-    from dalg.pipeline import execute_run, resolve_experiment
+    from dalg.pipeline import execute_run, map_experiments_to_manifest
     from tests.synthetic_shards import build_multi_shard
     from tests.test_training_pipeline import _config, _write_yaml
 
@@ -341,7 +341,7 @@ def test_em_pipeline_with_shards_and_assignments(tmp_path, monkeypatch, workers,
         "kmeans_model_path": str(initializer), "em_component_chunk_size": 1,
         "em_eig_batch_size": 1, "epoch_snapshot_every": 1,
     })
-    run = resolve_experiment(_write_yaml(tmp_path / "em.yaml", config))[0]
+    run = map_experiments_to_manifest(_write_yaml(tmp_path / "em.yaml", config))[0]
     assert run["training"]["arguments"]["fit_method"] == "em"
     run_dir = execute_run(run)
     checkpoint = torch.load(run_dir / "checkpoint.pt", weights_only=False)

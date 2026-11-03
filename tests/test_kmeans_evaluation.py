@@ -10,10 +10,8 @@ from dalg.analysis.cluster_assignments import compute_assignments
 from dalg.cli.run_metrics import build_parser
 from dalg.data.manifold_dataset import ToyManifoldConfig, save_toy_manifold_shards
 from dalg.data.shard_activations import load_meta_index
-from dalg.evaluation.toy_manifold_metrics import (
-    _leading_covariance_eigenspaces,
-    evaluate_toy_manifold_metrics,
-)
+from dalg.evaluation.subspaces import leading_covariance_eigenspaces as _leading_covariance_eigenspaces
+from dalg.evaluation.toy_manifold_metrics import evaluate_toy_manifold_metrics
 from dalg.evaluation.toy_manifold_tiling import evaluate_toy_manifold_tiling
 from dalg.models.kmeans import KMeans, save_kmeans
 
