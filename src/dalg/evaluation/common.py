@@ -12,8 +12,10 @@ from torch.utils.data import DataLoader
 
 from dalg.analysis.bic import bic_from_mean_nll, model_parameter_count
 from dalg.analysis.bic_improved import active_bic_from_standard
+from dalg.analysis.reconstruction import ReconstructionMoments, reconstruction_errors
 from dalg.data.shard_activations import ActivationBatchDataset, load_meta_index
 from dalg.data.subset_spec import resolve_spec_positions, split_shard_dir_spec
+from dalg.evaluation.reconstruction import reconstruction_metadata
 
 
 @dataclass
@@ -39,6 +41,11 @@ class EvaluationData:
             "shard_dir": str(self.shard_dir), "subset_spec": self.subset_spec,
             "layer": int(layer), "selected_rows": len(self.positions),
             "train_rows": len(self.train_positions), "validation_rows": len(self.val_positions),
+            "d_model": int(self.config["d_model"]),
+            "window": int(self.config["window"]), "drop_prefix": self.drop_prefix,
+            "selected_points": len(self.positions) * self.tokens_per_row,
+            "train_points": len(self.train_positions) * self.tokens_per_row,
+            "validation_points": len(self.val_positions) * self.tokens_per_row,
         }
 
 
@@ -154,6 +161,7 @@ def _mean_nll(
     batch_size: int,
     drop_prefix: int,
     device: torch.device,
+    reconstruction: ReconstructionMoments | None = None,
 ) -> float:
     if not positions:
         raise ValueError("cannot evaluate NLL on an empty split")
@@ -176,6 +184,8 @@ def _mean_nll(
             x = batch.to(device, non_blocking=(device.type == "cuda"))
             total_nll += float(model.nll(x).item()) * int(x.shape[0])
             total_points += int(x.shape[0])
+            if reconstruction is not None:
+                reconstruction.update(*reconstruction_errors(model, x, model_kind="hddc"))
     if total_points == 0:
         raise ValueError("cannot evaluate NLL on an empty split")
     return total_nll / total_points
@@ -191,6 +201,7 @@ def _quantization_error(
     batch_size: int,
     drop_prefix: int,
     device: torch.device,
+    reconstruction: ReconstructionMoments | None = None,
 ) -> dict[str, float | int | None]:
     """Measure squared distances, reporting no mean for an empty split."""
     if not positions:
@@ -210,9 +221,12 @@ def _quantization_error(
     total_points = 0
     for batch in DataLoader(dataset, batch_size=None, num_workers=0):
         x = batch.to(device, non_blocking=(device.type == "cuda"))
-        assigned_means = model.mu[model.predict(x)]
+        labels = model.predict(x)
+        assigned_means = model.mu[labels]
         total_squared_distance += float((x.double() - assigned_means.double()).square().sum())
         total_points += len(x)
+        if reconstruction is not None:
+            reconstruction.update(*reconstruction_errors(model, x, model_kind="kmeans", labels=labels))
     if total_points == 0:
         raise ValueError("cannot evaluate quantization error on an empty split")
     return {
@@ -225,12 +239,15 @@ def _quantization_error(
 @torch.no_grad()
 def evaluate_fit(model, data: EvaluationData, *, model_kind: str, layer: int,
                  batch_size: int, device: torch.device) -> dict[str, Any]:
-    """Evaluate split NLL/BIC or KMeans quantization using the saved partition."""
+    """Evaluate fit and reconstruction metrics using the saved partition."""
     clean_shard_dir = data.shard_dir
     train_positions, val_positions = data.train_positions, data.val_positions
     window, drop_prefix = int(data.config["window"]), data.drop_prefix
     train_cluster_sizes = data.train_cluster_sizes
     resolved_device = device
+    reconstruction = {
+        name: ReconstructionMoments() for name in ("train", "validation")
+    } if model_kind in {"hddc", "kmeans"} else {}
     if model_kind == "kmeans":
         if not train_positions:
             raise ValueError("cannot evaluate KMeans quantization error on an empty training split")
@@ -244,6 +261,7 @@ def evaluate_fit(model, data: EvaluationData, *, model_kind: str, layer: int,
                     batch_size=batch_size,
                     drop_prefix=drop_prefix,
                     device=resolved_device,
+                    reconstruction=reconstruction[name],
                 )
                 for name, split_positions in (
                     ("train", train_positions), ("validation", val_positions)
@@ -260,6 +278,7 @@ def evaluate_fit(model, data: EvaluationData, *, model_kind: str, layer: int,
             batch_size=batch_size,
             drop_prefix=drop_prefix,
             device=resolved_device,
+            reconstruction=reconstruction.get("train"),
         )
         val_nll = _mean_nll(
             model,
@@ -269,6 +288,7 @@ def evaluate_fit(model, data: EvaluationData, *, model_kind: str, layer: int,
             batch_size=batch_size,
             drop_prefix=drop_prefix,
             device=resolved_device,
+            reconstruction=reconstruction.get("validation"),
         )
         n_train = len(train_positions) * (window - drop_prefix)
         bic_parameters = model_parameter_count(model, model_kind)
@@ -305,4 +325,9 @@ def evaluate_fit(model, data: EvaluationData, *, model_kind: str, layer: int,
             },
         }
 
+    if reconstruction:
+        fit_metrics["reconstruction"] = {
+            **reconstruction_metadata(model_kind, model.D),
+            **{name: moments.summary() for name, moments in reconstruction.items()},
+        }
     return fit_metrics

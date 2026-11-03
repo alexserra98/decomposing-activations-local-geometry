@@ -9,9 +9,13 @@ from typing import Any
 import torch
 
 from dalg.evaluation.tile_alignment import validate_tile_alignment_settings
+from dalg.evaluation.pc1_density import PC1_DENSITY_DEFAULTS, validate_pc1_density_settings
 
 
 def validate_evaluation_settings(cfg: Mapping[str, Any], *, model_kind: str) -> None:
+    validate_pc1_density_settings(cfg)
+    if cfg.get("pc1_density", False) and (cfg["kind"] != "unsupervised" or model_kind not in {"kmeans", "hddc"}):
+        raise ValueError("PC1 density requires unsupervised evaluation of KMeans or HDDC")
     validate_tile_alignment_settings(
         cfg.get("tile_alignment", True), cfg.get("tile_alignment_neighbors", 5),
     )
@@ -75,7 +79,8 @@ def evaluate_pipeline_run(
         from dalg.evaluation.unsupervised import evaluate_unsupervised
 
         evaluator = evaluate_unsupervised
-        options = {"test_shard_dir": cfg.get("test_shard_dir")}
+        options = {"test_shard_dir": cfg.get("test_shard_dir"),
+                   **{key: cfg.get(key, value) for key, value in PC1_DENSITY_DEFAULTS.items()}}
     metrics = evaluator(
         run["run_dir"], shard_dir=run["dataset"]["shard_dir"],
         layer=int(run["dataset"]["layer"]), model_kind=kind,

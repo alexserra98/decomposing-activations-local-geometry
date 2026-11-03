@@ -735,6 +735,12 @@ def test_real_toy_manifold_tiling_pipeline_runs_end_to_end(tmp_path: Path) -> No
     assert metrics["dataset"]["selected_rows"] == 76
     assert len(load_meta_index(shard_dir / "test", layer=0)) == 20
     assert metrics["bic"]["n"] == metrics["dataset"]["train_rows"]
+    for split in ("train", "validation"):
+        reconstruction = metrics["reconstruction"][split]
+        assert reconstruction["n"] == metrics["dataset"][f"{split}_rows"]
+        assert reconstruction["excluded_n"] == 0
+        assert reconstruction["mse"] >= 0
+        assert reconstruction["standard_error"] >= 0
     assert metrics["bic"]["parameters"] > 0
     assert metrics["bic"]["convention"] == "higher_is_better"
     assert metrics["bic"]["value"] == pytest.approx(

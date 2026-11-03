@@ -29,6 +29,7 @@ uv.lock
 *.npz
 *.h5
 *.hdf5
+!tests/fixtures/pc1_density_knn3d_roundoff.pt
 
 # Experiment outputs
 experiments/data/

@@ -11,6 +11,8 @@ from typing import Any
 from dalg.data.subset_spec import split_shard_dir_spec
 from dalg.evaluation.toy_manifold_coverage import coverage_report_valid
 from dalg.evaluation.tile_alignment import tile_alignment_report_valid
+from dalg.evaluation.reconstruction import reconstruction_report_valid
+from dalg.evaluation.pc1_density import PC1_DENSITY_DEFAULTS
 
 from .common import _write_json_atomic
 
@@ -25,6 +27,7 @@ _EVALUATION_DEFAULTS = {
     "heldout_distribution_coverage": True,
     "tile_alignment": True,
     "tile_alignment_neighbors": 5,
+    **PC1_DENSITY_DEFAULTS,
 }
 
 
@@ -46,6 +49,11 @@ def _evaluation_metrics_valid(run: Mapping[str, Any], metrics: Any) -> bool:
 
         return unsupervised_report_valid(run, metrics)
     if not isinstance(metrics, Mapping):
+        return False
+    kind = run["training"]["model_kind"]
+    if kind in {"hddc", "kmeans"} and not reconstruction_report_valid(
+        metrics.get("reconstruction"), model_kind=kind, dataset=metrics.get("dataset"),
+    ):
         return False
     if run["evaluation"].get("tile_alignment", True):
         if not tile_alignment_report_valid(

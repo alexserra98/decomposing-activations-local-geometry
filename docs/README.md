@@ -75,6 +75,8 @@ scope.
 - [KNN-PCA centroid initialization](experiments/knn-pca-centroid-initialization.md)
   documents the temporary 64-neighbor workaround used to provide 32 local
   directions for sparse `K=1000` toy KMeans partitions.
+- [PC1 density alignment](experiments/pc1-density-alignment.md) explains current
+  pipeline commands and the years/temperature density-support findings.
 - [Synthetic MFA analyses](experiments/synthetic-mfa.md) describes the temporary
   synthetic sweep and related analysis.
 - [Wikipedia KMedoids slice](experiments/wikipedia-kmedoids.md) describes the

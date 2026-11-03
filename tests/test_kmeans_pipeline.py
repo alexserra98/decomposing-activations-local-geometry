@@ -185,6 +185,9 @@ def test_kmeans_pipeline_without_validation(tmp_path: Path) -> None:
     assert metrics["quantization"]["validation"] == {
         "n": 0, "sum_squared_distance": 0.0, "mean_squared_distance": None,
     }
+    assert metrics["reconstruction"]["validation"] == {
+        "n": 0, "excluded_n": 0, "mse": None, "standard_error": None,
+    }
     assert pipeline_status([run])[0]["pipeline"]
 
 
@@ -233,6 +236,10 @@ def test_sparse_pipeline_keeps_partition_and_resumes(tmp_path, monkeypatch, K, t
     assert metrics['rank']['components'] == eligible
     assert metrics['quantization']['train']['n'] == 96
     assert metrics['quantization']['validation']['n'] == 24
+    reconstruction = metrics['reconstruction']['train']
+    assert reconstruction['n'] == int(model.cluster_counts[model.pca_valid].sum())
+    assert reconstruction['excluded_n'] == 96 - reconstruction['n']
+    assert reconstruction['excluded_n'] > 0
     assert metrics['heldout_distribution_coverage']['components_live'] == K
     assignments = torch.load(directory / 'kmeans_model_assignments.pt', weights_only=True)
     assert assignments['assignments'].numel() == 120

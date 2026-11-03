@@ -466,6 +466,11 @@ assignment count before the stage is marked complete.
 | `heldout_distribution_coverage` | boolean | `true` | Compute distance summaries and the full empirical coverage curve using training-live centroids. Set `false` to omit coverage and its test-data requirement. |
 | `tile_alignment` | boolean | `true` | Compute neighboring-tile leading-PC and best-subset PC alignment in either suite. |
 | `tile_alignment_neighbors` | integer | `5` | Positive directed centroid kNN neighbor count, capped at eligible tiles minus one. |
+| `pc1_density` | boolean | `false` | Compute PC1 density support; only for `unsupervised` KMeans/HDDC evaluation. |
+| `pc1_density_space` | string | `pca75` | `pca75` fits training-only global PCA retaining 75% variance; `ambient` uses original coordinates. |
+| `pc1_density_neighbors` | integer | `20` | Positive kNN density neighbor count; requires at least this many saved validation points. |
+| `pc1_density_random_directions` | integer | `32` | Positive number of matched isotropic random baseline directions per component. |
+| `pc1_density_seed` | integer | `42` | Nonnegative baseline seed; component ID is added to it. |
 | `test_shard_dir` | string or `null` | `null` | Unsupervised evaluation only: explicit independent test shards, required when coverage is enabled. Accepts the subset suffix; relative paths resolve against the repository root. |
 
 `evaluation.enabled: true` requires `assignments.enabled: true`.
@@ -483,7 +488,9 @@ raises an exception requesting a scalable coverage implementation. See the
 KMeans quantization, live/dead components, effective-rank summaries, and optional
 coverage, plus neighboring-tile alignment by default. It requires no manifold
 metadata. Alignment computes PCs using the shared Python helpers; disabling it
-avoids that eigendecomposition. No PC artifact is saved. See the
+avoids that eigendecomposition. Optional PC1 density computes its own geometry
+and training PCA; see the [PC1 density contract](../evaluation/unsupervised.md#pc1-density-support).
+No PC artifact is saved. See the
 [unsupervised evaluation contract](../evaluation/unsupervised.md) for stream
 alignment, test-data requirements, and output populations.
 
@@ -629,6 +636,11 @@ for local and Slurm examples, result layout, and retry behavior.
 | `--rank-threshold FLOAT` | Override the MFA/ARD effective-rank threshold; ignored for HDDC/KMeans. |
 | `--max-mean-to-manifold-distance FLOAT_OR_NONE` | Positive finite association cutoff, or `none` to remove it. |
 | `--heldout-distribution-coverage` / `--no-heldout-distribution-coverage` | Enable or disable test coverage for this evaluation invocation. Missing settings in older manifests default to enabled. |
+| `--pc1-density` / `--no-pc1-density` | Enable or disable PC1 density support; older manifests default to disabled. |
+| `--pc1-density-space {pca75,ambient}` | Density coordinates; defaults to training PCA retaining 75% variance. |
+| `--pc1-density-neighbors N` | Positive kNN density neighbor count. |
+| `--pc1-density-random-directions N` | Positive number of random baseline directions. |
+| `--pc1-density-seed N` | Nonnegative random baseline seed. |
 | `--resources PATH` | Flat YAML mapping of resource overrides using the existing `resources` keys. |
 | `--submit` | Submit evaluation arrays followed by a dependent CPU collection job. |
 | `--dry-run` | Inspect without writing outputs, evaluating, or submitting. |

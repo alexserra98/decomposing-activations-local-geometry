@@ -18,6 +18,10 @@ from dalg.evaluation.coverage import (
     check_empirical_coverage_size, coverage_report_valid, evaluate_stream_coverage,
 )
 from dalg.evaluation.subspaces import effective_component_ranks
+from dalg.evaluation.reconstruction import reconstruction_report_valid
+from dalg.evaluation.pc1_density import (
+    evaluate_pc1_density, pc1_density_report_valid, validate_pc1_density_settings,
+)
 from dalg.evaluation.tile_alignment import (
     evaluate_tile_alignment, tile_alignment_report_valid, validate_tile_alignment_settings,
 )
@@ -82,12 +86,23 @@ def evaluate_unsupervised(
     heldout_distribution_coverage: bool = True,
     tile_alignment: bool = True,
     tile_alignment_neighbors: int = 5,
+    pc1_density: bool = False, pc1_density_space: str = "pca75",
+    pc1_density_neighbors: int = 20, pc1_density_random_directions: int = 32,
+    pc1_density_seed: int = 42,
 ) -> dict[str, Any]:
-    """Compute existing fit, component, rank, and held-out coverage summaries.
+    """Compute fit, component, rank, coverage, and optional geometry summaries.
 
     Tile alignment computes covariance PCs when enabled but saves only scores
     and neighbor comparisons, not a PC artifact.
     """
+    validate_pc1_density_settings({
+        "pc1_density": pc1_density, "pc1_density_space": pc1_density_space,
+        "pc1_density_neighbors": pc1_density_neighbors,
+        "pc1_density_random_directions": pc1_density_random_directions,
+        "pc1_density_seed": pc1_density_seed,
+    })
+    if pc1_density and model_kind not in {"kmeans", "hddc"}:
+        raise ValueError("PC1 density supports only KMeans and HDDC")
     validate_tile_alignment_settings(tile_alignment, tile_alignment_neighbors)
     if type(heldout_distribution_coverage) is not bool:
         raise ValueError("heldout_distribution_coverage must be true or false")
@@ -121,13 +136,7 @@ def evaluate_unsupervised(
     report = {
         "schema_version": 2, "evaluation": "unsupervised", "model_kind": model_kind,
         "K": int(model.K), "q_capacity": int(model.q),
-        "dataset": {
-            **data.dataset_summary(layer), "window": int(data.config["window"]),
-            "drop_prefix": data.drop_prefix,
-            "selected_points": len(data.positions) * data.tokens_per_row,
-            "train_points": len(data.train_positions) * data.tokens_per_row,
-            "validation_points": len(data.val_positions) * data.tokens_per_row,
-        },
+        "dataset": data.dataset_summary(layer),
         **fit,
         "components": {"live": int(live.sum()), "dead": int((~live).sum())},
         "rank": {
@@ -144,6 +153,12 @@ def evaluate_unsupervised(
     if tile_alignment:
         report["tile_alignment"] = evaluate_tile_alignment(
             model, live, neighbors=tile_alignment_neighbors, rank_threshold=rank_threshold,
+        )
+    if pc1_density:
+        report["pc1_density"] = evaluate_pc1_density(
+            model, data, model_kind=model_kind, layer=layer, batch_size=batch_size,
+            space=pc1_density_space, neighbors=pc1_density_neighbors,
+            random_directions=pc1_density_random_directions, seed=pc1_density_seed,
         )
     if source is not None:
         report["heldout_distribution_coverage"] = _test_coverage(
@@ -176,6 +191,10 @@ def unsupervised_report_valid(run: Mapping[str, Any], metrics: Any) -> bool:
     if any(not isinstance(metrics.get(key), Mapping) for key in required_blocks):
         return False
     dataset = metrics["dataset"]
+    if kind in {"hddc", "kmeans"} and not reconstruction_report_valid(
+        metrics.get("reconstruction"), model_kind=kind, dataset=dataset,
+    ):
+        return False
     root, subset = split_shard_dir_spec(run["dataset"]["shard_dir"])
     if (not isinstance(dataset.get("shard_dir"), str)
             or Path(dataset["shard_dir"]).resolve() != root.resolve()
@@ -191,6 +210,12 @@ def unsupervised_report_valid(run: Mapping[str, Any], metrics: Any) -> bool:
         return False
     if any(dataset[f"{split}_points"] != dataset[f"{split}_rows"] * tokens_per_row
            for split in ("selected", "train", "validation")):
+        return False
+    if run["evaluation"].get("pc1_density", False):
+        if not pc1_density_report_valid(metrics.get("pc1_density"), components=k,
+                                        cfg=run["evaluation"], dataset=dataset):
+            return False
+    elif "pc1_density" in metrics:
         return False
     components = metrics.get("components", {})
     if (any(type(components.get(key)) is not int or components[key] < 0 for key in ("live", "dead"))

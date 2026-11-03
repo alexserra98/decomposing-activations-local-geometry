@@ -9,6 +9,8 @@ The toy-manifold tiling evaluator measures how local components cover planted
 manifold instances. It supports MFA, ARD, HDDC, and KMeans+PCA checkpoints and
 writes clustering, rank, and tangent geometry to `metrics.json`. MFA-family
 models also report NLL and augmented BIC; KMeans reports quantization error.
+HDDC and KMeans+PCA also report train/validation reconstruction MSE and standard
+error using the [shared reconstruction contract](../../evaluation/unsupervised.md#reconstruction-mse).
 All models include [held-out distribution coverage](../../evaluation/heldout-distribution-coverage.md)
 by default, evaluated on the independent `test/` population.
 
@@ -511,6 +513,7 @@ model_kind
 K
 q_capacity
 dataset
+reconstruction                # HDDC and KMeans+PCA; shared split MSE contract
 heldout_distribution_coverage  # when enabled; full empirical CDF and distance summaries
 nll
 bic

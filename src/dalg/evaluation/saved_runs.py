@@ -295,6 +295,8 @@ def command_evaluate(args) -> None:
         "device", "batch_size", "rank_threshold", "max_mean_to_manifold_distance",
         "heldout_distribution_coverage", "kind", "test_shard_dir",
         "tile_alignment", "tile_alignment_neighbors",
+        "pc1_density", "pc1_density_space", "pc1_density_neighbors",
+        "pc1_density_random_directions", "pc1_density_seed",
     ) if hasattr(args, key)}
     resources = {}
     if args.resources:
