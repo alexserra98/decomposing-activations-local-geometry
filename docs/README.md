@@ -78,6 +78,10 @@ scope.
 - [Toy held-out coverage](experiments/toy-heldout-coverage.md) defines the
   strict D=128 noiseless pilot and its fixed train/validation/test artifacts,
   with paired noisy spheres retained as a low-dimensional visual control.
+- [PC1 density support](experiments/pc1-density-alignment.md) defines the
+  years/layer-4 ambient pilot and global-PCA75 repeats for years and temperature
+  at layers 4 and 28, comparing original PC1 density retention with matched random directions,
+  and the paired direction-swap control at common centers and lengths.
 
 ## Document roles
 
