@@ -178,6 +178,7 @@ def run_prompt_extraction(
     checkpoint. A finished run can be resumed without loading the model weights.
     """
     from transformers import AutoConfig, AutoModel, AutoTokenizer, __version__ as transformers_version
+    from transformers.utils.hub import cached_file, extract_commit_hash
 
     if batch_size <= 0 or shard_size <= 0:
         raise ValueError("batch_size and shard_size must be positive")
@@ -196,7 +197,10 @@ def run_prompt_extraction(
     model_config = AutoConfig.from_pretrained(model_name, revision=revision, cache_dir=cache_dir)
     if model_config.model_type != "llama":
         raise ValueError(f"Unsupported model_type={model_config.model_type!r}; expected 'llama'")
-    resolved_revision = getattr(model_config, "_commit_hash", None)
+    # Config objects may discard _commit_hash; the cached snapshot path pins it.
+    resolved_revision = None if local_model else extract_commit_hash(
+        cached_file(model_name, "config.json", revision=revision, cache_dir=cache_dir), None,
+    )
     if not local_model and not resolved_revision:
         raise ValueError("Could not resolve the model's immutable Hugging Face revision")
     load_revision = resolved_revision if not local_model else revision

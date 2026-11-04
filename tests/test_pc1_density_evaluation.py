@@ -65,6 +65,7 @@ def test_pipeline_density_saved_split_and_aggregation(tmp_path, monkeypatch, kin
         assert metric['projection'] is None
         expected_reference = val
     torch.testing.assert_close(captured['reference'], expected_reference)
+    assert metric['quadrature_grid_points'] == [201, 401, 801, 1601, 3201, 6401]
     assert metric['reference']['points'] == len(val)
     assert metric['eligible_components'] > 0
     assert metric['eligible_components'] + metric['excluded_components'] == 2
@@ -75,7 +76,7 @@ def test_pipeline_density_saved_split_and_aggregation(tmp_path, monkeypatch, kin
     assert general.iloc[0]['pc1_density.log_retention.median'] == metric['log_retention']['median']
     assert json.loads(general.iloc[0]['pc1_density.per_component']) == metric['per_component']
 
-    for mutation in ('missing', 'settings', 'summary', 'split', 'duplicate_id', 'nan'):
+    for mutation in ('missing', 'settings', 'summary', 'split', 'duplicate_id', 'resolution', 'old_version', 'nan'):
         broken = copy.deepcopy(report)
         block = broken['pc1_density']
         if mutation == 'missing':
@@ -86,6 +87,10 @@ def test_pipeline_density_saved_split_and_aggregation(tmp_path, monkeypatch, kin
             block['log_retention']['median'] += 1
         elif mutation == 'split':
             block['reference']['points'] += 1
+        elif mutation == 'resolution':
+            block['quadrature_grid_points'] = [1601, 3201, 6401]
+        elif mutation == 'old_version':
+            block['version'] = 1
         elif mutation == 'duplicate_id':
             block['per_component'][0]['component_id'] = 2
         else:

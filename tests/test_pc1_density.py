@@ -244,3 +244,117 @@ def test_one_dimensional_kmeans_has_a_unique_pc1():
     assert geometry['exclusion_reasons'] == ['']
     assert geometry['eigenvalues'][0] == pytest.approx(2.5)
     assert geometry['vectors'][0].abs().item() == 1
+
+
+@pytest.mark.parametrize('case_index', [0, 1, 2])
+def test_sae_selective_quadrature_matches_independent_dense_integration(case_index):
+    cases = torch.load(Path(__file__).parent / 'fixtures/pc1_density_sae_roundoff.pt', weights_only=True)
+    case = cases[case_index]
+    # Distances along e1 depend only on the projection and orthogonal residual norm.
+    reference = torch.zeros(len(case['dot']), case['dimension'], dtype=torch.float64)
+    reference[:, 0] = case['dot']
+    reference[:, 1] = (case['norm2'] - case['dot'].square()).sqrt()
+    estimator = KNNLogDensity(reference, k=case['k'])
+    center = torch.zeros(case['dimension'], dtype=torch.float64)
+    direction = torch.zeros_like(center)
+    direction[0] = 1
+    positions = torch.linspace(-1, 1, 201, dtype=torch.float64)
+    profiles, _ = estimator.line_profiles(center, direction[None], positions * case['half_length'])
+    actual, error, _ = estimator.adaptive_log_averages(
+        center, direction[None], case['half_length'], positions, profiles)
+    assert abs(float(actual[0]) - case['expected_log_average']) < 2e-6
+    assert error <= 1e-4
+
+
+def test_refinement_retries_warnings_without_relaxing_accuracy(monkeypatch):
+    from scipy import integrate
+    from dalg.analysis.pc1_density import QUADRATURE_GRID_POINTS
+    estimator = KNNLogDensity(torch.tensor([[1., 1.], [2., 1.]], dtype=torch.float64), k=1)
+    center = torch.zeros(2, dtype=torch.float64)
+    direction = torch.tensor([[1., 0.]], dtype=torch.float64)
+    positions = torch.linspace(-1, 1, 201, dtype=torch.float64)
+    profiles, _ = estimator.line_profiles(center, direction, positions)
+    calls = []
+
+    def quadrature(*args, **kwargs):
+        if not kwargs.get('full_output'):
+            return 1., 1e-6
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return 1., 1e-6, {'neval': 1}, 'roundoff warning despite small error estimate'
+        return 1., 1e-6, {'neval': 1}
+
+    monkeypatch.setattr(integrate, 'quad', quadrature)
+    _, error, evaluations = estimator.adaptive_log_averages(center, direction, 1., positions, profiles)
+    assert len(calls) == 2 and evaluations == 2 and error == 1e-6
+    assert len(calls[1]['points']) > len(calls[0]['points'])
+    assert all(call['epsrel'] == 1e-4 for call in calls)
+
+    def never_converges(*args, **kwargs):
+        return (1., 1e-6, {'neval': 1}, 'roundoff') if kwargs.get('full_output') else (1., 1e-6)
+
+    monkeypatch.setattr(integrate, 'quad', never_converges)
+    with pytest.raises(RuntimeError, match=f'after {QUADRATURE_GRID_POINTS[-1]} grid points'):
+        estimator.adaptive_log_averages(center, direction, 1., positions, profiles)
+
+
+def test_refinement_is_independent_for_each_direction(monkeypatch):
+    from scipy import integrate
+    import numpy as np
+
+    estimator = KNNLogDensity(torch.tensor([[2., 3.], [4., 5.]], dtype=torch.float64), k=1)
+    center = torch.zeros(2, dtype=torch.float64)
+    directions = torch.tensor([[1., 0.], [0., 1.], [-1., 0.]], dtype=torch.float64)
+    positions = torch.linspace(-1, 1, 201, dtype=torch.float64)
+    profiles, _ = estimator.line_profiles(center, directions, positions)
+    pilots, attempts = [], []
+
+    def quadrature(*args, **kwargs):
+        if not kwargs.get('full_output'):
+            pilots.append(kwargs)
+            attempts.append([])
+            return 1., 1e-6
+        attempts[-1].append(kwargs)
+        # Only the middle direction needs refinement, even without a warning.
+        error = 2e-4 if len(attempts) == 2 and len(attempts[-1]) == 1 else 1e-4
+        return 1., error, {'neval': 10}
+
+    monkeypatch.setattr(integrate, 'quad', quadrature)
+    averages, error, evaluations = estimator.adaptive_log_averages(
+        center, directions, 1., positions, profiles)
+    assert averages.shape == (3,)
+    assert [len(calls) for calls in attempts] == [1, 2, 1]
+    assert error == 1e-4 and evaluations == 20
+    for pilot, calls in zip(pilots, attempts):
+        # Extra peak breakpoints are preserved, but each direction starts coarse.
+        np.testing.assert_array_equal(pilot['points'], calls[0]['points'])
+        expected_breaks = np.unique(np.r_[positions.numpy()[1:-1],
+                                         np.linspace(-1, 1, 201)[1:-1]])
+        np.testing.assert_array_equal(pilot['points'], expected_breaks)
+        assert all(call['epsrel'] == 1e-4 for call in calls)
+        assert all(call['epsabs'] == 1e-6 for call in calls)
+    assert len(attempts[1][1]['points']) > len(attempts[1][0]['points'])
+
+
+@pytest.mark.parametrize('pilot_invalid', [False, True])
+@pytest.mark.parametrize('value', [0., -1., float('nan'), float('inf')])
+def test_invalid_integral_fails_without_refinement(monkeypatch, pilot_invalid, value):
+    from scipy import integrate
+
+    estimator = KNNLogDensity(torch.tensor([[2., 3.]], dtype=torch.float64), k=1)
+    center = torch.zeros(2, dtype=torch.float64)
+    direction = torch.tensor([[1., 0.]], dtype=torch.float64)
+    positions = torch.linspace(-1, 1, 201, dtype=torch.float64)
+    profiles, _ = estimator.line_profiles(center, direction, positions)
+    calls = []
+
+    def quadrature(*args, **kwargs):
+        calls.append(kwargs)
+        if not kwargs.get('full_output'):
+            return (value if pilot_invalid else 1.), 1e-6
+        return value, 1e-6, {'neval': 1}
+
+    monkeypatch.setattr(integrate, 'quad', quadrature)
+    with pytest.raises(ValueError, match='nonpositive or nonfinite'):
+        estimator.adaptive_log_averages(center, direction, 1., positions, profiles)
+    assert len(calls) == (1 if pilot_invalid else 2)

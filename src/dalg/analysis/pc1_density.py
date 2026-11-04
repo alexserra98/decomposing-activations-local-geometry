@@ -12,6 +12,9 @@ import numpy as np
 import torch
 
 
+QUADRATURE_GRID_POINTS = (201, 401, 801, 1601, 3201, 6401)
+
+
 def log_average_density(log_density: torch.Tensor) -> torch.Tensor:
     """Log trapezoidal average on a uniform grid, along the last dimension."""
     if log_density.shape[-1] < 3 or not torch.isfinite(log_density).all():
@@ -84,10 +87,11 @@ class KNNLogDensity:
         """Integrate rescaled densities with QUADPACK and explicit peak splits.
 
         A uniform pilot grid locates peaks. Bounded searches refine their
-        positions. Every pilot interval is an explicit quadrature subinterval
-        to handle kNN neighbour switches, with additional splits at refined
-        peaks. Absolute error is controlled relative to a pilot integral before
-        requesting the final tolerance.
+        positions. Each direction starts with coarse uniform subintervals,
+        with additional splits at pilot positions and refined peaks. Only
+        failed convergence or excess error triggers finer subintervals for
+        that direction, at the same tolerance.
+        Absolute error is controlled relative to a pilot integral.
         """
         from scipy.integrate import quad
         from scipy.optimize import minimize_scalar
@@ -118,26 +122,36 @@ class KNNLogDensity:
                     raise RuntimeError('Could not resolve a pilot density peak')
                 peak_positions.append(float(optimum.x))
                 shift = max(shift, -float(optimum.fun))
-            breaks = np.unique(np.r_[positions[1:-1], peak_positions])
+            peak_breaks = np.r_[positions[1:-1], peak_positions]
 
             def integrand(s):
                 return math.exp(log_density(s) - shift)
 
-            pilot, _ = quad(integrand, -1, 1, points=breaks, epsabs=1e-10,
-                            epsrel=1e-3, limit=2000)
+            initial_breaks = np.unique(np.r_[peak_breaks,
+                np.linspace(-1, 1, QUADRATURE_GRID_POINTS[0])[1:-1]])
+            pilot, _ = quad(integrand, -1, 1, points=initial_breaks, epsabs=1e-10,
+                            epsrel=1e-3, limit=10000)
             if not math.isfinite(pilot) or pilot <= 0:
                 raise ValueError('Adaptive density integral is nonpositive or nonfinite')
-            result = quad(integrand, -1, 1, points=breaks, epsabs=pilot * 1e-6,
-                          epsrel=1e-4, limit=2000, full_output=1)
-            if len(result) != 3:
-                raise RuntimeError(f'Adaptive density integration failed: {result[3]}')
-            value, error, info = result
-            if (value <= 0 or not math.isfinite(value) or not math.isfinite(error)
-                    or error < 0 or error / value > 1e-4):
-                raise ValueError('Adaptive density integral did not meet relative error tolerance')
+            total_evaluations = 0
+            for grid_points in QUADRATURE_GRID_POINTS:
+                breaks = np.unique(np.r_[peak_breaks, np.linspace(-1, 1, grid_points)[1:-1]])
+                result = quad(integrand, -1, 1, points=breaks, epsabs=pilot * 1e-6,
+                              epsrel=1e-4, limit=max(10000, 3 * len(breaks)), full_output=1)
+                value, error, info = result[:3]
+                total_evaluations += info['neval']
+                if (value <= 0 or not math.isfinite(value) or not math.isfinite(error)
+                        or error < 0):
+                    raise ValueError('Adaptive density integral is nonpositive or nonfinite')
+                if len(result) == 3 and error / value <= 1e-4:
+                    break
+            else:
+                reason = result[3] if len(result) > 3 else 'relative error tolerance not met'
+                raise RuntimeError(f'Adaptive density integration failed after {grid_points} '
+                                   f'grid points: {reason}')
             averages.append(shift + math.log(value / 2))
             relative_errors.append(error / value)
-            evaluations.append(info['neval'])
+            evaluations.append(total_evaluations)
         return (torch.tensor(averages, dtype=torch.float64, device=self.reference.device),
                 max(relative_errors), max(evaluations))
 

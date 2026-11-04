@@ -1,13 +1,13 @@
-# Training only, on original 4096-dimensional last-token activations.
-# Layers are zero-based decoder-block indices. Each file resolves to 72 runs.
+# Training, assignments, and full unsupervised evaluation on last-token activations.
+# Layers are zero-based decoder-block indices. Each file resolves to 36 runs.
 # Large-K runs require the covariance/PCA memory issue to be resolved before submission.
 experiment:
   name: sae_manifold_temperature_02d_years_neutral_kmeans_pca
-  output_root: dalg-cache/sae_manifold_models_temperature_years
+  output_root: dalg-cache/sae-manifold/sae_manifold_temperature_02d_years_neutral_llama31_8b_last
 
 dataset:
   id: temperature_02d_years_neutral
-  shard_dir: dalg-cache/sae_manifold_temperature_02d_years_neutral_llama31_8b_last
+  shard_dir: dalg-cache/sae-manifold/sae_manifold_temperature_02d_years_neutral_llama31_8b_last
   layer: 4
 
 model:
@@ -29,10 +29,22 @@ training:
   device: cuda
 
 assignments:
-  enabled: false
+  enabled: true
 
 evaluation:
-  enabled: false
+  enabled: true
+  kind: unsupervised
+  test_shard_dir: dalg-cache/sae-manifold/sae_manifold_temperature_02d_years_neutral_llama31_8b_last/test
+  device: cuda
+  batch_size: 4096
+  heldout_distribution_coverage: true
+  tile_alignment: true
+  tile_alignment_neighbors: 5
+  pc1_density: true
+  pc1_density_space: pca75
+  pc1_density_neighbors: 20
+  pc1_density_random_directions: 32
+  pc1_density_seed: 42
 
 resources:
   partition: H100
@@ -48,5 +60,5 @@ resources:
 
 sweep:
   dataset.layer: [4, 28]
-  model.K: [50, 100, 200, 400]
+  model.K: [50, 100]
   model.surgery_threshold: [0.00025, 0.005, 0.01, 0.05, 0.1, 0.15, 0.2, 0.5, 1.0]

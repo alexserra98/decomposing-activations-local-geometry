@@ -16,7 +16,7 @@ MANIFESTS = [
     REPO / 'outputs/experiments/sae_manifold_years_neutral_kmeans_pca/manifest_8a97901252.jsonl',
 ]
 JOB_ROOT = REPO / 'outputs/evaluations/sae_temperature_years'
-ROOTS = [REPO / 'dalg-cache' / name for name in (
+ROOTS = [REPO / 'dalg-cache' / 'sae-manifold' / name for name in (
     'sae_manifold_temperature_02d_llama31_8b_last',
     'sae_manifold_years_neutral_llama31_8b_last',
 )]

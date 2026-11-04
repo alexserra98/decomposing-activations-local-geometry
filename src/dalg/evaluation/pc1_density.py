@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from dalg.analysis.pc1_density import (
-    KNNLogDensity, fit_global_variance_pca, leading_components,
+    KNNLogDensity, QUADRATURE_GRID_POINTS, fit_global_variance_pca, leading_components,
     project_pc1_segments, score_component,
 )
 from dalg.data.shard_activations import ActivationBatchDataset
@@ -105,11 +105,12 @@ def evaluate_pc1_density(model, data: EvaluationData, *, model_kind: str, layer:
                           original_half_length=float(projected["original_half_lengths"][component]))
         records.append(record)
     return {
-        "version": 1, "definitions": dict(_DEFINITIONS),
+        "version": 2, "definitions": dict(_DEFINITIONS),
         "settings": {key: value for key, value in settings.items() if key != "pc1_density"},
         "population": "defined_covariance_pc1_components",
         "aggregation": "unweighted_component_log_scores",
         "interval_probability": .8, "pilot_points": 201,
+        "quadrature_grid_points": list(QUADRATURE_GRID_POINTS),
         "integration": "adaptive_quad", "relative_tolerance": 1e-4,
         "density_dimension": estimator.dimension,
         "reference": {"split": "validation", "points": reference_points,
@@ -128,11 +129,12 @@ def pc1_density_report_valid(report, *, components: int, cfg: Mapping, dataset: 
     if not isinstance(report, Mapping):
         return False
     settings = {k: cfg.get(k, v) for k, v in PC1_DENSITY_DEFAULTS.items() if k != "pc1_density"}
-    if (report.get("version") != 1 or report.get("settings") != settings
+    if (report.get("version") != 2 or report.get("settings") != settings
             or report.get("definitions") != _DEFINITIONS
             or report.get("population") != "defined_covariance_pc1_components"
             or report.get("aggregation") != "unweighted_component_log_scores"
             or report.get("interval_probability") != .8 or report.get("pilot_points") != 201
+            or report.get("quadrature_grid_points") != list(QUADRATURE_GRID_POINTS)
             or report.get("integration") != "adaptive_quad" or report.get("relative_tolerance") != 1e-4):
         return False
     reference = report.get("reference")

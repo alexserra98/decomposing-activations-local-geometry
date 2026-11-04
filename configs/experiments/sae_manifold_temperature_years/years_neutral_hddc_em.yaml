@@ -1,14 +1,14 @@
-# Training only, on original 4096-dimensional last-token activations.
+# Training, assignments, and full unsupervised evaluation on last-token activations.
 # HDDC reads drop_prefix=0 from the extraction config.json.
 # Layers are zero-based decoder-block indices. Each file resolves to 16 runs.
-# Four arrays with max_parallel=1 use at most four GPUs in total.
+# Each array uses at most one GPU at a time (max_parallel=1).
 experiment:
   name: sae_manifold_years_neutral_hddc_em
-  output_root: dalg-cache/sae_manifold_years_neutral_llama31_8b_last
+  output_root: dalg-cache/sae-manifold/sae_manifold_years_neutral_llama31_8b_last
 
 dataset:
   id: years_neutral
-  shard_dir: dalg-cache/sae_manifold_years_neutral_llama31_8b_last
+  shard_dir: dalg-cache/sae-manifold/sae_manifold_years_neutral_llama31_8b_last
   layer: 4
 
 model:
@@ -43,10 +43,22 @@ training:
   device: cuda
 
 assignments:
-  enabled: false
+  enabled: true
 
 evaluation:
-  enabled: false
+  enabled: true
+  kind: unsupervised
+  test_shard_dir: dalg-cache/sae-manifold/sae_manifold_years_neutral_llama31_8b_last/test
+  device: cuda
+  batch_size: 4096
+  heldout_distribution_coverage: true
+  tile_alignment: true
+  tile_alignment_neighbors: 5
+  pc1_density: true
+  pc1_density_space: pca75
+  pc1_density_neighbors: 20
+  pc1_density_random_directions: 32
+  pc1_density_seed: 42
 
 resources:
   partition: H100

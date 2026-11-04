@@ -14,8 +14,8 @@ From the repository root, using the project environment:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m dalg.cli.run_prompt_extraction \
-  --dataset dalg-cache/sae_manifold_prompts \
-  --out-dir dalg-cache/sae_manifold_llama31_8b_last \
+  --dataset dalg-cache/sae-manifold/dataset/temperature_02d_years_neutral/development \
+  --out-dir dalg-cache/sae-manifold/sae_manifold_temperature_02d_years_neutral_llama31_8b_last \
   --model meta-llama/Llama-3.1-8B \
   --device cuda --dtype bfloat16 \
   --extract-batch-size 8 --shard-size 512
@@ -25,7 +25,7 @@ The installed `dalg-run-prompt-extraction` command accepts the same arguments.
 The pinned-revision Slurm launcher uses the same last-token representation:
 
 ```bash
-sbatch scripts/slurm/temporary/sbatch_extract_sae_manifold_llama31.sh
+sbatch scripts/slurm/temporary/sbatch_extract_sae_manifold_temperature_02d_years_neutral_llama31.sh
 ```
 
 Add `--preview` to print input lengths and a selected-token example for each
@@ -38,6 +38,73 @@ Gated models require an account with access and an existing Hugging Face token.
 block. `--revision` pins a model/tokenizer revision. Local Llama checkpoints are
 also accepted. `--max-length` rejects overlong inputs rather than truncating;
 the default is the model's context limit. This count includes the added BOS.
+
+## Prompt dataset storage
+
+Store canonical SAE-manifold prompt datasets under
+`dalg-cache/sae-manifold/dataset/<dataset-name>/`, independently of the model
+used to extract activations. Each dataset contains `prompts.jsonl` and
+`metadata.json`. The migrated datasets are:
+
+- `temperature_02d_years_neutral/`: 35,020 prompts (15,000 temperature and
+  20,020 years).
+- `years_neutral/`: 20,020 years prompts.
+- `temperature_02d/`: 15,000 temperature prompts.
+
+Activation folders remain directly under `dalg-cache/sae-manifold/`. Their
+`source/records.jsonl` and `source/dataset_metadata.json` are extraction
+snapshots and stay with the activations: the records include model-specific
+tokenization used by provenance lookup. These snapshots do not replace the
+canonical prompt datasets. Pass the canonical dataset directory to `--dataset`
+and use the same layout for new prompt generation via the builder's `--out`.
+
+The standalone years and temperature datasets were recovered from their
+extraction snapshots by removing `tokenization`; their prompt-file SHA-256
+hashes match the original input fingerprints. All three migrated datasets
+retain their original row order, IDs, text, labels, and metadata.
+
+## SAE prompt-level held-out test split
+
+For `temperature_02d`, `years_neutral`, and `temperature_02d_years_neutral`,
+reserve 20% of prompt rows for test, using seed 42 independently within each
+subset. Split membership is shared between standalone and combined datasets.
+Original row IDs, prompt text, labels, and ordering within each partition are
+preserved. The remaining development rows are available to the usual downstream
+training/validation split.
+
+| Dataset | Development prompts | Test prompts |
+| --- | ---: | ---: |
+| Temperature | 12,000 | 3,000 |
+| Years | 16,016 | 4,004 |
+| Temperature + years | 28,016 | 7,004 |
+
+The canonical full dataset stays at `dataset/<name>/prompts.jsonl`.
+`dataset/<name>/development/` and `dataset/<name>/test/` each contain
+`prompts.jsonl` and `metadata.json`; `dataset/<name>/split.json` records exact
+membership, source fingerprints, and extraction settings.
+
+Prepare these fixed splits before submitting the three corresponding launchers:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/temporary/reextract_sae_prompt_holdout.py prepare
+sbatch scripts/slurm/temporary/sbatch_extract_sae_manifold_temperature_02d_llama31.sh
+sbatch scripts/slurm/temporary/sbatch_extract_sae_manifold_years_neutral_llama31.sh
+sbatch scripts/slurm/temporary/sbatch_extract_sae_manifold_temperature_02d_years_neutral_llama31.sh
+```
+
+Each job reuses the recorded model revision, layers, and precision. It extracts
+into a temporary sibling directory and validates both populations before
+replacing the original activation root. Development shards occupy the root;
+test shards occupy its `test/` subdirectory. The ordinary shard reader only
+reads root-level layer directories, so training excludes test rows. For
+unsupervised coverage, point `evaluation.test_shard_dir` at that `test/` directory.
+
+The replacement preserves old fitted models and extraction provenance under
+`dalg-cache/sae-manifold/pre_holdout/<activation-folder>/`, removing the old
+activation tensors. Those models were fitted on the full population and are
+not valid for this held-out experiment; saved run paths there are historical.
+A failed extraction leaves the original activation root intact, and resubmitting
+the same launcher resumes staged shards. Retraining is a separate operation.
 
 ## Input and representation
 
@@ -112,7 +179,7 @@ are authoritative. Character spans can overlap for byte-level Unicode tokens.
 from dalg.data.prompt_activations import load_prompt_activation_index
 import torch
 
-index = load_prompt_activation_index("dalg-cache/sae_manifold_llama31_8b_last", layer=19)
+index = load_prompt_activation_index("dalg-cache/sae-manifold/sae_manifold_temperature_02d_years_neutral_llama31_8b_last", layer=19)
 row = index[0]
 print(row["prompt"], row["labels"])
 print(row["source_row_id"], row["token_index"], repr(row["decoded_token"]))

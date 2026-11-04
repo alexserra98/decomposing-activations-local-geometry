@@ -249,15 +249,24 @@ The baseline uses `pc1_density_random_directions` isotropic unit directions
 (default 32), generated directly in the density space at the same center and
 length, with seed `pc1_density_seed + component_id` (default seed 42).
 
-CPU float64 adaptive quadrature uses a 201-position pilot and relative error
-tolerance `1e-4`. Integration failures and zero/nonfinite radii raise explicitly.
+CPU float64 adaptive quadrature uses a 201-position pilot to locate peaks,
+then computes a preliminary integral with 201 uniform points plus pilot/peak
+breakpoints. Each PC1 or random direction independently starts at that same
+resolution and accepts its first warning-free integral with estimated relative
+error at most `1e-4` (0.01%). Only a failing direction retries with 401, 801,
+1,601, 3,201, then 6,401 points, retaining the pilot/peak breakpoints and the
+same tolerance. Successful directions are not recomputed. Refinement subdivides
+the same segment; it does not change its length or the density definition.
+A convergence warning is never accepted as a valid result. Exhausted refinements
+raise explicitly; invalid radii and nonpositive/nonfinite integrals fail immediately.
 Coarse/refined grid differences remain diagnostics. Training covariance is
 streamed, but costs O(D²) memory; the full validation reference is held in memory.
 The metric is opt-in because PCA and per-component integration can be expensive.
 The `device` option still controls the other evaluation metrics.
 
 The top-level report stays at schema version 2. Its `pc1_density` block has
-`version: 1`, definitions, settings, reference row IDs and point count, actual
+`version: 2`, `quadrature_grid_points: [201, 401, 801, 1601, 3201, 6401]`, definitions,
+settings, reference row IDs and point count, actual
 density dimension, PCA training count and variance fractions, eligible/excluded
 counts and reasons, and scalar diagnostics per component (including alpha and
 original/projected lengths for PCA75). Global `mean` and `median` summaries use
@@ -268,7 +277,8 @@ are not saved by the pipeline; PCA is recomputed per evaluated run.
 
 CSV aggregation exports these summaries and serializes detailed lists using
 its existing generic flattener. Completion validation requires the enabled block,
-matching settings, split sizes, and consistent component summaries. Disabling
+matching settings and refinement schedule, split sizes, and consistent component
+summaries. Disabling
 the metric omits the block. Use explicit saved-run reevaluation to replace older
 reports. Saved-run flags are `--pc1-density` / `--no-pc1-density`,
 `--pc1-density-space {pca75,ambient}`, `--pc1-density-neighbors N`,
