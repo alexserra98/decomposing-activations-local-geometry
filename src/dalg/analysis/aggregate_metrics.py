@@ -128,8 +128,8 @@ def aggregate_metrics(
     Each report contributes one general row and one row per saved manifold.
     Nested fields use dotted columns and run specifications use ``config.*``.
     ``evaluation_id`` (the relative report path) joins the tables. Deprecated
-    centroid reports, history directories, and nested directory symlinks are
-    excluded. ``skip_regex`` additionally skips subdirectories whose names
+    centroid reports, history directories, subdirectories containing uppercase
+    ``SKIP`` in their names, and nested directory symlinks are excluded. ``skip_regex`` additionally skips subdirectories whose names
     match via ``re.search``. ``skip_paths`` skips specific subdirectories using
     absolute paths or paths relative to ``folder``. Both filters exclude entire
     subtrees; the root folder is never filtered. Invalid reports raise
@@ -151,7 +151,8 @@ def aggregate_metrics(
     for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
         dirs[:] = [
             name for name in dirs
-            if name not in _EXCLUDED_DIRS and not (Path(directory) / name).is_symlink()
+            if name not in _EXCLUDED_DIRS and "SKIP" not in name
+            and not (Path(directory) / name).is_symlink()
             and Path(directory) / name not in excluded_paths
             and (skip_pattern is None or skip_pattern.search(name) is None)
         ]

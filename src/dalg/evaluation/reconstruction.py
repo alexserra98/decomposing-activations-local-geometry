@@ -19,7 +19,7 @@ def reconstruction_metadata(model_kind: str, dimension: int) -> dict:
     }
 
 
-def reconstruction_report_valid(report, *, model_kind: str, dataset) -> bool:
+def reconstruction_report_valid(report, *, model_kind: str, dataset, allow_empty_splits: bool = False) -> bool:
     """Check definitions, split counts, and finite statistics before publication."""
     if not isinstance(report, Mapping) or not isinstance(dataset, Mapping):
         return False
@@ -41,11 +41,11 @@ def reconstruction_report_valid(report, *, model_kind: str, dataset) -> bool:
         points = dataset.get(f"{split}_points")
         rows = dataset.get(f"{split}_rows")
         if (any(type(count) is not int or count < 0 for count in (n, excluded, points))
-                or n + excluded != points or (split == "train" and points == 0)):
+                or n + excluded != points or (split == "train" and points == 0 and not allow_empty_splits)):
             return False
         if type(rows) is not int or rows < 0 or rows * (window - prefix) != points:
             return False
-        if model_kind == "hddc" and (excluded != 0 or n == 0):
+        if model_kind == "hddc" and (excluded != 0 or (n == 0 and not allow_empty_splits)):
             return False
         for key, defined in (("mse", n > 0), ("standard_error", n > 1)):
             if key not in values:

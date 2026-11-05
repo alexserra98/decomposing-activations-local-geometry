@@ -151,7 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--tile-alignment-neighbors", type=int, default=argparse.SUPPRESS)
     evaluate.add_argument("--pc1-density", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help="include PC1 density support for unsupervised evaluation (default: disabled)")
-    evaluate.add_argument("--pc1-density-space", choices=("pca75", "ambient"), default=argparse.SUPPRESS)
+    evaluate.add_argument("--pc1-density-space", choices=("pca75", "pca90", "ambient"), default=argparse.SUPPRESS)
     evaluate.add_argument("--pc1-density-neighbors", type=int, default=argparse.SUPPRESS)
     evaluate.add_argument("--pc1-density-random-directions", type=int, default=argparse.SUPPRESS)
     evaluate.add_argument("--pc1-density-seed", type=int, default=argparse.SUPPRESS)

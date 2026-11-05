@@ -545,8 +545,10 @@ general, manifolds = aggregate_metrics(experiment)
 ```
 
 Discovery includes `metrics.json` at the root and in subdirectories, excluding
-`centroids`, `archive`, `archived`, `checkpoints`, `snapshots`, and directory
-symlinks below the root. The supplied root itself may be a symlink. Deprecated
+`centroids`, `archive`, `archived`, `checkpoints`, `snapshots`, directories whose
+names contain uppercase `SKIP` (case-sensitive), and directory symlinks below
+the root. Excluded directories are skipped with their entire subtrees. The
+supplied root itself is never filtered and may be a symlink. Deprecated
 centroid evaluations are not read or expanded into threshold sweeps. Runs without
 reports contribute no rows. Invalid JSON, conflicting fields, invalid manifold
 entries, duplicate manifold IDs, and flattened-column collisions cause an error

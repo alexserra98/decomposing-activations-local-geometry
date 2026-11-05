@@ -76,9 +76,10 @@ the existing metric definitions:
 - `heldout_distribution_coverage`: the existing distance summaries and full
   empirical curve, using training-only component occupancy.
 
-There are no label-recovery, manifold-association, target-rank-error, tangent,
-or per-manifold results. CSV aggregation adds one general row per run and no
-manifold rows.
+KMeans+PCA and HDDC also report `per_manifold` results grouped by the activation
+row metadata's `subset` label. These are prompt categories, not known geometric
+manifolds; no target-rank or ground-truth tangent metrics are inferred. CSV
+aggregation adds one general row per run and one row per prompt category.
 
 Assignment bundles must cover the complete selected canonical token stream and
 record the checkpoint, model type, subset, layer, prefix dropping, and item
@@ -93,6 +94,58 @@ Coverage retains only distances while streaming and keeps the existing
 100,000-point limit. It never silently truncates the supplied test population.
 Its `source` records `shard_dir`, `subset_spec`, `layer`, `num_rows`, `num_points`,
 `window`, `drop_prefix`, and `d_model`.
+
+## Per-manifold prompt breakdown
+
+For KMeans+PCA and HDDC, stratification is automatic and uses the existing shard
+metadata `subset` field (for example, `temperature` and `years`). No YAML option
+or new dataset is required. Every retained token inherits its row's label, and
+selected rows and saved train/validation splits are preserved. Missing labels
+use the shard reader's existing `all` category, including a single-group report.
+
+The pooled metrics retain their definitions. Each `per_manifold` entry contains
+an integer `manifold_id`, the string `subset`, associated `component_ids`, a
+`dataset` count summary, and the following metric blocks, respecting the existing
+enable/disable settings:
+
+- `reconstruction`: apply the **full fitted model** to that category's training
+  and validation samples. HDDC still uses its full posterior mixture mean;
+  KMeans still predicts over all centroids. Empty subgroup splits have null
+  statistics, and invalid KMeans PCA samples remain excluded and counted.
+- `heldout_distribution_coverage`: score that category's independent test
+  samples against **all training-live centroids**, regardless of component
+  category. The source additionally records `manifold_subset`. Test and selected
+  development category sets must match exactly; missing or additional categories
+  raise an error. The pooled size limit and full empirical CDF contract apply.
+- `tile_alignment`: rebuild the centroid neighbor graph using only components
+  associated with this category, retaining the usual positive-rank/PCA-valid
+  eligibility rules. Fewer than two eligible components gives null means.
+- `pc1_density`: fit PCA using only this category's training samples, estimate
+  density using only its saved validation samples, and score only its associated
+  components. Original component IDs and random seeds are preserved. Different
+  groups may have different PCA dimensions; their scores describe different
+  density spaces. Insufficient validation points or degenerate training PCA
+  raises an explicit error naming the category, with no pooled fallback.
+
+A component belongs to the category with the **unique largest number of hard
+training assignments** (plurality; purity need not exceed 50%). Validation and
+test samples never influence this association. Components with tied maximum
+counts or no training assignments are excluded from per-manifold geometry,
+but remain subject to the existing pooled metric rules. `stratification`
+(version 1) records `label_field: subset`, `association: unique_training_majority`,
+sorted `manifold_names`, and `per_component` records with `train_counts`,
+`train_points`, `purity`, `manifold_id`, and `exclusion_reason`. Purity is the
+largest training count divided by the component's total training count (null
+for training-empty components). Manifold IDs index the sorted names in this
+report; use the string label when comparing different category selections.
+
+The top-level schema stays version 2. Completion validation requires the new
+partition and association records for KMeans/HDDC reports. Existing reports
+remain aggregatable, but must be explicitly reevaluated to obtain this breakdown;
+ordinary resume does not overwrite them. The existing aggregator exports the
+nested group metrics to `manifold_metrics.csv` without recomputing or averaging
+runs. Per-manifold scoring adds activation passes and, when enabled, PCA/density
+work for each category. Training checkpoints and assignment artifacts are reused.
 
 ## Reconstruction MSE
 
@@ -210,6 +263,7 @@ its block. No PC artifact is saved.
 Enable `evaluation.pc1_density: true` for KMeans+PCA or MFA-EM (HDDC). The default
 `pc1_density_space: pca75` fits a centered global PCA on the saved **training**
 partition, retaining the smallest prefix explaining at least 75% of variance.
+`pc1_density_space: pca90` uses the same procedure with a 90% variance target.
 There is no standardization or whitening. `pc1_density_space: ambient` skips
 projection. These are distinct density spaces; compare models using the same
 space, activation population, saved split, and settings.
@@ -232,7 +286,7 @@ Eligibility follows model geometry, without additional assignment-live filtering
 
 With unit covariance PC1 `v`, define `a = Phi^-1(0.9) sqrt(lambda_1)`: the central
 80% one-dimensional Gaussian marginal interval. In ambient space, score
-`mu + t v` for `t` in `[-a,a]`. In PCA75 space, project this original segment:
+`mu + t v` for `t` in `[-a,a]`. In either PCA space, project this original segment:
 `P(mu-m) + t Pv`. Normalize `Pv` and use half-length `a ||Pv||`; do not recompute
 PC1 from projected cluster covariance. Record `alpha = ||Pv||^2`, and exclude
 projected norms at most `1e-12`.
@@ -281,7 +335,7 @@ matching settings and refinement schedule, split sizes, and consistent component
 summaries. Disabling
 the metric omits the block. Use explicit saved-run reevaluation to replace older
 reports. Saved-run flags are `--pc1-density` / `--no-pc1-density`,
-`--pc1-density-space {pca75,ambient}`, `--pc1-density-neighbors N`,
+`--pc1-density-space {pca75,pca90,ambient}`, `--pc1-density-neighbors N`,
 `--pc1-density-random-directions N`, and `--pc1-density-seed N`.
 
 Retention can exceed one and is not a manifold-membership probability.

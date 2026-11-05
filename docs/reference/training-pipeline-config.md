@@ -467,7 +467,7 @@ assignment count before the stage is marked complete.
 | `tile_alignment` | boolean | `true` | Compute neighboring-tile leading-PC and best-subset PC alignment in either suite. |
 | `tile_alignment_neighbors` | integer | `5` | Positive directed centroid kNN neighbor count, capped at eligible tiles minus one. |
 | `pc1_density` | boolean | `false` | Compute PC1 density support; only for `unsupervised` KMeans/HDDC evaluation. |
-| `pc1_density_space` | string | `pca75` | `pca75` fits training-only global PCA retaining 75% variance; `ambient` uses original coordinates. |
+| `pc1_density_space` | string | `pca75` | `pca75` / `pca90` fit training-only global PCA retaining at least 75% / 90% variance; `ambient` uses original coordinates. |
 | `pc1_density_neighbors` | integer | `20` | Positive kNN density neighbor count; requires at least this many saved validation points. |
 | `pc1_density_random_directions` | integer | `32` | Positive number of matched isotropic random baseline directions per component. |
 | `pc1_density_seed` | integer | `42` | Nonnegative baseline seed; component ID is added to it. |
@@ -637,7 +637,7 @@ for local and Slurm examples, result layout, and retry behavior.
 | `--max-mean-to-manifold-distance FLOAT_OR_NONE` | Positive finite association cutoff, or `none` to remove it. |
 | `--heldout-distribution-coverage` / `--no-heldout-distribution-coverage` | Enable or disable test coverage for this evaluation invocation. Missing settings in older manifests default to enabled. |
 | `--pc1-density` / `--no-pc1-density` | Enable or disable PC1 density support; older manifests default to disabled. |
-| `--pc1-density-space {pca75,ambient}` | Density coordinates; defaults to training PCA retaining 75% variance. |
+| `--pc1-density-space {pca75,pca90,ambient}` | Density coordinates; defaults to training PCA retaining 75% variance. |
 | `--pc1-density-neighbors N` | Positive kNN density neighbor count. |
 | `--pc1-density-random-directions N` | Positive number of random baseline directions. |
 | `--pc1-density-seed N` | Nonnegative random baseline seed. |

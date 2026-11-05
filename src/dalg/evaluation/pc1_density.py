@@ -15,6 +15,8 @@ from dalg.analysis.pc1_density import (
 from dalg.data.shard_activations import ActivationBatchDataset
 from dalg.evaluation.common import EvaluationData
 
+_PCA_VARIANCE_FRACTIONS = {"pca75": .75, "pca90": .90}
+
 PC1_DENSITY_DEFAULTS = {
     "pc1_density": False,
     "pc1_density_space": "pca75",
@@ -31,8 +33,8 @@ _DEFINITIONS = {
 def validate_pc1_density_settings(cfg: Mapping) -> None:
     if type(cfg.get("pc1_density", False)) is not bool:
         raise ValueError("evaluation.pc1_density must be true or false")
-    if cfg.get("pc1_density_space", "pca75") not in ("pca75", "ambient"):
-        raise ValueError("evaluation.pc1_density_space must be pca75 or ambient")
+    if cfg.get("pc1_density_space", "pca75") not in (*_PCA_VARIANCE_FRACTIONS, "ambient"):
+        raise ValueError("evaluation.pc1_density_space must be pca75, pca90, or ambient")
     for key in ("pc1_density_neighbors", "pc1_density_random_directions", "pc1_density_seed"):
         value = cfg.get(key, PC1_DENSITY_DEFAULTS[key])
         minimum = 0 if key == "pc1_density_seed" else 1
@@ -52,12 +54,18 @@ def _batches(data: EvaluationData, positions: list[int], layer: int, batch_size:
 @torch.no_grad()
 def evaluate_pc1_density(model, data: EvaluationData, *, model_kind: str, layer: int,
                          batch_size: int, space: str = "pca75", neighbors: int = 20,
-                         random_directions: int = 32, seed: int = 42) -> dict:
+                         random_directions: int = 32, seed: int = 42,
+                         component_mask: torch.Tensor | None = None) -> dict:
     """Fit optional training PCA and score original PC1 segments on validation density.
 
     CPU float64 preserves the pilot's numerical convention. The full validation
     reference is kept in memory; training covariance is accumulated in batches.
+    An optional component mask restricts scoring, preserving original model IDs.
     """
+    if component_mask is not None:
+        component_mask = component_mask.detach().cpu().bool().reshape(-1)
+        if component_mask.numel() != model.K:
+            raise ValueError("PC1 density component mask must match model K")
     settings = dict(pc1_density=True, pc1_density_space=space, pc1_density_neighbors=neighbors,
                     pc1_density_random_directions=random_directions, pc1_density_seed=seed)
     validate_pc1_density_settings(settings)
@@ -66,8 +74,10 @@ def evaluate_pc1_density(model, data: EvaluationData, *, model_kind: str, layer:
         raise ValueError("PC1 density requires at least pc1_density_neighbors saved validation points")
     geometry = leading_components(model, model_kind)
     projection = None
-    if space == "pca75":
-        pca = fit_global_variance_pca(_batches(data, data.train_positions, layer, batch_size), .75)
+    if space in _PCA_VARIANCE_FRACTIONS:
+        pca = fit_global_variance_pca(
+            _batches(data, data.train_positions, layer, batch_size), _PCA_VARIANCE_FRACTIONS[space],
+        )
         projected = project_pc1_segments(geometry, pca["mean"], pca["basis"])
         projection = {key: pca[key] for key in (
             "dimension", "input_dimension", "training_count", "target_variance_fraction",
@@ -79,7 +89,7 @@ def evaluate_pc1_density(model, data: EvaluationData, *, model_kind: str, layer:
     references = []
     for batch in _batches(data, data.val_positions, layer, batch_size):
         x = batch.cpu().double()
-        if space == "pca75":
+        if space in _PCA_VARIANCE_FRACTIONS:
             x = (x - pca["mean"]) @ pca["basis"].T
         references.append(x)
     reference = torch.cat(references)
@@ -88,6 +98,8 @@ def evaluate_pc1_density(model, data: EvaluationData, *, model_kind: str, layer:
     estimator = KNNLogDensity(reference, k=neighbors)
     records, excluded = [], []
     for component, reason in enumerate(projected["exclusion_reasons"]):
+        if component_mask is not None and not bool(component_mask[component]):
+            reason = "outside_manifold"
         if reason:
             excluded.append({"component_id": component, "reason": reason})
             continue
@@ -151,16 +163,17 @@ def pc1_density_report_valid(report, *, components: int, cfg: Mapping, dataset: 
     if type(dimension) is not int or dimension < 1:
         return False
     projection = report.get("projection")
-    if settings["pc1_density_space"] == "pca75":
+    if settings["pc1_density_space"] in _PCA_VARIANCE_FRACTIONS:
+        fraction = _PCA_VARIANCE_FRACTIONS[settings["pc1_density_space"]]
         if (not isinstance(projection, Mapping) or projection.get("dimension") != dimension
                 or projection.get("training_count") != dataset.get("train_points")
-                or projection.get("target_variance_fraction") != .75
+                or projection.get("target_variance_fraction") != fraction
                 or projection.get("centering") is not True
                 or projection.get("standardization") is not False or projection.get("whitening") is not False):
             return False
         previous, retained = (projection.get(k) for k in ("previous_variance_fraction", "retained_variance_fraction"))
         if (type(previous) not in (int, float) or type(retained) not in (int, float)
-                or not 0 <= previous < .75 <= retained <= 1 + 1e-12):
+                or not 0 <= previous < fraction <= retained <= 1 + 1e-12):
             return False
     elif projection is not None:
         return False

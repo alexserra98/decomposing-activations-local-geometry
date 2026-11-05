@@ -133,7 +133,10 @@ def test_discovery_includes_root_and_nested_reports_but_not_history_or_symlinks(
     root = tmp_path / "experiment"
     _write_report(root, {"score": 1})
     _write_report(root / "nested" / "run", {"score": 2})
-    for excluded in ["centroids", "archive", "archived", "checkpoints", "snapshots"]:
+    for excluded in [
+        "centroids", "archive", "archived", "checkpoints", "snapshots",
+        "SKIP", "SKIP_run", "run_SKIP_old", "run_SKIP",
+    ]:
         _write_report(root / "nested" / excluded / "run", {})
         (root / "nested" / excluded / "run" / "metrics.json").write_text("{broken")
     external = tmp_path / "external"

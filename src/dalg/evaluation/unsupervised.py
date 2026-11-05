@@ -17,7 +17,10 @@ from dalg.evaluation.common import evaluate_fit, load_evaluation_data, load_mode
 from dalg.evaluation.coverage import (
     check_empirical_coverage_size, coverage_report_valid, evaluate_stream_coverage,
 )
-from dalg.evaluation.subspaces import effective_component_ranks
+from dalg.evaluation.subspaces import effective_component_ranks, leading_covariance_eigenspaces
+from dalg.evaluation.unsupervised_subsets import (
+    subset_populations, subset_reconstruction, subset_reports_valid,
+)
 from dalg.evaluation.reconstruction import reconstruction_report_valid
 from dalg.evaluation.pc1_density import (
     evaluate_pc1_density, pc1_density_report_valid, validate_pc1_density_settings,
@@ -65,6 +68,8 @@ def _test_coverage(source: dict, centroids: torch.Tensor, train_live: torch.Tens
     positions = resolve_spec_positions(
         meta, source["subset_spec"], window=source["window"], drop_prefix=source["drop_prefix"],
     )
+    if "manifold_subset" in source:
+        positions = [p for p in positions if meta[p]["subset"] == source["manifold_subset"]]
     dataset = ActivationBatchDataset(
         source["shard_dir"], layer=source["layer"], row_subset=positions,
         batch_size=batch_size, drop_prefix=source["drop_prefix"], dtype=torch.float32,
@@ -120,6 +125,18 @@ def evaluate_unsupervised(
     source = validate_test_shards(
         shard_dir, test_shard_dir, layer=layer, model_kind=model_kind, drop_prefix=data.drop_prefix,
     ) if heldout_distribution_coverage else None
+    if model_kind in {"hddc", "kmeans"}:
+        groups, association = subset_populations(data)
+        test_counts = {}
+        if source is not None:
+            meta = load_meta_index(source["shard_dir"], layer=layer)
+            positions = resolve_spec_positions(meta, source["subset_spec"],
+                                               window=source["window"], drop_prefix=source["drop_prefix"])
+            for p in positions:
+                name = meta[p]["subset"]
+                test_counts[name] = test_counts.get(name, 0) + 1
+            if set(test_counts) != set(association["manifold_names"]):
+                raise ValueError("coverage test subsets must match the selected development subsets")
     resolved_device = resolve_device(device)
     model = model.to(resolved_device).eval()
     fit = evaluate_fit(model, data, model_kind=model_kind, layer=layer,
@@ -150,9 +167,13 @@ def evaluate_unsupervised(
             "version": 1, "minimum_cluster_points": 2,
             "eligible_components": int(valid.sum()), "excluded_components": int((~valid).sum()),
         }
+    eigenspaces = None
+    if tile_alignment and bool((live & valid & (ranks > 0)).any()):
+        eigenspaces = leading_covariance_eigenspaces(model, int(ranks[live & valid].max()))
     if tile_alignment:
         report["tile_alignment"] = evaluate_tile_alignment(
             model, live, neighbors=tile_alignment_neighbors, rank_threshold=rank_threshold,
+            eigenspaces=eigenspaces,
         )
     if pc1_density:
         report["pc1_density"] = evaluate_pc1_density(
@@ -164,6 +185,44 @@ def evaluate_unsupervised(
         report["heldout_distribution_coverage"] = _test_coverage(
             source, model.mu, data.train_cluster_sizes > 0, batch_size=batch_size,
         )
+    if model_kind in {"hddc", "kmeans"}:
+        report["stratification"] = association
+        report["per_manifold"] = []
+        for manifold_id, (name, group_data) in enumerate(groups):
+            component_mask = torch.tensor([
+                r["manifold_id"] == manifold_id for r in association["per_component"]
+            ], dtype=torch.bool)
+            group = {
+                "manifold_id": manifold_id, "subset": name,
+                "component_ids": torch.where(component_mask)[0].tolist(),
+                "dataset": group_data.dataset_summary(layer),
+                "reconstruction": subset_reconstruction(
+                    model, group_data, model_kind=model_kind, layer=layer,
+                    batch_size=batch_size, device=resolved_device,
+                ),
+            }
+            if tile_alignment:
+                group["tile_alignment"] = evaluate_tile_alignment(
+                    model, component_mask, neighbors=tile_alignment_neighbors,
+                    rank_threshold=rank_threshold, eigenspaces=eigenspaces,
+                )
+            if pc1_density:
+                try:
+                    group["pc1_density"] = evaluate_pc1_density(
+                        model, group_data, model_kind=model_kind, layer=layer, batch_size=batch_size,
+                        space=pc1_density_space, neighbors=pc1_density_neighbors,
+                        random_directions=pc1_density_random_directions, seed=pc1_density_seed,
+                        component_mask=component_mask,
+                    )
+                except ValueError as exc:
+                    raise ValueError(f"PC1 density for subset {name!r}: {exc}") from exc
+            if source is not None:
+                group_source = dict(source, manifold_subset=name, num_rows=test_counts[name],
+                                    num_points=test_counts[name] * data.tokens_per_row)
+                group["heldout_distribution_coverage"] = _test_coverage(
+                    group_source, model.mu, data.train_cluster_sizes > 0, batch_size=batch_size,
+                )
+            report["per_manifold"].append(group)
     return report
 
 
@@ -284,6 +343,10 @@ def unsupervised_report_valid(run: Mapping[str, Any], metrics: Any) -> bool:
                 or rows * (window - prefix) != source["num_points"]):
             return False
     elif "heldout_distribution_coverage" in metrics:
+        return False
+    if kind in {"kmeans", "hddc"} and not subset_reports_valid(
+        metrics, run["evaluation"], components=k, model_kind=kind,
+    ):
         return False
     return True
 
