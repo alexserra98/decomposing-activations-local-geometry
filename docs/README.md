@@ -77,6 +77,14 @@ scope.
   directions for sparse `K=1000` toy KMeans partitions.
 - [PC1 density alignment](experiments/pc1-density-alignment.md) explains current
   pipeline commands and the years/temperature density-support findings.
+- [Layer-4 years parameterization](experiments/years-spiral-parameterization.md)
+  compares ambient helix and spline fits with held-out years and prompt templates.
+- [Layer-4 years surface](experiments/years-surface-parameterization.md) fits an
+  ambient spline sheet and compares its tangent planes with Gaussian PC1–PC2.
+- [Layer-4 spiral ribbon](experiments/years-spiral-ribbon.md) fits a continuous
+  surface constrained to wind around an explicit generalized spiral.
+- [HDDC versus KMeans ribbon tangents](experiments/years-ribbon-hddc-kmeans-alignment.md)
+  compares saved covariance PCs against the fixed analytic surface tangent.
 - [Synthetic MFA analyses](experiments/synthetic-mfa.md) describes the temporary
   synthetic sweep and related analysis.
 - [Wikipedia KMedoids slice](experiments/wikipedia-kmedoids.md) describes the
