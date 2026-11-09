@@ -17,12 +17,12 @@ from dalg.data.manifold_dataset import (
 )
 from dalg.data.shard_activations import load_meta_index
 from dalg.evaluation.toy_manifold_geometry import _project_mean_to_manifold
-from dalg.evaluation.toy_manifold_metrics import (
-    _best_subset_alignment,
-    _leading_covariance_eigenspaces,
-    _subspace_alignment,
-    evaluate_toy_manifold_metrics,
+from dalg.evaluation.subspaces import (
+    best_subset_alignment as _best_subset_alignment,
+    leading_covariance_eigenspaces as _leading_covariance_eigenspaces,
+    subspace_alignment as _subspace_alignment,
 )
+from dalg.evaluation.toy_manifold_metrics import evaluate_toy_manifold_metrics
 from dalg.evaluation.toy_manifold_tiling import evaluate_toy_manifold_tiling
 from dalg.models.adaptive_q.mfa_ard import MFA_ARD, save_mfa_ard
 from dalg.models.adaptive_q.mfa_hddc import MFA_HDDC, save_mfa_hddc
@@ -458,6 +458,10 @@ def _build_evaluation_artifacts(tmp_path: Path, model_kind: str) -> tuple[Path, 
             "assignments": assignments,
             "cluster_sizes": torch.bincount(assignments, minlength=len(centroids)),
             "subset_spec": None,
+            "model_type": "mfa" if model_kind == "ard" else model_kind,
+            "model_path": str(run_dir / "mfa_model.pt"),
+            "source": {"shard_dir": str(shard_dir), "layer": 0,
+                       "drop_prefix": 0, "num_items": len(assignments)},
         },
         run_dir / "mfa_model_assignments.pt",
     )
@@ -583,6 +587,7 @@ def test_toy_manifold_tiling_augmented_bic_excludes_validation_activity(
     assignments_path = run_dir / "custom_assignments.pt"
     torch.save(
         {
+            **torch.load(run_dir / "mfa_model_assignments.pt", weights_only=True),
             "K": len(MANIFOLD_NAMES),
             "assignments": assignments,
             "cluster_sizes": torch.bincount(assignments, minlength=len(MANIFOLD_NAMES)),

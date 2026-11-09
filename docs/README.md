@@ -37,7 +37,8 @@ relevant to it.
 - [YAML training pipeline](workflows/training-pipeline.md) is the operational
   guide for planning, submitting, resuming, inspecting pipeline runs, and
   [reevaluating saved models](workflows/training-pipeline.md#evaluate-saved-runs)
-  from one or more manifests.
+  from one or more manifests. Its [code map](workflows/training-pipeline.md#code-map-and-data-flow)
+  follows the configuration and execution phases in `pipeline/main.py`.
 - [Training pipeline YAML reference](reference/training-pipeline-config.md)
   defines every supported configuration field and constraint.
 
@@ -48,6 +49,9 @@ reorganize this documentation collection.
 
 ## I want to evaluate a model
 
+- [Unsupervised evaluation](evaluation/unsupervised.md) covers activation datasets
+  without ground-truth geometry, existing fit and coverage metrics, and shared
+  component-PC functions.
 - [Toy-manifold tiling evaluation](experiments/evaluation/toy-manifold-tiling.md) defines
   association, rank-recovery, tangent-alignment, tangent-containment, and
   output-schema contracts.
@@ -71,6 +75,8 @@ scope.
 - [KNN-PCA centroid initialization](experiments/knn-pca-centroid-initialization.md)
   documents the temporary 64-neighbor workaround used to provide 32 local
   directions for sparse `K=1000` toy KMeans partitions.
+- [PC1 density alignment](experiments/pc1-density-alignment.md) explains current
+  pipeline commands and the years/temperature density-support findings.
 - [Synthetic MFA analyses](experiments/synthetic-mfa.md) describes the temporary
   synthetic sweep and related analysis.
 - [Wikipedia KMedoids slice](experiments/wikipedia-kmedoids.md) describes the

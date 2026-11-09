@@ -24,7 +24,7 @@ from dalg.data.shard_activations import ActivationBatchDataset, load_meta_index
 from dalg.data.subset_spec import resolve_spec_positions, split_shard_dir_spec
 from dalg.evaluation.coverage import evaluate_heldout_distribution_coverage
 from dalg.evaluation.toy_manifold_coverage import validate_toy_test_split
-from dalg.evaluation.toy_manifold_tiling import _load_model
+from dalg.evaluation.common import load_model
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODEL_LABELS = {"kmeans": "KMeans+PCA", "mfa": "MFA", "ard": "MFA-ARD", "hddc": "MFA-HDDC"}
@@ -73,7 +73,7 @@ def _load_run(kind, directory):
     bundle = torch.load(assignment_path, map_location="cpu", weights_only=True)
     assignments = bundle["assignments"].reshape(-1)
     sizes = bundle["cluster_sizes"].reshape(-1)
-    model = _load_model(directory, kind)
+    model = load_model(directory, kind)
     if model.D != shard_cfg["d_model"] or model.D < 2:
         raise ValueError("model dimension does not match the toy dataset")
     if (assignments.dtype != torch.int64 or assignments.numel() != len(positions)

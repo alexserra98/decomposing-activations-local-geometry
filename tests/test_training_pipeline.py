@@ -15,14 +15,9 @@ from dalg.data.manifold_dataset import (
     save_toy_manifold_shards,
 )
 from dalg.data.shard_activations import load_meta_index
-from dalg.pipeline import (
-    PipelineConfigError,
-    _evaluation_artifact_valid,
-    _training_command,
-    execute_run,
-    pipeline_status,
-    resolve_experiment,
-)
+from dalg.pipeline import PipelineConfigError, execute_run, pipeline_status, map_experiments_to_manifest
+from dalg.pipeline.evaluation import _evaluation_artifact_valid
+from dalg.pipeline.training import _training_command
 from dalg.models.adaptive_q.mfa_hddc import (
     MFA_HDDC,
     load_mfa_hddc,
@@ -80,8 +75,8 @@ def test_sweep_expands_to_stable_distinct_runs(tmp_path: Path) -> None:
     config["sweep"] = {"model.K": [2, 3], "training.seed": [7, 8]}
     path = _write_yaml(tmp_path / "experiment.yaml", config)
 
-    first = resolve_experiment(path)
-    second = resolve_experiment(path)
+    first = map_experiments_to_manifest(path)
+    second = map_experiments_to_manifest(path)
 
     assert len(first) == 4
     assert [run["run_id"] for run in first] == [run["run_id"] for run in second]
@@ -98,7 +93,7 @@ def test_unknown_training_parameter_is_rejected(tmp_path: Path) -> None:
     path = _write_yaml(tmp_path / "experiment.yaml", config)
 
     with pytest.raises(PipelineConfigError, match="batch_szie"):
-        resolve_experiment(path)
+        map_experiments_to_manifest(path)
 
 
 def _save_kmeans(path: Path, means: torch.Tensor, rank: int = 0) -> KMeans:
@@ -117,7 +112,7 @@ def test_shared_kmeans_is_validated_resolved_and_forwarded(tmp_path: Path) -> No
     _save_kmeans(checkpoint, torch.zeros(2, 2))
     config = _config(tmp_path, shards)
     config["training"]["kmeans_model_path"] = str(checkpoint)
-    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+    run = map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))[0]
     assert "initialization" not in run
     assert run["identity"]["training_args"]["kmeans_model_path"] == str(checkpoint.resolve())
     command = _training_command(run)
@@ -132,7 +127,7 @@ def test_incompatible_kmeans_dimensions_are_rejected(tmp_path: Path, means: torc
     config = _config(tmp_path, shards)
     config["training"]["kmeans_model_path"] = str(checkpoint)
     with pytest.raises(PipelineConfigError, match="does not match"):
-        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+        map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
 def test_missing_kmeans_model_is_rejected(tmp_path: Path) -> None:
@@ -140,7 +135,7 @@ def test_missing_kmeans_model_is_rejected(tmp_path: Path) -> None:
     config = _config(tmp_path, shards)
     config["training"]["kmeans_model_path"] = str(tmp_path / "missing.pt")
     with pytest.raises(PipelineConfigError, match="model file not found"):
-        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+        map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
 @pytest.mark.parametrize("name", ["model.pth", "model", "model.PT", "directory.pt"])
@@ -154,7 +149,7 @@ def test_kmeans_model_requires_direct_pt_file(tmp_path: Path, name: str) -> None
     config = _config(tmp_path, shards)
     config["training"]["kmeans_model_path"] = str(checkpoint)
     with pytest.raises(PipelineConfigError, match="must point directly"):
-        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+        map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
 @pytest.mark.parametrize("legacy_key", ["centroids_path", "kmeans_model_path"])
@@ -165,7 +160,7 @@ def test_legacy_centroid_artifact_is_not_a_pipeline_model(tmp_path: Path, legacy
     config = _config(tmp_path, shards)
     config["training"][legacy_key] = str(checkpoint)
     with pytest.raises(PipelineConfigError, match="deprecated|invalid KMeans model"):
-        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+        map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
 @pytest.mark.parametrize("model", [
@@ -180,7 +175,7 @@ def test_cluster_pca_direction_init_is_forwarded_for_every_trainer(tmp_path: Pat
     config = _config(tmp_path, shards)
     config["model"] = model
     config["training"].update(kmeans_model_path=str(checkpoint), direction_init="cluster_pca")
-    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+    run = map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))[0]
     command = _training_command(run)
     assert command[command.index("--direction-init") + 1] == "cluster_pca"
 
@@ -194,13 +189,13 @@ def test_cluster_pca_requires_enough_stored_directions(tmp_path: Path, stored_ra
     config["model"]["rank"] = requested_rank
     config["training"].update(kmeans_model_path=str(checkpoint), direction_init="cluster_pca")
     with pytest.raises(PipelineConfigError, match="principal components"):
-        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+        map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
 def test_cluster_pca_plans_generated_model_without_fitting(tmp_path: Path) -> None:
     shards = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
     config = _config(tmp_path, shards)
-    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+    run = map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))[0]
     assert run["initialization"]["rank"] == 1
     assert run["initialization"]["version"] == 4
     assert run["initialization"]["method"] == "kmeans_model"
@@ -217,7 +212,7 @@ def test_cluster_pca_rejects_malformed_checkpoint(tmp_path: Path) -> None:
     config = _config(tmp_path, shards)
     config["training"].update(kmeans_model_path=str(checkpoint), direction_init="cluster_pca")
     with pytest.raises(PipelineConfigError, match="invalid KMeans model"):
-        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+        map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
 def test_hddc_initial_model_is_validated_resolved_and_forwarded(tmp_path: Path) -> None:
@@ -237,7 +232,7 @@ def test_hddc_initial_model_is_validated_resolved_and_forwarded(tmp_path: Path) 
     config["training"]["init_model_path"] = str(initial_path)
     path = _write_yaml(tmp_path / "experiment.yaml", config)
 
-    run = resolve_experiment(path)[0]
+    run = map_experiments_to_manifest(path)[0]
     resolved = str(initial_path.resolve())
 
     assert run["training"]["arguments"]["init_model_path"] == resolved
@@ -258,7 +253,7 @@ def test_hddc_shared_b_is_forwarded_as_a_single_process_model(tmp_path: Path) ->
     }
     path = _write_yaml(tmp_path / "experiment.yaml", config)
 
-    run = resolve_experiment(path)[0]
+    run = map_experiments_to_manifest(path)[0]
     command = _training_command(run)
 
     assert run["training"]["arguments"]["shared_b"] is True
@@ -279,7 +274,7 @@ def test_hddc_fractional_epoch_surgery_is_forwarded(tmp_path: Path) -> None:
     }
     path = _write_yaml(tmp_path / "experiment.yaml", config)
 
-    run = resolve_experiment(path)[0]
+    run = map_experiments_to_manifest(path)[0]
     command = _training_command(run)
 
     assert run["training"]["arguments"]["surgery_every_epochs"] == 0.3
@@ -299,7 +294,7 @@ def test_hddc_zero_surgery_min_count_disables_the_cutoff(tmp_path: Path) -> None
         "surgery_min_count": 0,
     }
 
-    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+    run = map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))[0]
     command = _training_command(run)
 
     assert run["training"]["arguments"]["surgery_min_count"] == 0.0
@@ -320,7 +315,7 @@ def test_hddc_negative_surgery_min_count_is_rejected(tmp_path: Path) -> None:
     }
 
     with pytest.raises(PipelineConfigError, match="finite and non-negative"):
-        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+        map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
 def test_hddc_shared_b_warm_start_requires_the_same_noise_mode(tmp_path: Path) -> None:
@@ -340,7 +335,7 @@ def test_hddc_shared_b_warm_start_requires_the_same_noise_mode(tmp_path: Path) -
     config["training"]["init_model_path"] = str(initial_path)
 
     with pytest.raises(PipelineConfigError, match="same Psi noise mode"):
-        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+        map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
 def test_hddc_shared_b_rejects_component_sharding(tmp_path: Path) -> None:
@@ -358,7 +353,7 @@ def test_hddc_shared_b_rejects_component_sharding(tmp_path: Path) -> None:
     config["resources"].update({"gpus": 2, "gpu_type": "H100"})
 
     with pytest.raises(PipelineConfigError, match="shared-b supports.*single_process only"):
-        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+        map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
 def test_hddc_defaults_to_single_process_training_mode(tmp_path: Path) -> None:
@@ -366,7 +361,7 @@ def test_hddc_defaults_to_single_process_training_mode(tmp_path: Path) -> None:
     config = _config(tmp_path, shard_dir)
     config["model"] = {"kind": "hddc", "K": 2, "q_max": 1}
 
-    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+    run = map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))[0]
     command = _training_command(run)
 
     assert run["training"]["arguments"]["training_mode"] == "single_process"
@@ -381,7 +376,7 @@ def test_hddc_rejects_vanilla_as_a_training_mode(tmp_path: Path) -> None:
     config["training"]["training_mode"] = "vanilla"
 
     with pytest.raises(PipelineConfigError, match="invalid hddc training parameters"):
-        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+        map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
 def test_hddc_shared_b_and_isotropic_psi_are_mutually_exclusive(tmp_path: Path) -> None:
@@ -396,7 +391,7 @@ def test_hddc_shared_b_and_isotropic_psi_are_mutually_exclusive(tmp_path: Path) 
     }
 
     with pytest.raises(PipelineConfigError, match="select different noise modes"):
-        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+        map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
 def test_hddc_initial_model_rejects_rank_mismatch(tmp_path: Path) -> None:
@@ -417,7 +412,7 @@ def test_hddc_initial_model_rejects_rank_mismatch(tmp_path: Path) -> None:
     path = _write_yaml(tmp_path / "experiment.yaml", config)
 
     with pytest.raises(PipelineConfigError, match="rank q=1 does not match model.q_max=2"):
-        resolve_experiment(path)
+        map_experiments_to_manifest(path)
 
 
 def test_hddc_initial_model_rejects_k_mismatch(tmp_path: Path) -> None:
@@ -441,7 +436,7 @@ def test_hddc_initial_model_rejects_k_mismatch(tmp_path: Path) -> None:
         PipelineConfigError,
         match=r"initial model has \(K=2, D=2\), expected \(K=3, D=2\)",
     ):
-        resolve_experiment(path)
+        map_experiments_to_manifest(path)
 
 
 def test_component_sharded_command_uses_torchrun(tmp_path: Path) -> None:
@@ -451,7 +446,7 @@ def test_component_sharded_command_uses_torchrun(tmp_path: Path) -> None:
     config["resources"].update({"gpus": 2, "gpu_type": "H100"})
     path = _write_yaml(tmp_path / "experiment.yaml", config)
 
-    run = resolve_experiment(path)[0]
+    run = map_experiments_to_manifest(path)[0]
     command = _training_command(run)
 
     assert command[:3] == [sys.executable, "-m", "torch.distributed.run"]
@@ -467,7 +462,7 @@ def test_execute_run_skips_valid_completed_stages(tmp_path: Path, monkeypatch) -
     _save_kmeans(centroids_path, torch.zeros(2, 2))
     config["training"]["kmeans_model_path"] = str(centroids_path)
     path = _write_yaml(tmp_path / "experiment.yaml", config)
-    run = resolve_experiment(path)[0]
+    run = map_experiments_to_manifest(path)[0]
     commands: list[list[str]] = []
 
     def fake_run(command: list[str]) -> None:
@@ -488,7 +483,7 @@ def test_execute_run_skips_valid_completed_stages(tmp_path: Path, monkeypatch) -
             (run_dir / "val_indices.json").write_text("{}")
             (run_dir / "mfa_model.pt").write_bytes(b"model")
 
-    monkeypatch.setattr("dalg.pipeline._run_command", fake_run)
+    monkeypatch.setattr("dalg.pipeline.common._run_command", fake_run)
     execute_run(run)
     execute_run(run)
 
@@ -504,14 +499,14 @@ def test_execute_run_skips_valid_completed_stages(tmp_path: Path, monkeypatch) -
 def test_existing_run_spec_mismatch_is_rejected(tmp_path: Path, monkeypatch) -> None:
     shard_dir = build_multi_shard(tmp_path / "shards", n_shards=1, rows_per_shard=4)
     config = _config(tmp_path, shard_dir)
-    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+    run = map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))[0]
     run_dir = Path(run["run_dir"])
     run_dir.mkdir(parents=True)
     wrong = copy.deepcopy(run)
     wrong["identity_hash"] = "wrong"
     (run_dir / "run_spec.json").write_text(json.dumps(wrong))
 
-    monkeypatch.setattr("dalg.pipeline._run_command", lambda _command: None)
+    monkeypatch.setattr("dalg.pipeline.common._run_command", lambda _command: None)
     with pytest.raises(PipelineConfigError, match="different configuration"):
         execute_run(run)
 
@@ -523,7 +518,7 @@ def test_real_cpu_training_and_assignment_pipeline_smoke(tmp_path: Path) -> None
     centroids_path = tmp_path / "shared_centroids.pt"
     _save_kmeans(centroids_path, shared_centroids)
     config["training"]["kmeans_model_path"] = str(centroids_path)
-    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+    run = map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))[0]
 
     run_dir = execute_run(run)
 
@@ -559,7 +554,7 @@ def test_real_cpu_pipeline_preserves_cluster_pca_directions_at_zero_lr(
         }
     )
     config["assignments"]["enabled"] = False
-    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+    run = map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))[0]
 
     run_dir = execute_run(run)
     trained = load_mfa(run_dir / "mfa_model.pt", map_location="cpu")
@@ -596,7 +591,7 @@ def test_real_hddc_initial_model_pipeline_smoke(tmp_path: Path) -> None:
         }
     )
     config["assignments"]["enabled"] = False
-    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+    run = map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))[0]
 
     run_dir = execute_run(run)
 
@@ -625,7 +620,7 @@ def test_real_shared_b_pipeline_smoke(tmp_path: Path, hard: bool) -> None:
     }
     config["experimental"] = {"hard_assignment_covariance": hard}
     config["assignments"]["enabled"] = False
-    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+    run = map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))[0]
 
     run_dir = execute_run(run)
     trained = load_mfa_hddc(run_dir / "mfa_model.pt", map_location="cpu")
@@ -651,7 +646,7 @@ def test_toy_manifold_tiling_evaluation_accepts_vanilla_mfa_config(
         "device": "cpu",
     }
 
-    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+    run = map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))[0]
 
     assert run["training"]["model_kind"] == "mfa"
     assert run["evaluation"]["kind"] == "toy_manifold_tiling"
@@ -677,7 +672,7 @@ def test_toy_manifold_tiling_rejects_invalid_mean_distance(
         PipelineConfigError,
         match="max_mean_to_manifold_distance must be finite and positive",
     ):
-        resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))
+        map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))
 
 
 def test_real_toy_manifold_tiling_pipeline_runs_end_to_end(tmp_path: Path) -> None:
@@ -717,7 +712,7 @@ def test_real_toy_manifold_tiling_pipeline_runs_end_to_end(tmp_path: Path) -> No
         "batch_size": 32,
         "device": "cpu",
     }
-    run = resolve_experiment(_write_yaml(tmp_path / "experiment.yaml", config))[0]
+    run = map_experiments_to_manifest(_write_yaml(tmp_path / "experiment.yaml", config))[0]
 
     run_dir = execute_run(run)
 
@@ -740,6 +735,12 @@ def test_real_toy_manifold_tiling_pipeline_runs_end_to_end(tmp_path: Path) -> No
     assert metrics["dataset"]["selected_rows"] == 76
     assert len(load_meta_index(shard_dir / "test", layer=0)) == 20
     assert metrics["bic"]["n"] == metrics["dataset"]["train_rows"]
+    for split in ("train", "validation"):
+        reconstruction = metrics["reconstruction"][split]
+        assert reconstruction["n"] == metrics["dataset"][f"{split}_rows"]
+        assert reconstruction["excluded_n"] == 0
+        assert reconstruction["mse"] >= 0
+        assert reconstruction["standard_error"] >= 0
     assert metrics["bic"]["parameters"] > 0
     assert metrics["bic"]["convention"] == "higher_is_better"
     assert metrics["bic"]["value"] == pytest.approx(
@@ -849,7 +850,8 @@ def test_evaluation_artifact_requires_augmented_bic(
     run = {
         "run_dir": str(tmp_path),
         "training": {"model_kind": "mfa"},
-        "evaluation": {"kind": "toy_manifold_tiling", "heldout_distribution_coverage": False},
+        "evaluation": {"kind": "toy_manifold_tiling", "heldout_distribution_coverage": False,
+                       "tile_alignment": False},
         "identity_hash": "test-run",
     }
     (tmp_path / "metrics.json").write_text(
@@ -897,7 +899,7 @@ def test_hard_covariance_sweep_reaches_cli_and_surgery(tmp_path):
     }
     config["experimental"] = {"hard_assignment_covariance": False}
     config["sweep"] = {"experimental.hard_assignment_covariance": [False, True]}
-    soft, hard = resolve_experiment(_write_yaml(tmp_path / "sweep.yaml", config))
+    soft, hard = map_experiments_to_manifest(_write_yaml(tmp_path / "sweep.yaml", config))
     assert soft["run_id"] != hard["run_id"]
     for run, enabled in [(soft, False), (hard, True)]:
         assert run["identity"]["training_args"]["hard_assignment_covariance"] is enabled
@@ -906,7 +908,7 @@ def test_hard_covariance_sweep_reaches_cli_and_surgery(tmp_path):
         cli_args = build_parser().parse_args(command[command.index("--shard-dir"):])
         assert _surgery_config(cli_args).hard_assignment_covariance is enabled
     del config["experimental"], config["sweep"]
-    default = resolve_experiment(_write_yaml(tmp_path / "default.yaml", config))[0]
+    default = map_experiments_to_manifest(_write_yaml(tmp_path / "default.yaml", config))[0]
     assert default["run_id"] == soft["run_id"]
 
 
@@ -946,4 +948,4 @@ def test_invalid_hard_covariance_configuration(tmp_path, case, message):
     elif case == "misplaced":
         config["training"]["hard_assignment_covariance"] = True
     with pytest.raises(PipelineConfigError, match=message):
-        resolve_experiment(_write_yaml(tmp_path / "invalid.yaml", config))
+        map_experiments_to_manifest(_write_yaml(tmp_path / "invalid.yaml", config))

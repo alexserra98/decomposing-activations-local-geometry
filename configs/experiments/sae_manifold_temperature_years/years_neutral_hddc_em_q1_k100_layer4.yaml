@@ -1,0 +1,75 @@
+# Layer 4: two EM runs, followed by assignments and unsupervised evaluation.
+# Reuses the dataset sweep defaults, with K=100 and q_max=1.
+# Two arrays at max_parallel=2 use at most four H100 GPUs in total.
+experiment:
+  name: sae_manifold_years_neutral_hddc_em_q1_k100_layer4
+  output_root: dalg-cache/sae-manifold/sae_manifold_years_neutral_llama31_8b_last
+
+dataset:
+  id: years_neutral
+  shard_dir: dalg-cache/sae-manifold/sae_manifold_years_neutral_llama31_8b_last
+  layer: 4
+
+model:
+  kind: hddc
+  K: 100
+  q_max: 1
+  shared_b: false
+  isotropic_psi: true
+  surgery_threshold: 0.1
+  surgery_every_epochs: 0
+  surgery_min_count: 0
+  surgery_warmup_steps: 0
+
+training:
+  fit_method: em
+  epochs: 1000
+  em_component_chunk_size: 4
+  em_eig_batch_size: 1
+  em_tol: 0.00001
+  early_stop_patience: 10
+  early_stop_min_delta: 0.001
+  epoch_snapshot_every: 0
+  batch_size: 64
+  num_workers: 2
+  pool_size: 40000
+  refine_epochs: 0
+  wandb: false
+  training_mode: single_process
+  val_frac: 0.1
+  split_seed: 42
+  seed: 42
+  device: cuda
+
+assignments:
+  enabled: true
+
+evaluation:
+  enabled: true
+  kind: unsupervised
+  test_shard_dir: dalg-cache/sae-manifold/sae_manifold_years_neutral_llama31_8b_last/test
+  device: cuda
+  batch_size: 4096
+  heldout_distribution_coverage: true
+  tile_alignment: true
+  tile_alignment_neighbors: 5
+  pc1_density: true
+  pc1_density_space: pca75
+  pc1_density_neighbors: 20
+  pc1_density_random_directions: 32
+  pc1_density_seed: 42
+
+resources:
+  partition: H100
+  account: LADE
+  nodes: 1
+  ntasks_per_node: 1
+  cpus_per_task: 8
+  gpus: 1
+  gpu_type: H100
+  memory: 80G
+  time: "23:00:00"
+  max_parallel: 2
+
+sweep:
+  model.surgery_threshold: [0.1, 0.0001]

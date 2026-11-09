@@ -12,7 +12,8 @@ import torch
 
 from dalg.cli.run_pipeline import build_parser
 from dalg.evaluation import saved_runs as saved
-from dalg.pipeline import _RESOURCE_DEFAULTS, execute_run, resolve_run, write_manifest
+from dalg.pipeline.slurm import _RESOURCE_DEFAULTS
+from dalg.pipeline import execute_run, map_run_to_manifest, write_manifest
 
 
 @pytest.fixture(autouse=True)
@@ -155,7 +156,7 @@ def test_dry_run_is_read_only(planning, tmp_path, monkeypatch, capsys):
 def real_run(request, tmp_path):
     if request.param == "kmeans":
         from tests.test_kmeans_pipeline import _config
-        run = resolve_run(_config(tmp_path))
+        run = map_run_to_manifest(_config(tmp_path))
         execute_run(run)
         return run
     from dalg.data.manifold_dataset import ToyManifoldConfig, save_toy_manifold_shards
@@ -185,7 +186,11 @@ def real_run(request, tmp_path):
         save_mfa_hddc(model, str(directory / "mfa_model.pt"))
     labels = torch.cdist(points, model.mu.detach()).argmin(dim=1)
     torch.save({"K": 2, "assignments": labels, "cluster_sizes": torch.bincount(labels, minlength=2),
-                "subset_spec": None}, directory / "mfa_model_assignments.pt")
+                "subset_spec": None, "model_type": request.param,
+                "model_path": str(directory / "mfa_model.pt"),
+                "source": {"shard_dir": str(shards), "layer": 0,
+                           "drop_prefix": 0, "num_items": len(labels)}},
+               directory / "mfa_model_assignments.pt")
     (directory / "metrics.json").write_text('{"old_report": true}')
     return run
 
@@ -207,29 +212,32 @@ def _plans():
 
 
 def test_real_saved_evaluation_overwrites_every_invocation(real_run, tmp_path, monkeypatch):
-    from dalg.evaluation.toy_manifold_tiling import evaluate_pipeline_run
+    from dalg.evaluation import evaluate_pipeline_run
     manifest = _manifest(tmp_path / "manifest.jsonl", [real_run])
     source = Path(real_run["run_dir"])
     before = _source_artifacts(source)
     # Obsolete or broken reports and markers can be repaired by reevaluation.
     (source / "metrics.json").write_text('broken report')
     (source / "EVALUATION_COMPLETED.json").write_text('broken marker')
-    monkeypatch.setattr("dalg.pipeline._run_command", lambda *a: pytest.fail("must not train or assign"))
-    monkeypatch.setattr("dalg.pipeline.execute_run", lambda *a: pytest.fail("must not execute pipeline"))
+    monkeypatch.setattr("dalg.pipeline.common._run_command", lambda *a: pytest.fail("must not train or assign"))
+    monkeypatch.setattr("dalg.pipeline.main.execute_run", lambda *a: pytest.fail("must not execute pipeline"))
     calls = []
 
     def evaluate(*args, **kwargs):
         calls.append(kwargs["evaluation"])
         return evaluate_pipeline_run(*args, **kwargs)
 
-    monkeypatch.setattr("dalg.evaluation.toy_manifold_tiling.evaluate_pipeline_run", evaluate)
+    monkeypatch.setattr("dalg.evaluation.evaluate_pipeline_run", evaluate)
     args = build_parser().parse_args([
         "evaluate", "--manifest", str(manifest), "--batch-size", "13",
+        "--tile-alignment-neighbors", "1",
         "--max-mean-to-manifold-distance", "none",
     ])
     args.func(args)
     first = json.loads((source / "metrics.json").read_text())
     assert first["evaluation_config"]["batch_size"] == 13
+    assert first["evaluation_config"]["tile_alignment_neighbors"] == 1
+    assert first["tile_alignment"]["neighbors"] == 1
     assert first["identity_hash"] == real_run["identity_hash"]
     assert first["evaluation_provenance"]["source_run_dir"] == str(source)
     assert _source_artifacts(source) == before
@@ -264,7 +272,7 @@ def test_failed_evaluation_preserves_previous_report(real_run, tmp_path, monkeyp
             raise RuntimeError("evaluation failed")
         return {}
 
-    monkeypatch.setattr("dalg.evaluation.toy_manifold_tiling.evaluate_pipeline_run", fail)
+    monkeypatch.setattr("dalg.evaluation.evaluate_pipeline_run", fail)
     with pytest.raises((RuntimeError, ValueError)):
         saved.evaluate_saved_run(plan, 0)
     assert _snapshot(source) == before
@@ -299,15 +307,15 @@ def test_combined_csvs_preserve_unselected_rows(real_run, tmp_path, monkeypatch)
     other = copy.deepcopy(real_run)
     other["run_dir"] = str(second)
     (second / "run_spec.json").write_text(json.dumps(other))
-    if other["training"]["model_kind"] == "kmeans":
-        assignment = saved._assignments_path(other)
-        bundle = torch.load(assignment, weights_only=True)
-        bundle["model_path"] = str(second / "kmeans_model.pt")
-        torch.save(bundle, assignment)
+    assignment = saved._assignments_path(other)
+    bundle = torch.load(assignment, weights_only=True)
+    stem = "kmeans_model" if other["training"]["model_kind"] == "kmeans" else "mfa_model"
+    bundle["model_path"] = str(second / f"{stem}.pt")
+    torch.save(bundle, assignment)
     ma = _manifest(tmp_path / "ma.jsonl", [real_run, other])
     mb = _manifest(tmp_path / "mb.jsonl", [real_run])
     before = _source_artifacts(original), _source_artifacts(second)
-    monkeypatch.setattr("dalg.pipeline._run_command", lambda *a: pytest.fail("must not train or assign"))
+    monkeypatch.setattr("dalg.pipeline.common._run_command", lambda *a: pytest.fail("must not train or assign"))
     args = build_parser().parse_args(["evaluate", "--manifest", str(ma), str(mb)])
     args.func(args)
     plan = _plans()[0]

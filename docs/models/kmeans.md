@@ -130,3 +130,10 @@ include eligible/excluded counts separately from undefined tangent comparisons.
 When no geometry is eligible, its summaries are null with zero contributing
 components. Tangent comparisons use the selected active directions.
 KMeans has no NLL or BIC.
+
+Both evaluation suites also report train/validation reconstruction MSE using
+the nearest centroid plus projection onto its retained cluster PCs. Samples
+assigned to invalid-PCA components are excluded and counted; quantization still
+includes them. The metric uses `W`, never `W_init`, and extends the paper's
+centroid-only baseline. See the [reconstruction contract](../evaluation/unsupervised.md#reconstruction-mse)
+for normalization, standard error, population counts, and report fields.

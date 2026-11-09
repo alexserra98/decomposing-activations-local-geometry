@@ -10,10 +10,10 @@ from dalg.data.manifold_dataset import ToyManifoldConfig, save_toy_manifold_shar
 from dalg.data.shard_activations import ActivationBatchDataset
 from dalg.init.activation_selection import resolve_initialization_rows
 from dalg.models.kmeans import KMeans, load_kmeans
-from dalg.pipeline import (
-    PipelineConfigError, _assignment_artifact_valid, _evaluation_artifact_valid,
-    _training_artifacts_valid, execute_run, pipeline_status, resolve_run,
-)
+from dalg.pipeline import PipelineConfigError, execute_run, pipeline_status, map_run_to_manifest
+from dalg.pipeline.assignments import _assignment_artifact_valid
+from dalg.pipeline.evaluation import _evaluation_artifact_valid
+from dalg.pipeline.training import _training_artifacts_valid
 
 
 def _config(tmp_path: Path, *, test_fraction: float = 0) -> dict:
@@ -47,7 +47,7 @@ def _config(tmp_path: Path, *, test_fraction: float = 0) -> dict:
 def test_kmeans_pipeline_end_to_end(tmp_path: Path, monkeypatch, threshold: float | None) -> None:
     config = _config(tmp_path)
     config["model"]["surgery_threshold"] = threshold
-    run = resolve_run(config)
+    run = map_run_to_manifest(config)
     assert "initialization" not in run
     run_dir = execute_run(run)
     model = load_kmeans(run_dir / "kmeans_model.pt", map_location="cpu")
@@ -88,7 +88,7 @@ def test_kmeans_pipeline_end_to_end(tmp_path: Path, monkeypatch, threshold: floa
     assert metrics["quantization"]["train"]["sum_squared_distance"] == pytest.approx(float(expected_sse), rel=1e-5)
     assert _evaluation_artifact_valid(run)
     assert pipeline_status([run])[0]["pipeline"]
-    monkeypatch.setattr("dalg.pipeline._run_command", lambda _: pytest.fail("completed stages must be reused"))
+    monkeypatch.setattr("dalg.pipeline.common._run_command", lambda _: pytest.fail("completed stages must be reused"))
     execute_run(run)
     if threshold is None:
         assignment_path = run_dir / "kmeans_model_assignments.pt"
@@ -162,16 +162,16 @@ def test_invalid_kmeans_pipeline_options(tmp_path: Path, section: str, changes: 
     config = _config(tmp_path)
     config[section].update(changes)
     with pytest.raises(PipelineConfigError, match=message):
-        resolve_run(config)
+        map_run_to_manifest(config)
 
 
 def test_cattell_options_change_run_identity(tmp_path: Path) -> None:
     config = _config(tmp_path)
-    first = resolve_run(config)
+    first = map_run_to_manifest(config)
     config["model"]["surgery_threshold"] = 0.3
-    second = resolve_run(config)
+    second = map_run_to_manifest(config)
     config["model"]["surgery_threshold"] = 0.5
-    third = resolve_run(config)
+    third = map_run_to_manifest(config)
     assert len({r["identity_hash"] for r in (first, second, third)}) == 3
     assert all(not Path(r["run_dir"]).exists() for r in (first, second, third))
 
@@ -179,18 +179,21 @@ def test_cattell_options_change_run_identity(tmp_path: Path) -> None:
 def test_kmeans_pipeline_without_validation(tmp_path: Path) -> None:
     config = _config(tmp_path)
     config["training"]["val_frac"] = 0.0
-    run = resolve_run(config)
+    run = map_run_to_manifest(config)
     directory = execute_run(run)
     metrics = json.loads((directory / "metrics.json").read_text())
     assert metrics["quantization"]["validation"] == {
         "n": 0, "sum_squared_distance": 0.0, "mean_squared_distance": None,
+    }
+    assert metrics["reconstruction"]["validation"] == {
+        "n": 0, "excluded_n": 0, "mse": None, "standard_error": None,
     }
     assert pipeline_status([run])[0]["pipeline"]
 
 
 def test_kmeans_pipeline_excludes_reserved_test_points(tmp_path: Path) -> None:
     config = _config(tmp_path, test_fraction=0.2)
-    run = resolve_run(config)
+    run = map_run_to_manifest(config)
     directory = execute_run(run)
     metrics = json.loads((directory / "metrics.json").read_text())
     assert metrics["quantization"]["train"]["n"] == 76
@@ -209,7 +212,7 @@ def test_legacy_initialization_manifest_rejected_without_writes(tmp_path: Path) 
     config["model"] = {"kind": "mfa", "K": 2, "rank": 1}
     config["training"] = {"device": "cpu", "val_frac": 0.2}
     config["evaluation"]["enabled"] = False
-    run = resolve_run(config)
+    run = map_run_to_manifest(config)
     run["initialization"].update(method="kmeans_pca", version=1)
     with pytest.raises(PipelineConfigError, match="legacy centroid initialization"):
         execute_run(run)
@@ -220,7 +223,7 @@ def test_legacy_initialization_manifest_rejected_without_writes(tmp_path: Path) 
 def test_sparse_pipeline_keeps_partition_and_resumes(tmp_path, monkeypatch, K, threshold):
     config = _config(tmp_path)
     config['model'].update(K=K, surgery_threshold=threshold)
-    run = resolve_run(config)
+    run = map_run_to_manifest(config)
     directory = execute_run(run)
     model = load_kmeans(directory / 'kmeans_model.pt')
     assert (~model.pca_valid).any()
@@ -233,6 +236,10 @@ def test_sparse_pipeline_keeps_partition_and_resumes(tmp_path, monkeypatch, K, t
     assert metrics['rank']['components'] == eligible
     assert metrics['quantization']['train']['n'] == 96
     assert metrics['quantization']['validation']['n'] == 24
+    reconstruction = metrics['reconstruction']['train']
+    assert reconstruction['n'] == int(model.cluster_counts[model.pca_valid].sum())
+    assert reconstruction['excluded_n'] == 96 - reconstruction['n']
+    assert reconstruction['excluded_n'] > 0
     assert metrics['heldout_distribution_coverage']['components_live'] == K
     assignments = torch.load(directory / 'kmeans_model_assignments.pt', weights_only=True)
     assert assignments['assignments'].numel() == 120
@@ -242,7 +249,7 @@ def test_sparse_pipeline_keeps_partition_and_resumes(tmp_path, monkeypatch, K, t
         assert eligible == 1  # 96 training points in 95 distinct clusters.
         assert metrics['rank']['mean_learned'] == 1
     assert pipeline_status([run])[0]['pipeline']
-    monkeypatch.setattr('dalg.pipeline._run_command', lambda _: pytest.fail('resume reran a stage'))
+    monkeypatch.setattr('dalg.pipeline.common._run_command', lambda _: pytest.fail('resume reran a stage'))
     execute_run(run)
     metrics.pop('pca_geometry')
     (directory / 'metrics.json').write_text(json.dumps(metrics))
@@ -260,7 +267,7 @@ def test_sparse_automatic_initialization_uses_knn_only(tmp_path, kind):
     config['initialization'] = {'pca_neighbors': 8}
     config['assignments']['enabled'] = False
     config['evaluation']['enabled'] = False
-    run = resolve_run(config)
+    run = map_run_to_manifest(config)
     directory = execute_run(run)
     initial = load_kmeans(directory / 'initialization' / 'kmeans_model.pt')
     assert initial.q == 0 and initial.q_init == 3
@@ -278,7 +285,7 @@ def test_previous_model_initialization_manifest_rejected(tmp_path, version):
     config['model'] = {'kind': 'mfa', 'K': 2, 'rank': 1}
     config['training'] = {'device': 'cpu', 'val_frac': .2}
     config['evaluation']['enabled'] = False
-    run = resolve_run(config)
+    run = map_run_to_manifest(config)
     run['initialization']['version'] = version
     with pytest.raises(PipelineConfigError, match='initialization version 4'):
         execute_run(run)
@@ -293,7 +300,7 @@ def test_surgery_threshold_sweep_and_legacy_checkpoint(tmp_path):
     config = _config(tmp_path)
     config['model']['surgery_threshold'] = 0.05
     config['sweep'] = {'model.surgery_threshold': [0.005, 0.5, 1.0]}
-    runs = [resolve_run(row) for row in expand_sweep(config)]
+    runs = [map_run_to_manifest(row) for row in expand_sweep(config)]
     assert [r['training']['arguments']['surgery_threshold'] for r in runs] == [0.005, 0.5, 1.0]
     assert len({r['run_id'] for r in runs}) == 3
     for flag in ('--surgery-threshold', '--cattell-threshold'):

@@ -10,10 +10,8 @@ from dalg.analysis.cluster_assignments import compute_assignments
 from dalg.cli.run_metrics import build_parser
 from dalg.data.manifold_dataset import ToyManifoldConfig, save_toy_manifold_shards
 from dalg.data.shard_activations import load_meta_index
-from dalg.evaluation.toy_manifold_metrics import (
-    _leading_covariance_eigenspaces,
-    evaluate_toy_manifold_metrics,
-)
+from dalg.evaluation.subspaces import leading_covariance_eigenspaces as _leading_covariance_eigenspaces
+from dalg.evaluation.toy_manifold_metrics import evaluate_toy_manifold_metrics
 from dalg.evaluation.toy_manifold_tiling import evaluate_toy_manifold_tiling
 from dalg.models.kmeans import KMeans, save_kmeans
 
@@ -101,6 +99,17 @@ def test_kmeans_assignments_and_toy_evaluation(tmp_path: Path, method: str, catt
         assert result["sum_squared_distance"] == pytest.approx(float(errors.sum()))
         assert result["mean_squared_distance"] == pytest.approx(float(errors.mean()))
         assert result["n"] == int(mask.sum())
+        reconstruction = metrics["reconstruction"][name]
+        x = points[mask]
+        labels = model.predict(x)
+        bases = model.W[labels]
+        scores = torch.einsum("bd,bdq->bq", x - model.mu[labels], bases)
+        rebuilt = model.mu[labels] + torch.einsum("bdq,bq->bd", bases, scores)
+        squared_errors = (x.double() - rebuilt.double()).square().mean(1)
+        assert reconstruction["mse"] == pytest.approx(float(squared_errors.mean()), abs=1e-10)
+        assert reconstruction["standard_error"] == pytest.approx(float(squared_errors.std() / len(x) ** 0.5), abs=1e-10)
+        assert reconstruction["n"] == len(x)
+        assert reconstruction["excluded_n"] == 0
     assert metrics["rank"]["definition"] == "kmeans_component_ranks"
     assert "threshold" not in metrics["rank"]
     assert metrics["rank"]["mean_learned"] == pytest.approx(float(model.component_ranks.float().mean()))

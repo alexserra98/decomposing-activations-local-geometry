@@ -6,15 +6,12 @@ import json
 from pathlib import Path
 
 from dalg.evaluation.toy_manifold_tiling import evaluate_toy_manifold_tiling
-from dalg.pipeline import (
-    _assignment_artifact_valid,
-    _assignments_path,
-    _evaluation_artifact_valid,
-    _mark_stage,
-    _training_artifacts_valid,
-    _write_json_atomic,
-    read_manifest,
-)
+from dalg.pipeline.assignments import _assignment_artifact_valid, _assignments_path
+from dalg.pipeline.evaluation import _evaluation_artifact_valid
+from dalg.pipeline.completion import _mark_stage
+from dalg.pipeline.training import _training_artifacts_valid
+from dalg.pipeline.common import _write_json_atomic
+from dalg.pipeline import read_manifest
 
 
 def evaluate(manifest: Path, index: int) -> None:

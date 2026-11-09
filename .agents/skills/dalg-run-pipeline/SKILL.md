@@ -15,8 +15,8 @@ implementations.
 Before changing or launching a config, read the relevant sections of
 `docs/workflows/training-pipeline.md` and
 `docs/reference/training-pipeline-config.md`. Treat
-`src/dalg/cli/run_pipeline.py` and `src/dalg/pipeline.py` as authoritative when
-documentation differs from code.
+`src/dalg/cli/run_pipeline.py`, `src/dalg/pipeline/main.py`, and its phase helpers
+as authoritative when documentation differs from code.
 
 ## Requested scope
 

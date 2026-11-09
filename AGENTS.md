@@ -8,6 +8,9 @@ this repository.
 This is a machine learning research codebase for **"From Directions to Regions:
 Decomposing Activations in Language Models via Local Geometry"**.
 
+The only supported models are **MFA-EM (HDDC fitted with EM)** and
+**KMeans+PCA**.
+
 The core object is a **Mixture of Factor Analyzers (MFA)** over language-model
 activations:
 
@@ -34,21 +37,22 @@ and package metadata are intentionally omitted.
 src/dalg/
   analysis/              Assignments, overlap, intrinsic dimension, labels, and description metrics
   cli/                   Console-script entrypoints
-    adaptive_q/          ARD and HDDC training entrypoints
+    adaptive_q/          MFA-EM (HDDC) training entrypoint
   data/                  Window builders, toy manifolds, and activation-shard streaming
   evaluation/            Toy-manifold geometry, tiling metrics, and pipeline evaluator
   init/                  Reservoir KMeans centroid initialization
   intervention/          Region and local-subspace steering
   llm/                   TransformerLens activation extraction wrapper
-  models/                MFA models and training loops
-    adaptive_q/          ARD and HDDC per-component-rank variants
-  pipeline.py            YAML planning, immutable manifests, and stage orchestration
+  models/                KMeans+PCA and MFA-EM models and training
+    adaptive_q/          HDDC model and full-data EM trainer
+  pipeline/              YAML planning, immutable manifests, and stage orchestration
+    main.py              Readable planning and execution phases; helpers live beside it
 
 configs/experiments/     YAML experiment and sweep configurations
 
 scripts/
   slurm/                 Reusable extraction, training, assignment, metric, and labeling jobs
-    adaptive_q/          ARD and HDDC training jobs
+    adaptive_q/          HDDC training launcher (select EM explicitly)
     experimental/        Launchers for named experimental workflows
     temporary/           One-off or short-lived cluster jobs
   temporary/             One-off experiment and repair scripts
@@ -88,35 +92,54 @@ documented under [Cluster and Scratch Notes](#cluster-and-scratch-notes).
 
 ## Main Entrypoints
 
-Preferred CLI entrypoints are defined in `pyproject.toml`:
+The main workflow is **write a YAML config -> launch the pipeline -> aggregate
+saved metrics**. The entrypoints are `dalg-run-pipeline` and
+`dalg-aggregate-metrics`, defined in `pyproject.toml`. Use `$dalg-run-pipeline`
+for execution and the [YAML reference](docs/reference/training-pipeline-config.md)
+for exact fields.
 
-- `dalg-run-extraction`
-- `dalg-run-training`
-- `dalg-run-training-kmeans`
-- `dalg-run-training-ard`
-- `dalg-run-training-hddc`
-- `dalg-run-metrics`
-- `dalg-interpret-mfa`
-- `dalg-label-mfa-clusters`
-- `dalg-gaussian-overlap`
-- `dalg-cluster-intrinsic-dim`
-- `dalg-build-pile-windows`
-- `dalg-build-newsgroups-windows`
+1. **Write a config** under `configs/experiments/`. Set the experiment name and
+   output root, existing activation shards and layer, model, training settings,
+   and Slurm resources; add `sweep` axes when needed. Choose `model.kind: kmeans`
+   or `model.kind: hddc` with `training.fit_method: em` and the isotropic-noise
+   settings described below. Enable `assignments.enabled` and
+   `evaluation.enabled` to produce metrics. Choose
+   `evaluation.kind: toy_manifold_tiling` for toy geometry or
+   `evaluation.kind: unsupervised` for
+   ordinary activation shards. The pipeline does not extract activations.
 
-The main workflow is:
+2. **Inspect and launch on Slurm**, replacing the example paths with your config
+   and the immutable manifest path printed by the command:
 
-```text
-token windows dataset
-  -> activation shards
-  -> centroid init
-  -> MFA training
-  -> assignments / Gaussian overlap / intrinsic dim
-  -> cluster examples and LLM labels
-  -> optional description metrics / steering / notebooks
-```
+   ```bash
+   uv run --locked dalg-run-pipeline submit path/to/config.yaml --dry-run
+   uv run --locked dalg-run-pipeline submit path/to/config.yaml
+   uv run --locked dalg-run-pipeline status --manifest path/to/manifest.jsonl
+   ```
 
-There is no current `dalg-run-layer` entrypoint in `pyproject.toml`. If old
-docs or logs mention it, treat that path as stale.
+   Each run performs any required initialization, training, assignments, and
+   configured evaluation. For a local or interactive allocation, use
+   `dalg-run-pipeline plan path/to/config.yaml`, then
+   `dalg-run-pipeline run --manifest path/to/manifest.jsonl --index 0` for the
+   selected manifest row. Reusing the same manifest resumes incomplete work
+   and skips stages with valid completed artifacts.
+
+3. **Aggregate metrics after evaluation finishes.** Pass the experiment folder
+   containing the run directories (`<output_root>/<experiment-name>`):
+
+   ```bash
+   uv run --locked dalg-aggregate-metrics path/to/experiment
+   ```
+
+   This collects saved `metrics.json` reports into `general_metrics.csv` and
+   `manifold_metrics.csv` in that folder. Each report contributes one general
+   row and, when available, one row per manifold. Aggregation does not recompute
+   metrics or average across runs.
+
+See the [pipeline workflow](docs/workflows/training-pipeline.md) for launch,
+resume, and saved-run reevaluation details. Lower-level entrypoints remain
+`dalg-run-extraction`, `dalg-run-training-kmeans`, and
+`dalg-run-training-hddc --fit-method em`.
 
 ## Data Layout
 
@@ -127,71 +150,10 @@ Before generating, storing, or changing synthetic local-geometry data, read
 determinism and paired-condition rules, return metadata, activation-compatible
 shard format, storage policy, and links to downstream tiling evaluation.
 
-### Activation shards
+### SAE-manifold prompts
 
-Large language-model runs use activation shards produced by
-`dalg-run-extraction`.
-
-Expected layout for `--shard-dir <root>`:
-
-```text
-<root>/config.json
-<root>/layerNN/shard_NNNNN.pt
-<root>/tokens/shard_NNNNN.pt
-<root>/meta/shard_NNNNN.json
-```
-
-Layer shard tensors have shape `(rows, window, d_model)`. Metadata maps shard
-rows back to global window rows and optional subset labels.
-
-`src/dalg/data/shard_activations.py` is the streaming layer:
-
-- `load_meta_index(activation_dir, layer)` returns one row entry per window
-- `stratified_split(meta_index, val_frac, seed)` builds train/val row splits
-- `per_subset_counts(meta_index, positions)` summarizes split composition
-- `ActivationBatchDataset` streams flattened token activations of shape
-  `(batch, d_model)` after dropping prefix tokens
-- set `return_metadata=True` when downstream code needs `(x, global_rows, tok_pos)`
-
-`ActivationBatchDataset` is already batched, so wrap it with
-`DataLoader(dataset, batch_size=None, ...)`.
-
-### Subset Slice Suffix (`--shard-dir <root>#<spec>`)
-
-`src/dalg/data/subset_spec.py` is a small, deletable helper that lets you re-run
-the pipeline on a filtered, randomly-subsampled slice of an existing activation
-shard directory **without re-extracting or duplicating activations**. The slice
-is encoded as a `#<spec>` suffix on the value you already pass to `--shard-dir`:
-
-```bash
---shard-dir dalg-cache/pile_gemma2b_activations#pile_wikipedia_1M
-```
-
-The spec format is `pile_<subset>_<N>[K|M]`:
-
-- `<subset>` is resolved via `_SUBSET_ALIASES` (currently `wikipedia ->
-  pile-wikipedia_en`); other names fall back to `pile-<subset>`.
-- `<N>[K|M]` is a **token budget**, translated to
-  `ceil(N / (window - drop_prefix))` randomly chosen windows of that subset.
-- Selection is deterministic (fixed seed) so every pipeline step picks the same
-  rows; positions are returned sorted to match canonical stream order.
-
-Two functions form the whole surface:
-
-- `split_shard_dir_spec(value)` -> `(clean_path, spec_or_None)`
-- `resolve_spec_positions(meta_index, spec, *, window, drop_prefix)` -> sorted
-  positions into the full `meta_index` (all positions when `spec` is `None`)
-
-The suffix is honored end-to-end: training, `dalg-run-metrics assignments` /
-`intrinsic-dim`, the standalone `cluster_assignments`, and
-`dalg-label-mfa-clusters`. `gaussian-overlap` needs no filter (pure model
-geometry).
-Assignments save the resolved `subset_spec`, and labeling falls back to that
-recorded value when `--shard-dir` carries no suffix, so positions are always
-inverted through the same filtered meta. When no `#<spec>` is present behavior is
-identical to before. To remove the feature: delete `subset_spec.py`, revert the
-`split_shard_dir_spec` call sites to `Path(args.shard_dir)`, and drop the
-`positions=` argument added to `stratified_split`.
+We use SAE-manifold prompt datasets inspired by Goodfire's paper
+"Do Sparse Autoencoders Capture Concept Manifolds?".
 
 ## Core Model and Training Code
 
@@ -201,50 +163,20 @@ full cluster PCA, Cattell rank masks, and checkpoint behavior. New pipeline
 initialization uses `kmeans_model.pt` directly; legacy centroid bundles and
 external centroid-based KMeans workflows are deprecated.
 
-`src/dalg/models/mfa.py` contains:
+`src/dalg/models/adaptive_q/mfa_hddc.py` provides `MFA_HDDC`, its per-component
+rank masks, and the `save_mfa_hddc` / `load_mfa_hddc` checkpoint helpers.
+`src/dalg/models/adaptive_q/train_em_hddc.py` provides `train_em_hddc`, the
+full-data EM trainer with KMeans initialization, Cattell rank selection,
+convergence checks, and resumable checkpoints.
 
-- `MFA`: full single-process model
-- `ComponentShardedMFA`: model-parallel MFA where each rank owns a slice of K
-- `save_mfa`, `load_mfa`, `save_component_shard`, `load_component_shards`
-- `component_shard_bounds(K, rank, world_size)`
+Before editing MFA-EM, read the
+[HDDC EM contract](docs/models/mfa-hddc.md#streamed-full-data-em). EM supports
+one CPU or CUDA process with shared or component-specific isotropic noise.
 
-Important model parameters:
-
-- `mu`: component means, `(K, D)`
-- `dir_raw` and derived `W`: local directions/loadings
-- `scale_rho`: loading scales
-- `psi_rho`: diagonal noise
-- `pi_logits`: mixture weights
-
-Likelihood and posterior computations use Woodbury-style small latent-space
-operations because `q << D`.
-
-`src/dalg/models/train.py` contains `train_nll`, the main optimizer loop. It is
-distributed-aware:
-
-- rank 0 handles printing, tqdm, W&B logging, and main checkpoint bookkeeping
-- validation can use `val_tensor` or `val_loader`
-- component-sharded training saves per-rank checkpoints and synchronizes
-  gradients for replicated parameters via `sync_replicated_grads()`
-
-No optimizer in this repo applies weight decay; `Adam` is constructed with its
-default `weight_decay=0`. Shrinkage on `W` comes only from the ARD path below.
-
-## Adaptive q
-
-The repository currently has two deliberately independent experimental routes
-to per-component rank. Before editing either one, read its canonical wiki page:
-
-- [MFA-ARD](docs/models/mfa-ard.md) owns the shrinkage objective, warmup and
-  selection rules, effective-rank definition, checkpoint compatibility, code
-  organization, and failure modes.
-- [MFA-HDDC](docs/models/mfa-hddc.md) owns isotropic-noise models, covariance
-  surgery, rank-mask and optimizer invariants, execution modes, checkpoint
-  compatibility, code organization, and failure modes.
-
-Use [HDDC Rank Surgery](docs/experiments/hddc-rank-surgery.md) or the
-[Adaptive-q Technical Card](docs/experiments/adaptive-q-technical-card.md) only
-when that specific experiment or its measured results are in scope.
+Always select EM explicitly: use `dalg-run-training-hddc --fit-method em`, or
+set `model.kind: hddc` and `training.fit_method: em` in pipeline YAML. Select
+exactly one noise mode: `model.shared_b: true` or `model.isotropic_psi: true`
+(`--shared-b` or `--isotropic-psi` on the CLI).
 
 ## Workflow Skills
 
@@ -252,18 +184,11 @@ Recurring operational procedures live in project skills so they are loaded only
 when relevant. Codex discovers the canonical skills under `.agents/skills/`;
 Claude Code reaches the same directories through `.claude/skills/` symlinks.
 
-- `dalg-run-pipeline`: configure vanilla or adaptive-rank MFA training, then
-  plan, submit, resume, and inspect the manifest-based pipeline with optional
-  assignments and toy-manifold tiling evaluation.
-- `dalg-wiki`: navigate, read, and maintain the task-routed Markdown wiki under
-  `docs/`, including its index, document roles, and cross-links.
-- `dalg-compute-assignments`: source-agnostic hard partitions using either MFA
-  responsibility argmax or nearest Euclidean centroids/medoids, plus stream
-  alignment and assignment-bundle validation.
-- `dalg-compute-metrics`: assignment-source-agnostic intrinsic dimension, MFA
-  Gaussian overlap, description metrics, devices, and output policy.
-- `dalg-label-mfa-clusters`: top activation contexts, selective or no-LLM
-  labeling, cached indexes, and label validation.
+- `dalg-run-pipeline`: configure, launch, resume, and inspect KMeans+PCA or
+  MFA-EM pipelines, and reevaluate saved runs.
+- `dalg-compute-assignments`: compute, inspect, or repair hard assignments using
+  MFA responsibility argmax or nearest Euclidean centroids.
+- `dalg-wiki`: navigate and maintain the Markdown wiki under `docs/`.
 
 Use only the skill relevant to the requested stage. Missing upstream artifacts
 are prerequisites to report, not permission to run additional pipeline stages.
@@ -276,7 +201,6 @@ user places that experiment in scope:
 
 - `docs/experiments/wikipedia-kmedoids.md`
 - `docs/experiments/synthetic-mfa.md`
-- `docs/experiments/hddc-rank-surgery.md`
 
 ## Cluster and Scratch Notes
 
@@ -295,17 +219,6 @@ large artifacts under `dalg-cache/`. Existing legacy outputs under
 `dalg-cache/output/` should remain untouched unless the user explicitly asks to
 move or delete them.
 
-Useful known scratch contents include:
-
-- `dalg-cache/pile_gemma2b_100M_windows/merged/`
-- `dalg-cache/pile_gemma2b_activations/`
-- `dalg-cache/pile_gemma2b_models/`
-- `dalg-cache/pile_gemma2b_activations_debug/`
-- `dalg-cache/qk_sweep_exploration/`
-
-Older direct aliases such as `/orfeo/scratch/dssc/zenocosini/pile_gemma2b_activations`
-may still appear in scripts or logs. Check symlink targets before assuming data
-is missing.
 
 ## Local Development
 
@@ -327,12 +240,10 @@ export PYTORCH_ENABLE_MPS_FALLBACK=1
 Useful tests:
 
 ```bash
-PYTHONPATH=src pytest tests/test_train.py
+PYTHONPATH=src pytest tests/test_hddc_em.py
+PYTHONPATH=src pytest tests/test_kmeans.py
 PYTHONPATH=src pytest tests/test_shard_activations
-PYTHONPATH=src pytest tests/test_cluster_labeling.py
-PYTHONPATH=src pytest tests/test_description_metrics.py
-PYTHONPATH=src python -m torch.distributed.run --standalone --nproc_per_node=2 \
-  tests/component_sharded_mfa_equivalence.py --device cpu --optimizer adam --steps 4
+PYTHONPATH=src pytest tests/test_aggregate_metrics.py
 ```
 
 ## Implementation Guidance
@@ -347,3 +258,7 @@ PYTHONPATH=src python -m torch.distributed.run --standalone --nproc_per_node=2 \
 - If you need to create scripts custom for a execute a specific experiment put under either scripts/temporary of scripts/slurm/temporary. Avoid cluttering the main scripts/ folder with one-off scripts.
 - Reuse reuse reuse. I don't want you to reinvent the wheel prefer to reuse existing code and functions in this repo instead of writing new ones.
 - This is code for  research not production so if the code halts or fails in some edge case it is ok. I prefer clear and strict contracts rather than loads of fallbacks and error handling.
+- When refactoring code leverage how much ensure backward compatibility and deprecating old code. Since this is a research codebase I am less concerned about backward compatibility and I am ok to let some old code become deprecated. I always in the process of understand what is going to be the right set of experiments, so I prefer adapt the code to the current
+
+# AGENTS CHAT
+If you are an agent and want to communicate with other agents use `AGENTS_chat.md`. There you can chat with other AGENTS, or leave messages / suggestions / instructions for future iteration of yourself.
