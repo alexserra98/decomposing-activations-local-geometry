@@ -125,15 +125,21 @@ Assignments remain separate in `kmeans_model_assignments.pt`; no `centroids.pt` 
 Toy evaluation uses only `W`, cluster spectra, selected ranks, and `pca_valid`.
 Sparse components are excluded from rank recovery and tangent alignment and
 containment, globally and per manifold. Centroid associations, clustering,
-and train/validation quantization errors retain the full partition. Reports
+and saved assignments retain the full partition. Reports
 include eligible/excluded counts separately from undefined tangent comparisons.
 When no geometry is eligible, its summaries are null with zero contributing
 components. Tangent comparisons use the selected active directions.
-KMeans has no NLL or BIC.
+Fit evaluation converts KMeans to an in-memory HDDC Gaussian mixture using its
+saved training-cluster PCA, with component-specific isotropic residual noise.
+It reports training/validation NLL, augmented BIC, and posterior reconstruction
+MSE through the same code as HDDC. Quantization is no longer an evaluation output.
+The original checkpoint, assignments, and geometric metrics remain KMeans-based.
+Active-BIC uses the surrogate's training MAP counts.
 
-Both evaluation suites also report train/validation reconstruction MSE using
-the nearest centroid plus projection onto its retained cluster PCs. Samples
-assigned to invalid-PCA components are excluded and counted; quantization still
-includes them. The metric uses `W`, never `W_init`, and extends the paper's
-centroid-only baseline. See the [reconstruction contract](../evaluation/unsupervised.md#reconstruction-mse)
+The conversion uses `fit_mixture_logits` and `fit_cluster_covariances` in
+`src/dalg/analysis/kmeans_gaussian.py`. There is no opt-in flag or fallback to
+quantization.
+The contract requires nonempty train/validation splits and valid training PCA
+for every occupied cluster. Empty components retain zero mixture weight.
+See the [reconstruction contract](../evaluation/unsupervised.md#reconstruction-mse)
 for normalization, standard error, population counts, and report fields.

@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from dalg.analysis.cluster_assignments import compute_assignments
+from dalg.analysis.kmeans_gaussian import gaussian_from_cluster_pca
 from dalg.cli.run_metrics import build_parser
 from dalg.data.manifold_dataset import ToyManifoldConfig, save_toy_manifold_shards
 from dalg.data.shard_activations import load_meta_index
@@ -91,20 +92,19 @@ def test_kmeans_assignments_and_toy_evaluation(tmp_path: Path, method: str, catt
     )
     assert metrics["schema_version"] == 2
     assert metrics["model_kind"] == "kmeans"
-    assert "nll" not in metrics and "bic" not in metrics
-    assert metrics["quantization"]["convention"] == "lower_is_better"
+    assert "quantization" not in metrics
+    gaussian = gaussian_from_cluster_pca(model, train_cluster_sizes=model.cluster_counts)
+    covariance = gaussian.W.double() @ gaussian.W.double().transpose(-1, -2)
+    covariance += torch.diag_embed(gaussian._psi().double())
+    dense = torch.distributions.MultivariateNormal(gaussian.mu.double(), covariance_matrix=covariance)
     for name, mask in (("train", ~validation), ("validation", validation)):
-        errors = (points[mask].double() - model.mu[expected[mask]].double()).square().sum(1)
-        result = metrics["quantization"][name]
-        assert result["sum_squared_distance"] == pytest.approx(float(errors.sum()))
-        assert result["mean_squared_distance"] == pytest.approx(float(errors.mean()))
-        assert result["n"] == int(mask.sum())
         reconstruction = metrics["reconstruction"][name]
         x = points[mask]
-        labels = model.predict(x)
-        bases = model.W[labels]
-        scores = torch.einsum("bd,bdq->bq", x - model.mu[labels], bases)
-        rebuilt = model.mu[labels] + torch.einsum("bdq,bq->bd", bases, scores)
+        expected_nll = -torch.logsumexp(
+            dense.log_prob(x.double()[:, None]) + gaussian.pi_logits.double().log_softmax(0), dim=1,
+        ).mean()
+        assert metrics["nll"][name] == pytest.approx(float(expected_nll))
+        rebuilt = gaussian.reconstruct(x)
         squared_errors = (x.double() - rebuilt.double()).square().mean(1)
         assert reconstruction["mse"] == pytest.approx(float(squared_errors.mean()), abs=1e-10)
         assert reconstruction["standard_error"] == pytest.approx(float(squared_errors.std() / len(x) ** 0.5), abs=1e-10)
@@ -243,17 +243,10 @@ def test_kmeans_evaluation_without_validation_split(tmp_path):
     run_dir, shard_dir, model, points, _ = _build_kmeans_run(
         tmp_path, "cluster", False, validation_stride=None,
     )
-    metrics = evaluate_toy_manifold_tiling(
-        run_dir, shard_dir=shard_dir, layer=0, model_kind="kmeans", device="cpu",
-    )
-    assert metrics["quantization"]["validation"] == {
-        "n": 0, "sum_squared_distance": 0.0, "mean_squared_distance": None,
-    }
-    errors = (points.double() - model.mu[model.predict(points)].double()).square().sum(1)
-    assert metrics["quantization"]["train"]["n"] == len(points)
-    assert metrics["quantization"]["train"]["sum_squared_distance"] == pytest.approx(float(errors.sum()))
-    assert metrics["quantization"]["train"]["mean_squared_distance"] == pytest.approx(float(errors.mean()))
-    assert metrics["dataset"]["validation_rows"] == 0
+    with pytest.raises(ValueError, match="nonempty training and validation"):
+        evaluate_toy_manifold_tiling(
+            run_dir, shard_dir=shard_dir, layer=0, model_kind="kmeans", device="cpu",
+        )
 
 
 def test_kmeans_evaluation_requires_training_split(tmp_path):
@@ -263,7 +256,7 @@ def test_kmeans_evaluation_requires_training_split(tmp_path):
         "train_rows": 0, "val_rows": len(points),
         "val_global_rows": [row["global_row"] for row in meta_index],
     }))
-    with pytest.raises(ValueError, match="empty training split"):
+    with pytest.raises(ValueError, match="nonempty training and validation"):
         evaluate_toy_manifold_tiling(
             run_dir, shard_dir=shard_dir, layer=0, model_kind="kmeans", device="cpu",
         )

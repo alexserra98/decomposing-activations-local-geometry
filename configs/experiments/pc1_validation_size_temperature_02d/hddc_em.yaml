@@ -1,0 +1,71 @@
+# Exact validation sizes: 2200 and 1600 of 12000 development rows. Fitting seed stays 42.
+experiment:
+  name: temperature_02d_pc1_valsize_hddc_em
+  output_root: dalg-cache/sae-manifold/pc1_validation_size_temperature_02d
+dataset:
+  id: temperature_02d
+  shard_dir: dalg-cache/sae-manifold/sae_manifold_temperature_02d_llama31_8b_last
+  layer: 4
+model:
+  kind: hddc
+  K: 50
+  q_max: 16
+  shared_b: false
+  isotropic_psi: true
+  surgery_threshold: 0.1
+  surgery_every_epochs: 0
+  surgery_min_count: 0
+  surgery_warmup_steps: 0
+training:
+  fit_method: em
+  epochs: 1000
+  em_component_chunk_size: 4
+  em_eig_batch_size: 1
+  em_tol: 1.0e-05
+  early_stop_patience: 10
+  early_stop_min_delta: 0.001
+  epoch_snapshot_every: 0
+  batch_size: 64
+  num_workers: 2
+  pool_size: 40000
+  refine_epochs: 0
+  wandb: false
+  training_mode: single_process
+  val_frac: 0.18333333333333332
+  split_seed: 42
+  seed: 42
+  device: cuda
+assignments:
+  enabled: true
+evaluation:
+  enabled: true
+  kind: unsupervised
+  device: cuda
+  batch_size: 4096
+  heldout_distribution_coverage: false
+  tile_alignment: false
+  tile_alignment_neighbors: 5
+  pc1_density: true
+  pc1_density_space: pca75
+  pc1_density_neighbors: 20
+  pc1_density_random_directions: 32
+  pc1_density_seed: 42
+resources:
+  partition: H100
+  account: LADE
+  nodes: 1
+  ntasks_per_node: 1
+  cpus_per_task: 8
+  gpus: 1
+  gpu_type: H100
+  memory: 80G
+  time: '23:00:00'
+  max_parallel: 1
+sweep:
+  training.val_frac:
+  - 0.18333333333333332
+  - 0.13333333333333333
+  training.split_seed:
+  - 42
+  - 43
+  - 44

@@ -52,7 +52,7 @@ def _evaluation_metrics_valid(run: Mapping[str, Any], metrics: Any) -> bool:
         return False
     kind = run["training"]["model_kind"]
     if kind in {"hddc", "kmeans"} and not reconstruction_report_valid(
-        metrics.get("reconstruction"), model_kind=kind, dataset=metrics.get("dataset"),
+        metrics.get("reconstruction"), model_kind="hddc", dataset=metrics.get("dataset"),
     ):
         return False
     if run["evaluation"].get("tile_alignment", True):
@@ -110,28 +110,17 @@ def _evaluation_metrics_valid(run: Mapping[str, Any], metrics: Any) -> bool:
     ):
         return False
     if run["training"]["model_kind"] == "kmeans":
-        quantization = metrics.get("quantization")
-        if not isinstance(quantization, Mapping) or quantization.get("convention") != "lower_is_better":
+        surrogate = metrics.get("gaussian_surrogate")
+        if ("quantization" in metrics or not isinstance(surrogate, Mapping)
+                or surrogate.get("source_model") != "kmeans"):
             return False
-        for name in ("train", "validation"):
-            values = quantization.get(name)
-            if not isinstance(values, Mapping) or type(values.get("n")) is not int or values["n"] < 0:
-                return False
-            if values["n"] == 0:
-                if name == "train":
-                    return False
-                continue
-            for key in ("sum_squared_distance", "mean_squared_distance"):
-                value = values.get(key)
-                if not isinstance(value, (float, int)) or not math.isfinite(value) or value < 0:
-                    return False
         geometry = metrics.get("pca_geometry")
         if not isinstance(geometry, Mapping) or geometry.get("version") != 1:
             return False
         counts = [geometry.get(name) for name in ("eligible_components", "excluded_components")]
         if any(type(count) is not int or count < 0 for count in counts):
             return False
-        return (
+        if not (
             metrics.get("schema_version") == 2
             and metrics.get("model_kind") == "kmeans"
             and geometry.get("minimum_cluster_points") == 2
@@ -140,8 +129,8 @@ def _evaluation_metrics_valid(run: Mapping[str, Any], metrics: Any) -> bool:
             and metrics.get("identity_hash") == run["identity_hash"]
             and metrics.get("rank", {}).get("definition") == "kmeans_component_ranks"
             and metrics.get("ambient_rank", {}).get("definition") == "kmeans_component_ranks"
-            and "nll" not in metrics and "bic" not in metrics
-        )
+        ):
+            return False
     if run["training"]["model_kind"] == "hddc":
         for rank_name in ("rank", "ambient_rank"):
             rank = metrics.get(rank_name)
@@ -150,6 +139,12 @@ def _evaluation_metrics_valid(run: Mapping[str, Any], metrics: Any) -> bool:
                 or "threshold" in rank
             ):
                 return False
+    nll = metrics.get("nll")
+    if not isinstance(nll, Mapping) or any(
+        type(nll.get(split)) not in (int, float) or not math.isfinite(nll[split])
+        for split in ("train", "validation")
+    ):
+        return False
     bic_metrics = metrics.get("bic")
     if not isinstance(bic_metrics, Mapping):
         return False

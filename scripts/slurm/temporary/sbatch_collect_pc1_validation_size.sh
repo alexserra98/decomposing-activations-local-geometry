@@ -11,4 +11,4 @@ set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:?}"
 export PYTHONPATH="$PWD/src"
 export MPLCONFIGDIR="${TMPDIR:-/tmp}/pc1-valsize-mpl-${SLURM_JOB_ID:?}"
-.venv/bin/python -u scripts/temporary/collect_pc1_validation_size.py
+.venv/bin/python -u scripts/temporary/collect_pc1_validation_size.py "$@"

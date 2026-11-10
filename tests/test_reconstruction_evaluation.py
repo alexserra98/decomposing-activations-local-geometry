@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from dalg.analysis.aggregate_metrics import aggregate_metrics
+from dalg.analysis.kmeans_gaussian import gaussian_from_cluster_pca
 from dalg.evaluation import evaluate_pipeline_run, saved_runs
 from dalg.evaluation.common import load_evaluation_data, load_model
 from dalg.pipeline import evaluate_run, execute_run, map_run_to_manifest, write_manifest
@@ -27,6 +28,7 @@ def test_saved_splits_subsets_prefix_aggregation_and_reevaluation(tmp_path, monk
     config["dataset"]["shard_dir"] += "#pile_A_10"
     if kind == "kmeans":
         config["training"]["drop_prefix"] = 1
+        config["model"]["K"] = 1  # This tiny split must have enough points for cluster PCA.
     generator = torch.Generator().manual_seed(51)
     all_points = []
     for index in range(2):
@@ -48,21 +50,14 @@ def test_saved_splits_subsets_prefix_aggregation_and_reevaluation(tmp_path, monk
     model = load_model(directory, kind)
     data = load_evaluation_data(directory, shard_dir=run["dataset"]["shard_dir"],
                                 layer=LAYER, model=model, model_kind=kind)
+    if kind == "kmeans":
+        model = gaussian_from_cluster_pca(model, train_cluster_sizes=data.train_cluster_sizes)
     assert len(data.positions) == 5
     for split, positions in (("train", data.train_positions), ("validation", data.val_positions)):
         x = all_points[positions, 1:].reshape(-1, 2)
         total = len(x)
         with torch.no_grad():
-            if kind == "hddc":
-                reconstructed = model.reconstruct(x)
-            else:
-                labels = model.predict(x)
-                eligible = model.pca_valid[labels]
-                x, labels = x[eligible], labels[eligible]
-                bases = model.W[labels]
-                centered = x - model.mu[labels]
-                scores = torch.einsum("bd,bdq->bq", centered, bases)
-                reconstructed = model.mu[labels] + torch.einsum("bdq,bq->bd", bases, scores)
+            reconstructed = model.reconstruct(x)
         errors = (x.double() - reconstructed.double()).square().mean(1)
         result = report["reconstruction"][split]
         assert result["n"] == len(errors)

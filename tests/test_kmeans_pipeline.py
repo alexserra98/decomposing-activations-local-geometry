@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from dalg.analysis.kmeans_gaussian import gaussian_from_cluster_pca
 from dalg.data.manifold_dataset import ToyManifoldConfig, save_toy_manifold_shards
 from dalg.data.shard_activations import ActivationBatchDataset
 from dalg.init.activation_selection import resolve_initialization_rows
@@ -79,13 +80,19 @@ def test_kmeans_pipeline_end_to_end(tmp_path: Path, monkeypatch, threshold: floa
     torch.testing.assert_close(model.W @ model.W.transpose(1, 2), expected.W @ expected.W.transpose(1, 2))
     assert model.checkpoint_extra["selection"] == selection
     metrics = json.loads((run_dir / "metrics.json").read_text())
-    assert "nll" not in metrics and "bic" not in metrics
+    assert "nll" in metrics and "bic" in metrics and "quantization" not in metrics
     assert metrics["rank"]["definition"] == "kmeans_component_ranks"
     assert metrics["rank"]["mean_learned"] == pytest.approx(float(model.component_ranks.float().mean()))
-    assert metrics["quantization"]["train"]["n"] == len(train_points)
-    assert metrics["quantization"]["validation"]["n"] == 120 - len(train_points)
-    expected_sse = (train_points - model.mu[model.predict(train_points)]).square().sum()
-    assert metrics["quantization"]["train"]["sum_squared_distance"] == pytest.approx(float(expected_sse), rel=1e-5)
+    assert metrics["reconstruction"]["train"]["n"] == len(train_points)
+    assert metrics["reconstruction"]["validation"]["n"] == 120 - len(train_points)
+    gaussian = gaussian_from_cluster_pca(model, train_cluster_sizes=model.cluster_counts)
+    covariance = gaussian.W.double() @ gaussian.W.double().transpose(-1, -2)
+    covariance += torch.diag_embed(gaussian._psi().double())
+    dense = torch.distributions.MultivariateNormal(gaussian.mu.double(), covariance_matrix=covariance)
+    expected_nll = -torch.logsumexp(
+        dense.log_prob(train_points.double()[:, None]) + gaussian.pi_logits.double().log_softmax(0), dim=1,
+    ).mean()
+    assert metrics["nll"]["train"] == pytest.approx(float(expected_nll), rel=1e-5)
     assert _evaluation_artifact_valid(run)
     assert pipeline_status([run])[0]["pipeline"]
     monkeypatch.setattr("dalg.pipeline.common._run_command", lambda _: pytest.fail("completed stages must be reused"))
@@ -143,7 +150,7 @@ def test_kmeans_pipeline_end_to_end(tmp_path: Path, monkeypatch, threshold: floa
     (run_dir / "metrics.json").write_text(json.dumps(metrics))
     assert not _evaluation_artifact_valid(run)
     metrics["tangent_alignment"]["definition"] = current_definition
-    metrics["quantization"]["train"]["mean_squared_distance"] = float("nan")
+    metrics["nll"]["train"] = float("nan")
     (run_dir / "metrics.json").write_text(json.dumps(metrics))
     assert not _evaluation_artifact_valid(run)
 
@@ -180,15 +187,8 @@ def test_kmeans_pipeline_without_validation(tmp_path: Path) -> None:
     config = _config(tmp_path)
     config["training"]["val_frac"] = 0.0
     run = map_run_to_manifest(config)
-    directory = execute_run(run)
-    metrics = json.loads((directory / "metrics.json").read_text())
-    assert metrics["quantization"]["validation"] == {
-        "n": 0, "sum_squared_distance": 0.0, "mean_squared_distance": None,
-    }
-    assert metrics["reconstruction"]["validation"] == {
-        "n": 0, "excluded_n": 0, "mse": None, "standard_error": None,
-    }
-    assert pipeline_status([run])[0]["pipeline"]
+    with pytest.raises(ValueError, match="nonempty training and validation"):
+        execute_run(run)
 
 
 def test_kmeans_pipeline_excludes_reserved_test_points(tmp_path: Path) -> None:
@@ -196,8 +196,8 @@ def test_kmeans_pipeline_excludes_reserved_test_points(tmp_path: Path) -> None:
     run = map_run_to_manifest(config)
     directory = execute_run(run)
     metrics = json.loads((directory / "metrics.json").read_text())
-    assert metrics["quantization"]["train"]["n"] == 76
-    assert metrics["quantization"]["validation"]["n"] == 20
+    assert metrics["reconstruction"]["train"]["n"] == 76
+    assert metrics["reconstruction"]["validation"]["n"] == 20
     assignments = torch.load(directory / "kmeans_model_assignments.pt", weights_only=True)
     assert assignments["assignments"].numel() == 96
     test_config = json.loads((Path(config["dataset"]["shard_dir"]) / "test/config.json").read_text())
@@ -220,40 +220,23 @@ def test_legacy_initialization_manifest_rejected_without_writes(tmp_path: Path) 
 
 
 @pytest.mark.parametrize('K,threshold', [(40, None), (40, .1), (95, None), (95, .1)])
-def test_sparse_pipeline_keeps_partition_and_resumes(tmp_path, monkeypatch, K, threshold):
+def test_sparse_pipeline_preserves_artifacts_but_rejects_missing_covariance(tmp_path, monkeypatch, K, threshold):
     config = _config(tmp_path)
     config['model'].update(K=K, surgery_threshold=threshold)
     run = map_run_to_manifest(config)
-    directory = execute_run(run)
+    with pytest.raises(ValueError, match="occupied clusters require valid PCA"):
+        execute_run(run)
+    directory = Path(run['run_dir'])
     model = load_kmeans(directory / 'kmeans_model.pt')
-    assert (~model.pca_valid).any()
-    metrics = json.loads((directory / 'metrics.json').read_text())
-    assert metrics['pca_geometry']['minimum_cluster_points'] == 2
-    eligible = int(model.pca_valid.sum())
-    assert metrics['pca_geometry']['eligible_components'] == eligible
-    assert metrics['pca_geometry']['excluded_components'] == K - eligible
-    assert metrics['association']['associated_components'] == K
-    assert metrics['rank']['components'] == eligible
-    assert metrics['quantization']['train']['n'] == 96
-    assert metrics['quantization']['validation']['n'] == 24
-    reconstruction = metrics['reconstruction']['train']
-    assert reconstruction['n'] == int(model.cluster_counts[model.pca_valid].sum())
-    assert reconstruction['excluded_n'] == 96 - reconstruction['n']
-    assert reconstruction['excluded_n'] > 0
-    assert metrics['heldout_distribution_coverage']['components_live'] == K
+    assert ((model.cluster_counts > 0) & ~model.pca_valid).any()
     assignments = torch.load(directory / 'kmeans_model_assignments.pt', weights_only=True)
     assert assignments['assignments'].numel() == 120
     assert assignments['cluster_sizes'].numel() == K
-    assert sum(m['components']['pca_excluded'] for m in metrics['per_manifold']) == K - eligible
-    if K == 95:
-        assert eligible == 1  # 96 training points in 95 distinct clusters.
-        assert metrics['rank']['mean_learned'] == 1
-    assert pipeline_status([run])[0]['pipeline']
-    monkeypatch.setattr('dalg.pipeline.common._run_command', lambda _: pytest.fail('resume reran a stage'))
-    execute_run(run)
-    metrics.pop('pca_geometry')
-    (directory / 'metrics.json').write_text(json.dumps(metrics))
-    assert not _evaluation_artifact_valid(run)
+    assert not (directory / 'metrics.json').exists()
+    assert not pipeline_status([run])[0]['pipeline']
+    monkeypatch.setattr('dalg.pipeline.common._run_command', lambda _: pytest.fail('resume reran training or assignments'))
+    with pytest.raises(ValueError, match="occupied clusters require valid PCA"):
+        execute_run(run)
 
 
 @pytest.mark.parametrize('kind', ['mfa', 'ard', 'hddc'])

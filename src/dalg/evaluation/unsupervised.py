@@ -244,14 +244,14 @@ def unsupervised_report_valid(run: Mapping[str, Any], metrics: Any) -> bool:
             return False
     elif "tile_alignment" in metrics:
         return False
-    required_blocks = ("dataset", "components", "rank", "quantization", "pca_geometry") if kind == "kmeans" else (
-        "dataset", "components", "rank", "nll", "bic",
-    )
+    required_blocks = ("dataset", "components", "rank", "nll", "bic")
+    if kind == "kmeans":
+        required_blocks += ("pca_geometry", "gaussian_surrogate")
     if any(not isinstance(metrics.get(key), Mapping) for key in required_blocks):
         return False
     dataset = metrics["dataset"]
     if kind in {"hddc", "kmeans"} and not reconstruction_report_valid(
-        metrics.get("reconstruction"), model_kind=kind, dataset=dataset,
+        metrics.get("reconstruction"), model_kind="hddc", dataset=dataset,
     ):
         return False
     root, subset = split_shard_dir_spec(run["dataset"]["shard_dir"])
@@ -299,31 +299,17 @@ def unsupervised_report_valid(run: Mapping[str, Any], metrics: Any) -> bool:
         if (geometry.get("version") != 1 or geometry.get("minimum_cluster_points") != 2
                 or geometry.get("eligible_components") != count or geometry.get("excluded_components") != k - count):
             return False
-        quantization = metrics.get("quantization", {})
-        if quantization.get("convention") != "lower_is_better" or "nll" in metrics or "bic" in metrics:
+        if "quantization" in metrics or metrics["gaussian_surrogate"].get("source_model") != "kmeans":
             return False
-        for split in ("train", "validation"):
-            values = quantization.get(split, {})
-            if not isinstance(values, Mapping):
-                return False
-            n = values.get("n")
-            if type(n) is not int or n != dataset[f"{split}_points"]:
-                return False
-            if n == 0 and (values.get("sum_squared_distance") != 0 or values.get("mean_squared_distance") is not None):
-                return False
-            if n and any(type(values.get(key)) not in (int, float) or not math.isfinite(values[key])
-                         or values[key] < 0 for key in ("sum_squared_distance", "mean_squared_distance")):
-                return False
-    else:
-        nll, bic = metrics.get("nll", {}), metrics.get("bic", {})
-        if any(type(nll.get(split)) not in (float, int) or not math.isfinite(nll[split])
-               for split in ("train", "validation")):
-            return False
-        if (bic.get("formula") != "-standard_bic / n + active_components"
-                or bic.get("convention") != "higher_is_better"
-                or bic.get("n") != dataset["train_points"]
-                or type(bic.get("value")) not in (float, int) or not math.isfinite(bic["value"])):
-            return False
+    nll, bic = metrics.get("nll", {}), metrics.get("bic", {})
+    if any(type(nll.get(split)) not in (float, int) or not math.isfinite(nll[split])
+           for split in ("train", "validation")):
+        return False
+    if (bic.get("formula") != "-standard_bic / n + active_components"
+            or bic.get("convention") != "higher_is_better"
+            or bic.get("n") != dataset["train_points"]
+            or type(bic.get("value")) not in (float, int) or not math.isfinite(bic["value"])):
+        return False
     if run["evaluation"].get("heldout_distribution_coverage", True):
         coverage = metrics.get("heldout_distribution_coverage")
         if not coverage_report_valid(coverage, components=k):

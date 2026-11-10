@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 
 from dalg.analysis.bic import bic_from_mean_nll, model_parameter_count
 from dalg.analysis.bic_improved import active_bic_from_standard
+from dalg.analysis.kmeans_gaussian import gaussian_from_cluster_pca
 from dalg.analysis.reconstruction import ReconstructionMoments, reconstruction_errors
 from dalg.data.shard_activations import ActivationBatchDataset, load_meta_index
 from dalg.data.subset_spec import resolve_spec_positions, split_shard_dir_spec
@@ -162,6 +163,7 @@ def _mean_nll(
     drop_prefix: int,
     device: torch.device,
     reconstruction: ReconstructionMoments | None = None,
+    map_counts: torch.Tensor | None = None,
 ) -> float:
     if not positions:
         raise ValueError("cannot evaluate NLL on an empty split")
@@ -179,11 +181,16 @@ def _mean_nll(
     loader = DataLoader(dataset, batch_size=None, num_workers=0)
     total_nll = 0.0
     total_points = 0
-    with model.inference_cache():
+    # HDDC covariances can be nearly singular; center in float64 as in EM.
+    cache_options = {"dtype": torch.float64, "component_chunk_size": 32} if reconstruction is not None else {}
+    with model.inference_cache(**cache_options):
         for batch in loader:
             x = batch.to(device, non_blocking=(device.type == "cuda"))
             total_nll += float(model.nll(x).item()) * int(x.shape[0])
             total_points += int(x.shape[0])
+            if map_counts is not None:
+                labels = model.responsibilities(x).argmax(dim=1)
+                map_counts.add_(torch.bincount(labels, minlength=model.K).to(map_counts.device))
             if reconstruction is not None:
                 reconstruction.update(*reconstruction_errors(model, x, model_kind="hddc"))
     if total_points == 0:
@@ -192,142 +199,98 @@ def _mean_nll(
 
 
 @torch.no_grad()
-def _quantization_error(
-    model,
-    *,
-    shard_dir: Path,
-    layer: int,
-    positions: list[int],
-    batch_size: int,
-    drop_prefix: int,
-    device: torch.device,
-    reconstruction: ReconstructionMoments | None = None,
-) -> dict[str, float | int | None]:
-    """Measure squared distances, reporting no mean for an empty split."""
-    if not positions:
-        return {"sum_squared_distance": 0.0, "mean_squared_distance": None, "n": 0}
-    dataset = ActivationBatchDataset(
-        shard_dir,
-        layer=layer,
-        row_subset=positions,
-        batch_size=batch_size,
-        drop_prefix=drop_prefix,
-        dtype=torch.float32,
-        shuffle_shards=False,
-        shuffle_within_shard=False,
-        seed=0,
-    )
-    total_squared_distance = 0.0
-    total_points = 0
-    for batch in DataLoader(dataset, batch_size=None, num_workers=0):
-        x = batch.to(device, non_blocking=(device.type == "cuda"))
-        labels = model.predict(x)
-        assigned_means = model.mu[labels]
-        total_squared_distance += float((x.double() - assigned_means.double()).square().sum())
-        total_points += len(x)
-        if reconstruction is not None:
-            reconstruction.update(*reconstruction_errors(model, x, model_kind="kmeans", labels=labels))
-    if total_points == 0:
-        raise ValueError("cannot evaluate quantization error on an empty split")
-    return {
-        "sum_squared_distance": total_squared_distance,
-        "mean_squared_distance": total_squared_distance / total_points,
-        "n": total_points,
-    }
-
-
-@torch.no_grad()
 def evaluate_fit(model, data: EvaluationData, *, model_kind: str, layer: int,
                  batch_size: int, device: torch.device) -> dict[str, Any]:
-    """Evaluate fit and reconstruction metrics using the saved partition."""
+    """Evaluate fit and reconstruction metrics using the saved partition.
+
+    KMeans is converted to an in-memory HDDC model using its saved training
+    cluster PCA. Config and report identity remain KMeans; only the
+    fit metric implementation uses HDDC. The caller's model is unchanged.
+    All models report NLL and BIC; HDDC and converted KMeans also report
+    posterior reconstruction.
+    """
     clean_shard_dir = data.shard_dir
     train_positions, val_positions = data.train_positions, data.val_positions
     window, drop_prefix = int(data.config["window"]), data.drop_prefix
     train_cluster_sizes = data.train_cluster_sizes
     resolved_device = device
+    fit_model_kind = model_kind
+    if model_kind == "kmeans":
+        if not train_positions or not val_positions:
+            raise ValueError("Gaussian fit evaluation requires nonempty training and validation splits")
+        model = gaussian_from_cluster_pca(model, train_cluster_sizes=train_cluster_sizes).to(device)
+        fit_model_kind = "hddc"
+        # Gaussian MAP occupancy can differ from the original nearest-centroid partition.
+        train_cluster_sizes = torch.zeros(model.K, dtype=torch.long, device=device)
     reconstruction = {
         name: ReconstructionMoments() for name in ("train", "validation")
-    } if model_kind in {"hddc", "kmeans"} else {}
-    if model_kind == "kmeans":
-        if not train_positions:
-            raise ValueError("cannot evaluate KMeans quantization error on an empty training split")
-        fit_metrics = {
-            "quantization": {
-                name: _quantization_error(
-                    model,
-                    shard_dir=clean_shard_dir,
-                    layer=layer,
-                    positions=split_positions,
-                    batch_size=batch_size,
-                    drop_prefix=drop_prefix,
-                    device=resolved_device,
-                    reconstruction=reconstruction[name],
-                )
-                for name, split_positions in (
-                    ("train", train_positions), ("validation", val_positions)
-                )
-            }
-        }
-        fit_metrics["quantization"]["convention"] = "lower_is_better"
-    else:
-        train_nll = _mean_nll(
-            model,
-            shard_dir=clean_shard_dir,
-            layer=layer,
-            positions=train_positions,
-            batch_size=batch_size,
-            drop_prefix=drop_prefix,
-            device=resolved_device,
-            reconstruction=reconstruction.get("train"),
-        )
-        val_nll = _mean_nll(
-            model,
-            shard_dir=clean_shard_dir,
-            layer=layer,
-            positions=val_positions,
-            batch_size=batch_size,
-            drop_prefix=drop_prefix,
-            device=resolved_device,
-            reconstruction=reconstruction.get("validation"),
-        )
-        n_train = len(train_positions) * (window - drop_prefix)
-        bic_parameters = model_parameter_count(model, model_kind)
-        standard_bic = bic_from_mean_nll(
-            model,
-            model_kind,
-            mean_nll=train_nll,
-            n=n_train,
-        )
-        active_components = int((train_cluster_sizes > 0).sum())
-        bic = active_bic_from_standard(
-            standard_bic,
-            n=n_train,
-            active_components=active_components,
-            K=model.K,
-        )
+    } if fit_model_kind == "hddc" else {}
+    train_nll = _mean_nll(
+        model,
+        shard_dir=clean_shard_dir,
+        layer=layer,
+        positions=train_positions,
+        batch_size=batch_size,
+        drop_prefix=drop_prefix,
+        device=resolved_device,
+        reconstruction=reconstruction.get("train"),
+        map_counts=train_cluster_sizes if model_kind == "kmeans" else None,
+    )
+    val_nll = _mean_nll(
+        model,
+        shard_dir=clean_shard_dir,
+        layer=layer,
+        positions=val_positions,
+        batch_size=batch_size,
+        drop_prefix=drop_prefix,
+        device=resolved_device,
+        reconstruction=reconstruction.get("validation"),
+    )
+    n_train = len(train_positions) * (window - drop_prefix)
+    bic_parameters = model_parameter_count(model, fit_model_kind)
+    standard_bic = bic_from_mean_nll(
+        model,
+        fit_model_kind,
+        mean_nll=train_nll,
+        n=n_train,
+    )
+    active_components = int((train_cluster_sizes > 0).sum())
+    bic = active_bic_from_standard(
+        standard_bic,
+        n=n_train,
+        active_components=active_components,
+        K=model.K,
+    )
 
-        fit_metrics = {
-            "nll": {"train": train_nll, "validation": val_nll},
-            "bic": {
-                "value": bic,
-                "standard_bic": standard_bic,
-                "standard_bic_per_sample_reward": -standard_bic / n_train,
-                "activity_reward": active_components,
-                "active_components": active_components,
-                "inactive_components": int(model.K) - active_components,
-                "K": int(model.K),
-                "parameters": bic_parameters,
-                "n": n_train,
-                "split": "train",
-                "assignment_rule": "hard_map_count_greater_than_zero",
-                "formula": "-standard_bic / n + active_components",
-                "convention": "higher_is_better",
-            },
-        }
+    fit_metrics = {
+        "nll": {"train": train_nll, "validation": val_nll},
+        "bic": {
+            "value": bic,
+            "standard_bic": standard_bic,
+            "standard_bic_per_sample_reward": -standard_bic / n_train,
+            "activity_reward": active_components,
+            "active_components": active_components,
+            "inactive_components": int(model.K) - active_components,
+            "K": int(model.K),
+            "parameters": bic_parameters,
+            "n": n_train,
+            "split": "train",
+            "assignment_rule": "hard_map_count_greater_than_zero",
+            "formula": "-standard_bic / n + active_components",
+            "convention": "higher_is_better",
+        },
+    }
 
     if reconstruction:
         fit_metrics["reconstruction"] = {
-            **reconstruction_metadata(model_kind, model.D),
+            **reconstruction_metadata(fit_model_kind, model.D),
             **{name: moments.summary() for name, moments in reconstruction.items()},
+        }
+    if model_kind == "kmeans":
+        fit_metrics["gaussian_surrogate"] = {
+            "source_model": "kmeans",
+            "covariance": "local_pca_plus_component_isotropic_noise",
+            "fit_population": "saved_training_cluster_pca",
+            "em_refit": False,
         }
     return fit_metrics

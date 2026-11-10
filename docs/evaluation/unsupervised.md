@@ -57,9 +57,11 @@ The schema-version-2 report identifies `evaluation: unsupervised` and reuses
 the existing metric definitions:
 
 - MFA-family models: training/validation `nll` and the existing augmented `bic`.
-- KMeans: training/validation `quantization`, including sum and mean squared
-  distance and point count. Empty validation has a null mean. MFA NLL requires
-  a nonempty validation split.
+- KMeans: training/validation `nll` and augmented `bic` from an evaluation-only
+  HDDC Gaussian mixture built from saved training-cluster PCA. `gaussian_surrogate`
+  records this provenance. All fit evaluations require nonempty validation.
+  The conversion is implemented in `src/dalg/analysis/kmeans_gaussian.py`;
+  there is no quantization fallback.
 - HDDC and KMeans+PCA: training/validation `reconstruction` MSE and standard
   error, with included and excluded activation counts; see below.
 - `components.live` and `.dead`: occupancy over the selected assignment stream,
@@ -166,11 +168,11 @@ it is not corrected for correlation between tokens in a document or window.
   by posterior responsibility. Noise and saved rank masks participate. This
   follows the paper's reconstruction equation, rather than selecting only the
   MAP component or applying an orthogonal projection. Every sample contributes.
-- **KMeans+PCA:** assign the nearest centroid `mu_k` and reconstruct
-  `mu_k + U_k U_k.T (x - mu_k)` using the saved retained cluster PCs, never
-  initialization PCs. Samples assigned to `pca_valid=False` components are
-  excluded and counted. This extends the paper's centroid-only KMeans baseline.
-  Existing quantization still scores all samples.
+- **KMeans+PCA pooled fit metrics:** convert saved training-cluster PCA to an HDDC
+  mixture and use its posterior reconstruction, as above. All samples contribute;
+  occupied training clusters without valid PCA cause conversion to fail.
+  The source model and saved assignments are unchanged. Per-category reconstruction
+  remains a separate local-PCA calculation using the original KMeans model.
 
 Within the top-level schema version 2, the block is:
 
@@ -189,15 +191,16 @@ reconstruction
     excluded_n
 ```
 
-The first method/population pair is HDDC's; the second is KMeans+PCA's.
+Pooled fit reports use `mfa_posterior_mean` and `all_samples` for both HDDC and
+converted KMeans. The local-PCA method/population pair applies to KMeans's
+separate per-category reconstruction reports.
 `n` counts included activation vectors, not windows or coordinates.
 `n + excluded_n` equals `dataset.train_points` or `dataset.validation_points`.
 Dataset summaries also record `d_model`, `window`, and `drop_prefix` in both suites.
 Empty eligible populations have null MSE and standard error; a single included
-sample has null standard error. An empty KMeans validation split is allowed;
-MFA NLL still requires nonempty validation. If every KMeans component lacks valid
-PCA, both reconstruction means are null. When KMeans excludes samples, its MSE
-and HDDC's MSE describe different populations.
+sample has null standard error. Pooled fit evaluation requires nonempty training
+and validation splits. Per-category reports can have empty eligible populations;
+KMeans local-PCA category reports exclude samples assigned to invalid PCA.
 
 CSV aggregation exports `reconstruction.train.*` and
 `reconstruction.validation.*` automatically. Completion validation requires the

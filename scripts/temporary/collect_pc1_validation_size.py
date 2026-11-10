@@ -1,4 +1,5 @@
-"""Collect the 12-run neutral-year validation-size study and render its comparison."""
+"""Collect a 12-run PC1 validation-size study and render its comparison."""
+import argparse
 import csv
 import json
 import math
@@ -11,9 +12,18 @@ OUTPUT = Path('outputs/experiments/pc1_validation_size_study')
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path, default=OUTPUT)
+    parser.add_argument('--root', type=Path, default=ROOT)
+    parser.add_argument('--total-rows', type=int, default=20020)
+    parser.add_argument('--title', default='Neutral years')
+    options = parser.parse_args()
+    output = options.output
+    root = options.root
     rows = []
+    validation_sets = {}
     for name in ('hddc', 'kmeans'):
-        manifest = OUTPUT / f'{name}_manifest.jsonl'
+        manifest = output / f'{name}_manifest.jsonl'
         runs = [json.loads(line) for line in manifest.read_text().splitlines() if line.strip()]
         assert len(runs) == 6
         for run in runs:
@@ -22,11 +32,13 @@ def main():
             report = json.loads((directory / 'metrics.json').read_text())
             split = json.loads((directory / 'val_indices.json').read_text())
             metric = report['pc1_density']
-            expected = 2200 if args['val_frac'] > .1 else 1600
+            expected = math.ceil(args['val_frac'] * options.total_rows)
+            assert expected in (1600, 2200)
             assert args['seed'] == 42
             assert split['val_rows'] == metric['reference']['points'] == expected
             assert metric['reference']['global_rows'] == split['val_global_rows']
-            assert split['train_rows'] == 20020 - expected
+            assert split['train_rows'] == options.total_rows - expected
+            validation_sets[name, args['split_seed'], expected] = set(split['val_global_rows'])
             assert metric['settings']['pc1_density_space'] == 'pca75'
             assert metric['settings']['pc1_density_neighbors'] == 20
             rows.append({
@@ -41,14 +53,19 @@ def main():
             })
     assert {(r['model'],r['validation_points'],r['split_seed']) for r in rows} == {
         (m,n,s) for m in ('hddc','kmeans') for n in (1600,2200) for s in (42,43,44)}
+    for seed in (42, 43, 44):
+        for size in (1600, 2200):
+            assert validation_sets['hddc', seed, size] == validation_sets['kmeans', seed, size]
+        for name in ('hddc', 'kmeans'):
+            assert validation_sets[name, seed, 1600] < validation_sets[name, seed, 2200]
     rows.sort(key=lambda r:(r['model'],r['split_seed'],r['validation_points']))
-    with (OUTPUT / 'comparison.csv').open('w') as f:
+    with (output / 'comparison.csv').open('w') as f:
         writer = csv.DictWriter(f,fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    general, manifolds = aggregate_metrics(ROOT)
-    general.to_csv(ROOT / 'general_metrics.csv',index=False)
-    manifolds.to_csv(ROOT / 'manifold_metrics.csv',index=False)
+    general, manifolds = aggregate_metrics(root)
+    general.to_csv(root / 'general_metrics.csv',index=False)
+    manifolds.to_csv(root / 'manifold_metrics.csv',index=False)
 
     import matplotlib
     matplotlib.use('Agg')
@@ -70,10 +87,26 @@ def main():
                 ax.set_xlabel('Validation reference points')
             if row == 0:
                 ax.legend()
-    fig.suptitle('Neutral years · layer 4 · K=50 · τ=0.1 · fitting seed 42\n'
+    fig.suptitle(f'{options.title} · layer 4 · K=50 · τ=0.1 · fitting seed 42\n'
                  'Models and PCA refitted per split; PCA75 density, kNN=20')
     for extension in ('png','pdf'):
-        fig.savefig(OUTPUT / f'comparison.{extension}',dpi=180)
+        fig.savefig(output / f'comparison.{extension}',dpi=180)
+    plt.close(fig)
+    fig, ax = plt.subplots(figsize=(12, 5), layout='constrained')
+    ax.axis('off')
+    table = ax.table(
+        cellText=[[r['model'].upper(), r['split_seed'], r['validation_points'],
+                   r['train_points'], r['pca_dimensions'],
+                   f"{r['retention']:.5g}", f"{r['enrichment']:.5g}",
+                   r['eligible_components']] for r in rows],
+        colLabels=['Model', 'Split seed', 'Validation', 'Train', 'PCA dims',
+                   'Retention', 'Enrichment', 'Eligible'], loc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 1.5)
+    ax.set_title(f'{options.title} · layer 4 · K=50 · τ=0.1 · fitting seed 42\n'
+                 'Scores: exp(median component log score)')
+    fig.savefig(output / 'results_table.pdf')
     plt.close(fig)
     print(json.dumps(rows,indent=2),flush=True)
 
