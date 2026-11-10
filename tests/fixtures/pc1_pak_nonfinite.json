@@ -1,0 +1,12 @@
+{
+  "dimension": 141,
+  "kstar": 4,
+  "radii": [
+    0.8683003085472218,
+    0.8866634110932817,
+    0.9202359744831486,
+    0.9461121748137297,
+    1.2012292256226709
+  ],
+  "source": "years/layer4 K50 threshold=.01, component12, direction PC1, pilot index188; DADApy Newton returns NaN"
+}

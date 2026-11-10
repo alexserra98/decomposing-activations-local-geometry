@@ -77,6 +77,9 @@ scope.
   directions for sparse `K=1000` toy KMeans partitions.
 - [PC1 density alignment](experiments/pc1-density-alignment.md) explains current
   pipeline commands and the years/temperature density-support findings.
+- [PC1 support coverage proposal](experiments/pc1-support-coverage-proposal.md)
+  defines the calibrated neighbor-distance pilot and accepted-position fraction
+  along PC1, with matched random controls and exact resolution checks.
 - [Synthetic MFA analyses](experiments/synthetic-mfa.md) describes the temporary
   synthetic sweep and related analysis.
 - [Wikipedia KMedoids slice](experiments/wikipedia-kmedoids.md) describes the

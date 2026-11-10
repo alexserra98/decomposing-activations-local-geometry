@@ -183,7 +183,7 @@ def panel_plots(entries):
     return fig
 
 
-def panel_tables(entries):
+def panel_tables(entries, *, score_formatter=score_text):
     fig = plt.figure(figsize=(17, 8.8), facecolor='white')
     outer = fig.add_gridspec(2, 2, left=.035, right=.965, top=.83, bottom=.18, hspace=.52, wspace=.12)
     for cell, entry in zip(outer, entries):
@@ -191,7 +191,7 @@ def panel_tables(entries):
         ax.axis('off')
         selected = [next(r for r in entry['selected'] if r['K'] == K and r['kind'] == kind)
                     for K in [50, 100] for kind in ['hddc', 'kmeans']]
-        cells = [[r['K'], r['method'], score_text(r['retention']), score_text(r['enrichment']),
+        cells = [[r['K'], r['method'], score_formatter(r['retention']), score_formatter(r['enrichment']),
                   f'{r["eligible"]}/{r["total"]}'] for r in selected]
         table = ax.table(cellText=cells,
             colLabels=['K', 'Modello', 'Retention ↑', 'Enrichment ↑', 'Valutabili'],
