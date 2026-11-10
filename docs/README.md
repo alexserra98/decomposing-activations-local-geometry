@@ -79,7 +79,10 @@ scope.
   pipeline commands and the years/temperature density-support findings.
 - [PC1 support coverage proposal](experiments/pc1-support-coverage-proposal.md)
   defines the calibrated neighbor-distance pilot and accepted-position fraction
-  along PC1, with matched random controls and exact resolution checks.
+  along PC1 and the equal-weight PC1–PC5 extension, with matched random controls
+  and exact resolution checks, including PC1-only percentile and neighbor-count
+  sensitivity sweeps, the segment-mass × percentile experiment, and its
+  controlled layer-4 neighbor-count ablation on the 4×4 grid.
 - [Synthetic MFA analyses](experiments/synthetic-mfa.md) describes the temporary
   synthetic sweep and related analysis.
 - [Wikipedia KMedoids slice](experiments/wikipedia-kmedoids.md) describes the
