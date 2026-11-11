@@ -92,7 +92,7 @@ Solution:
 
 # Research State (updated 2026-10-08)
 
-> **Kind:** Research state · **Status:** Current as of 2026-09-29 · **Use when:**
+> **Kind:** Research state · **Status:** Current as of 2026-10-08 · **Use when:**
 > Establishing the current research direction, findings, and immediate goals.
 
 I have fixed a majory issue with the way surgery was computed. Before when no gap where found for some reason I was putting q_k=1 which made no sense. Now when no gap is found q_k is set to q_max and then adjusted further by comparing with the noise b_k. Directions with eigenvalue $< b_k$ where removed from a_ij and the noise was recomputed.
@@ -108,7 +108,7 @@ I tried plotting the spectrum for different manifolds and I have observed a coup
 - For the torus there was no jump for the ID in the 30k dataset.
 - In 5M dataset the jump was more visible.
 
-# Research State (updated 2026-10-08)
+# Research State (updated 2026-10-27)
 
 > **Kind:** Research state · **Status:** Current as of 2026-10-27 · **Use when:**
 > Establishing the current research direction, findings, and immediate goals.
@@ -125,3 +125,20 @@ Now some more general considerations:
 Most of these "feature" manifolds are stuff found with PCA in low dimensional. To have an edge with respect with this manual methos we should be able to find stuff in a different regime for example high dimensional manifolds.
 I believe looking for general features in the wilde is doomed and should not be pursued so I think I would prefer to focus on specific dataset or specific task an hopefully find a mechanism explained by this feature manifold. 
 Both for high-dim features and for mechanism discovery the biggest issue is that I have no idea on how to investigate a manifold if not via visual inspection. 
+
+# Research State (updated 2026-11-10)
+
+> **Kind:** Research state · **Status:** Current as of 2026-11-10 · **Use when:**
+> Establishing the current research direction, findings, and immediate goals.
+
+I still didn't manage to solve the issues reported in last research state 2026-10-27. We implemented different metrics to evaluate the tiling on this new real dataset but none seems to work. You can find them in [unsupervised](../docs/evaluation/unsupervised.md). I managed to plot some manifold and visualise the tiling and I can see that hddc tends to make gaussian more aligned with the actual geometry. For example in (.../docs/research/hddc_years.png) and (../docs/research/kmeans_years.png) we can see that kmeans is fitting the internal structure of years spiral, while hddc find more elongated gaussians that capture the geometry. I am unable to show that though. 
+An other issue that I have found is that sometimes hddc find clusters outside of the manifold, usually when there is a curve, maybe it puts a guassian in the middle, I have observed that this gaussians tend to disappear or at least getting closer to the manifold changing seed, but I wasn't able to find specific charaterstic of these gaussians. I though it could be the likelihood, or  the flattness, but both of them are unreliable to spot this out of manifold gaussians. In general I know that the loss is not perfectly aligned with my goal of tiling so that's a general issue with hddc.
+
+
+*****
+
+I have implemented a new metric to evaluate tiling. It scores how much PC1 of gaussian is aligned with segment joining two label. Currently it is not favouring HDDC, but there a couple of things I can tweak.
+1. Use the same set to compute centroids and contribution of each gaussian
+2. Use acts from the same prompt to compute centroids
+3. Make weights more peaked
+4. Change weights computation (maybe based on euclidean distance rather than assignments)
